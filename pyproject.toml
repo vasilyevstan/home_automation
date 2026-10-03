@@ -21,6 +21,9 @@ starlink = [
     "grpcio-reflection>=1.76,<2",
     "protobuf>=6.31,<8",
 ]
+sonos = [
+    "soco>=0.31.4,<0.32",
+]
 
 [project.scripts]
 nordpool-ee = "nordpool_ee:main"
@@ -30,6 +33,7 @@ electrisity-price-mcp = "electricity_pricing_mcp:main"
 sensibo-mcp = "sensibo_mcp:main"
 tp-tapo-mcp = "tapo_mcp:main"
 starlink-mcp = "starlink_mcp:main"
+sonos-mcp = "sonos_mcp:main"
 
 [tool.setuptools]
-py-modules = ["nordpool_ee", "mcp_server", "wattcast_forecast", "elering_consumption", "elering_consumption_mcp", "electricity_pricing", "electricity_pricing_mcp", "sensibo", "sensibo_mcp", "tapo_plugs", "tapo_mcp", "starlink", "starlink_mcp"]
+py-modules = ["nordpool_ee", "mcp_server", "wattcast_forecast", "elering_consumption", "elering_consumption_mcp", "electricity_pricing", "electricity_pricing_mcp", "sensibo", "sensibo_mcp", "tapo_plugs", "tapo_mcp", "starlink", "starlink_mcp", "sonos", "sonos_mcp"]
