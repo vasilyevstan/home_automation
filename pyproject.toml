@@ -4,26 +4,56 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "estonia-nordpool-prices"
-version = "0.8.0"
-description = "CLI and MCP servers for Estonia's electricity prices, forecasts, consumption and configurable costs"
+version = "0.9.0"
+description = "Local home-automation MCPs and Estonia electricity prices, consumption and costs"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=2.2,<3",
 ]
 
+[project.urls]
+Repository = "https://github.com/vasilyevstan/home_automation"
+
 [project.optional-dependencies]
 tapo = [
     "python-kasa>=0.10.2,<0.11; python_version >= '3.11'",
 ]
+starlink = [
+    "grpcio>=1.76,<2",
+    "grpcio-reflection>=1.76,<2",
+    "protobuf>=6.31,<8",
+]
+sonos = [
+    "soco>=0.31.4,<0.32",
+]
+heater = [
+    "tinytuya>=1.20,<2",
+]
+heater-setup = [
+    "tinytuya>=1.20,<2",
+    "tuya-device-sharing-sdk>=0.2.11,<0.3",
+    "qrcode>=8,<9",
+]
 
 [project.scripts]
-nordpool-ee = "nordpool_ee:main"
-nordpool-ee-mcp = "mcp_server:main"
-elering-kodala-consumption-mcp = "elering_consumption_mcp:main"
-electrisity-price-mcp = "electricity_pricing_mcp:main"
-sensibo-mcp = "sensibo_mcp:main"
-tp-tapo-mcp = "tapo_mcp:main"
+nordpool-ee = "home_automation.electricity_market.prices:main"
+nordpool-ee-mcp = "home_automation.electricity_market.server:main"
+elering-kodala-consumption-mcp = "home_automation.household_consumption.server:main"
+electrisity-price-mcp = "home_automation.electricity_pricing.server:main"
+sensibo-mcp = "home_automation.sensibo.server:main"
+tp-tapo-mcp = "home_automation.tapo.server:main"
+starlink-mcp = "home_automation.starlink.server:main"
+sonos-mcp = "home_automation.sonos.server:main"
+govee-mcp = "home_automation.govee.server:main"
+terrace-heater-setup = "home_automation.terrace_heater.setup:main"
+terrace-heater-mcp = "home_automation.terrace_heater.server:main"
 
 [tool.setuptools]
-py-modules = ["nordpool_ee", "mcp_server", "wattcast_forecast", "elering_consumption", "elering_consumption_mcp", "electricity_pricing", "electricity_pricing_mcp", "sensibo", "sensibo_mcp", "tapo_plugs", "tapo_mcp"]
+py-modules = ["nordpool_ee", "mcp_server", "wattcast_forecast", "elering_consumption", "elering_consumption_mcp", "electricity_pricing", "electricity_pricing_mcp", "sensibo", "sensibo_mcp", "tapo_plugs", "tapo_mcp", "starlink", "starlink_mcp", "sonos", "sonos_mcp", "govee", "govee_mcp", "terrace_heater_setup", "terrace_heater", "terrace_heater_mcp"]
+
+[tool.setuptools.packages.find]
+include = ["home_automation", "home_automation.*"]
+
+[tool.setuptools.package-data]
+"*" = ["README.md", "AGENTS.md"]

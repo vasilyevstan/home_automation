@@ -1,2 +1,4 @@
 include examples/pricing-profile.example.json
+include examples/terrace-heater.example.json
 include tests/pricing_test_support.py
+recursive-include home_automation README.md AGENTS.md

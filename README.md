@@ -1,30 +1,57 @@
-# Estonia electricity prices CLI and MCP server
+# Home automation
 
-`nordpool_ee.py` is a small, dependency-free command-line tool that prints
-Estonia's Nord Pool day-ahead wholesale electricity prices for the next
-`Europe/Tallinn` calendar day. `mcp_server.py` exposes validated current-day,
-next-day and date/hour prices, plus a separate experimental seven-day forecast,
-as typed Model Context Protocol tools over stdio.
-The separate `elering-kodala-consumption` MCP reads authorized household
-electricity consumption and grid export from Elering's customer API.
-The separate `electrisity-price` MCP calculates household energy costs and
-export credits using an effective-dated private tariff profile.
-The separate `sensibo-mcp` reads Sensibo Sky climate telemetry and history,
-and controls explicitly selected enrolled devices through Sensibo's cloud API.
-The optional `tp-tapo-mcp` discovers local Tapo sockets by MAC, reads their
-supported measurements, and explicitly sets one socket's power on or off.
+Nine independent local stdio MCP servers for electricity data, household
+costs, and explicitly selected device controls. They share one installable
+Python distribution, not a hosted service or a background automation daemon.
 
-Repository: <https://github.com/vasilyevstan/electro>
+Repository: <https://github.com/vasilyevstan/home_automation>
+
+## MCP folders
+
+Each folder contains its implementation, a `README.md` with setup/tool
+documentation, and an `AGENTS.md` with maintenance and safety guidance.
+
+| MCP registration | Folder and README | Purpose | Optional runtime extra |
+| --- | --- | --- | --- |
+| `electro` | [electricity_market](home_automation/electricity_market/README.md) | Published Estonia prices, standalone CLI, and separate experimental forecast | None |
+| `elering-kodala-consumption` | [household_consumption](home_automation/household_consumption/README.md) | Authorized household grid import/export | None |
+| `electrisity-price` | [electricity_pricing](home_automation/electricity_pricing/README.md) | Effective-dated costs, bills, and incremental scenarios | None |
+| `sensibo-mcp` | [sensibo](home_automation/sensibo/README.md) | Enrolled Sensibo Sky climate devices | None |
+| `tp-tapo-mcp` | [tapo](home_automation/tapo/README.md) | Local MAC-addressed sockets and measurements | `tapo` |
+| `starlink-mcp` | [starlink](home_automation/starlink/README.md) | Local dish telemetry and opt-in controls | `starlink` |
+| `sonos-mcp` | [sonos](home_automation/sonos/README.md) | Local speakers, playback, groups, and queues | `sonos` |
+| `govee-mcp` | [govee](home_automation/govee/README.md) | LAN-enabled lights | None |
+| `terrace-heater-mcp` | [terrace_heater](home_automation/terrace_heater/README.md) | Privately provisioned direct-LAN heater | `heater` |
+
+The heater's one-time provisioning utility additionally uses `heater-setup`.
+Tests and synthetic examples remain in the shared `tests/` and `examples/`
+directories. The pricing server reuses the market and household clients
+directly rather than launching other MCP processes.
+
+The distribution name **`estonia-nordpool-prices`**, all existing console
+commands, MCP registration names, and tool names are retained for compatibility.
+Root-level Python files are small compatibility entry points: imports such as
+`electricity_pricing` and `nordpool_ee` still refer to the real implementation
+modules, including their state and exception classes. Put implementation changes
+in the relevant `home_automation/` folder, not those compatibility files.
 
 ## Requirements
 
 - Python 3.10 or newer
 - Python 3.11 or newer and the optional `tapo` extra for `tp-tapo-mcp` only
-- Internet access to `dashboard.elering.ee`
+- The optional `starlink` extra and a trusted LAN route to the dish for
+  `starlink-mcp`
+- The optional `sonos` extra and trusted LAN access to Sonos speakers for
+  `sonos-mcp`; no Sonos cloud credentials are required
+- Trusted LAN access to supported Govee devices with **LAN Control** enabled
+  in Govee Home for `govee-mcp`; no Govee cloud credentials are required
+- The optional `heater` extra and verified private provisioning for the heater
+- Internet access to `dashboard.elering.ee` for published electricity prices
 - Internet access to `wattcast.eu` for the optional forecast tool (no API key)
 - Elering customer API credentials and access to `estfeed.elering.ee` and
   `kc.elering.ee` for household consumption and automatic household pricing;
   pricing supplied readings or individual quantities needs no household credentials
+- Sensibo cloud access and explicit enrollment for `sensibo-mcp`
 - [`uv`](https://docs.astral.sh/uv/)
 
 ## Setup
@@ -32,1068 +59,65 @@ Repository: <https://github.com/vasilyevstan/electro>
 Clone the repository and install its locked dependencies:
 
 ```bash
-git clone https://github.com/vasilyevstan/electro.git
-cd electro
-uv sync --locked
+git clone https://github.com/vasilyevstan/home_automation.git
+cd home_automation
+uv sync --locked --inexact
 ```
 
-## CLI usage
-
-From a checkout:
+Run checkout commands from this repository root. Choose the optional extra
+listed for the MCP you need; for example:
 
 ```bash
-uv run nordpool-ee
+uv run --locked --extra tapo --inexact tp-tapo-mcp
 ```
 
-Without a checkout:
+The standalone electricity-price CLI is still `uv run nordpool-ee`.
+Each MCP README includes its own launch and registration instructions.
+`--inexact` preserves other extras already installed in a shared development
+environment. Persistent installations should use a published Git commit or
+their own non-editable environment outside the checkout.
+
+Keep credentials, real tariffs, household readings, device inventories, and
+invoice or device captures outside the public repository. GitHub publishes
+the generic code; repository secrets do not make a local MCP a hosted service.
+
+## Repository and local-folder rename
+
+The GitHub repository is `vasilyevstan/home_automation`. An existing checkout
+may still be named `electro`; its directory name is not part of the MCP API.
+The remote can be updated without moving the checkout:
 
 ```bash
-uvx --from "git+https://github.com/vasilyevstan/electro.git@main" nordpool-ee
+git remote set-url origin https://github.com/vasilyevstan/home_automation.git
 ```
 
-The output contains every published market interval in Tallinn local time,
-followed by the minimum, maximum, and duration-weighted average. Each price is
-shown in:
-
-- `EUR/MWh`, the unit returned by Elering
-- euro `cents/kWh`, calculated as `EUR/MWh / 10`
-
-These are wholesale energy prices only. VAT, electricity supplier margin,
-network charges, excise, and other consumer costs are not included.
-
-Day-ahead prices are normally published during the afternoon before delivery.
-If tomorrow's prices are not available yet, the command reports that explicitly
-and exits with a non-zero status instead of showing today's or partial data.
-
-Exit statuses:
-
-- `0`: complete next-day data was printed
-- `2`: next-day prices have not been published
-- `3`: Elering could not be reached successfully
-- `4`: Elering returned invalid or incomplete data
-
-## Price and forecast MCP server
-
-Start the local stdio server from a checkout:
-
-```bash
-uv run nordpool-ee-mcp
-```
-
-Or launch it directly from GitHub:
-
-```bash
-uvx --from "git+https://github.com/vasilyevstan/electro.git@main" \
-  nordpool-ee-mcp
-```
-
-It exposes four tools:
-
-```text
-get_estonia_current_day_prices
-get_estonia_next_day_prices
-get_estonia_prices_for_hour
-get_estonia_price_forecast
-```
-
-The current-day and next-day tools take no arguments and return typed
-structured content containing:
-
-- the Estonia bidding area and delivery date
-- timezone, currency, source, and interval metadata
-- every complete 15-minute interval in EUR/MWh and cents/kWh, with and without VAT
-- minimum, maximum, and duration-weighted average prices on both VAT bases
-- `hourly_averages` for every elapsed hour, with offset-aware start/end times
-- the applied `vat_rate_percent` and excluded consumer costs
-
-The current-day response includes `current_interval`, identifying the active
-Estonia quarter-hour price, and `current_hour`, containing the full-hour average
-at the time of the call. These are different prices: show both and label the
-time period and VAT basis. The next-day response returns `null` for both fields.
-
-`get_estonia_prices_for_hour` accepts:
-
-- `delivery_date`: an Estonia delivery date in `YYYY-MM-DD` format
-- `hour`: an Estonia local clock hour from `0` through `23`
-
-It returns all quarter-hour prices in that local hour plus the hourly minimum,
-maximum, and average on both VAT bases. A repeated daylight-saving hour contains
-eight intervals and two separate `hourly_averages`, distinguished by UTC offset.
-Its `summary` averages both occurrences for compatibility. Day responses contain
-23, 24, or 25 hourly averages; no missing or repeated hour is fabricated or
-collapsed. Requesting a skipped hour returns a tool error.
-
-### VAT and price fields
-
-Each interval (including summary minima/maxima and `current_interval`) includes
-`excluding_vat` and `including_vat`, each containing `eur_per_mwh` and
-`cents_per_kwh`. Summaries and hourly averages use `average_excluding_vat` and
-`average_including_vat` with the same units. The MCP text response includes these
-same labeled values as its structured response.
-
-For compatibility, existing interval fields `eur_per_mwh` / `cents_per_kwh`
-and summary fields `average_eur_per_mwh` / `average_cents_per_kwh` remain
-**VAT-exclusive**. The standalone CLI also remains VAT-exclusive.
-
-The MCP adds Estonia's standard **24% VAT** to the wholesale energy component.
-This rate has applied since 1 July 2025 and covers the supported 15-minute price
-period. Source: [Estonian Tax and Customs Board](https://www.emta.ee/en/business-client/taxes-and-payment/value-added-tax/vat-rates-and-supply-exempt-tax/standard-vat-rate).
-Historical hourly-era and incomplete-day support is unchanged.
-
-VAT-inclusive price = VAT-exclusive price multiplied by `1.24`.
-Calculations use decimal arithmetic before serialization, without rounding
-individual intervals first. Negative and zero spot prices are retained.
-
-For example, the four 23:00-hour prices on 2026-09-28 were 20.01, 8.77, 7.05,
-and 6.05 EUR/MWh. The hourly average is 10.47 EUR/MWh:
-
-```json
-{
-  "vat_rate_percent": 24,
-  "average_excluding_vat": {
-    "eur_per_mwh": 10.47,
-    "cents_per_kwh": 1.047
-  },
-  "average_including_vat": {
-    "eur_per_mwh": 12.9828,
-    "cents_per_kwh": 1.29828
-  }
-}
-```
-
-That is approximately **1.30 cents/kWh including VAT for the full hour**, not
-the price for its first quarter-hour. `wholesale_only` still denotes the energy
-component, not a final consumer tariff. `excluded_costs` now lists only charges
-absent from both VAT bases: supplier margin, network charges, excise, and other
-consumer fees.
-
-Expected retrieval failures are returned as MCP tool errors, not successful
-responses containing error text.
-
-### Seven-day forecast (experimental)
-
-`get_estonia_price_forecast()` takes no arguments and uses
-[Wattcast's free API](https://wattcast.eu/api). It returns the **next seven full
-Estonia calendar days, starting tomorrow**, not a rolling 168-hour period.
-A DST transition can make this window 167 or 169 elapsed hours.
-The three published-price tools and the standalone CLI continue to use
-Elering unchanged.
-
-The tool requests the raw model (`adjusted=false`), without Wattcast's online
-level or written-outlook adjustments. It requests a bounded upstream window
-and trims by actual timestamps; it never invents missing prices.
-
-| Field | Meaning |
-| --- | --- |
-| `hourly_prices[].published_price` | Already-published hourly price, relayed through Wattcast from Elering; `prediction` is null |
-| `hourly_prices[].prediction` | Hourly `p10`, `p50`, `p90` and provider `horizon_days`; `published_price` is null |
-| `basis` | Explicit `published` or `forecast` classification for each hour |
-| `daily_summaries` | All seven dates, counts/completeness, minimum/maximum hours, and `average_available_hourly_price` |
-| `window_start`, `window_end` | Requested local-time bounds; end is exclusive |
-| `available_start`, `available_end`, `missing_hours`, `complete` | Actual coverage, including any gaps |
-| `issued_at`, `retrieved_at`, `age_seconds`, `stale` | Model issuance, HTTP retrieval time, and freshness at the call |
-| `accuracy` | Separately labeled provider-reported raw live errors and backtests |
-| `warnings` | Limitations and any partial, stale, missing-accuracy or undercoverage warnings; display these prominently |
-
-Every published price and forecast quantile contains `excluding_vat` and
-`including_vat`, each with `eur_per_mwh` and `cents_per_kwh`. Net values come
-from the provider's EUR/MWh fields; cents/kWh and **24% VAT** are calculated
-locally. Supplier margin, network charges, excise and other fees remain excluded.
-Hour start/end timestamps include Estonia's UTC offset, including both
-occurrences of a repeated DST hour.
-
-`p50` is the hourly central median, not an auction result. Daily summaries
-average the available hourly point values: published prices where known,
-otherwise p50. A mixed day is labeled `mixed`. This average is not necessarily
-a daily median or expected price, and **no daily 80% probability band is
-inferred by averaging hourly bounds**. Empty dates have null statistics.
-
-Valid partial data is returned with `complete=false`, the missing hours, and
-warnings. A forecast issued more than **three hours** ago has `stale=true`.
-Both fixed upstream requests are cached in-process for one hour; cached calls
-retain original retrieval/issuance timestamps and recalculate freshness and
-the requested calendar window. There is no background polling or disk cache.
-If the forecast is invalid, unreachable, or has no usable predicted hours in
-the requested window, the tool returns an MCP error. An accuracy-only failure
-does not hide usable forecasts: `accuracy.status` becomes `unavailable`, with
-an explicit reason and warning.
-
-#### How much confidence to place in it
-
-Wattcast's p10-p90 band has a **nominal 80% target**, not guaranteed coverage.
-The tool returns the provider's observed raw-model coverage and sample count
-by horizon, rather than inventing an accuracy percentage. `horizon_days` means
-days after the last settled local day, **not** exactly that many 24-hour periods
-after issuance.
-
-The [EE accuracy API](https://wattcast.eu/v1/accuracy?zone=EE&days=14) supplies
-live metrics over a reported 14-day window and separate cross-validation
-results. MAE is mean absolute hourly error, not a maximum error bound.
-VAT-inclusive MAE is the net monetary error scaled by 1.24. Do not compare
-live error with a backtest baseline to claim live improvement.
-
-In the research snapshot on 2026-09-28, raw live MAE ranged from
-33.51 to 47.09 EUR/MWh across horizons, and nominal-80% band coverage ranged
-from 62.8% to 79.2%. The horizon-7 MAE was 44.50 EUR/MWh, equivalent to
-4.45 cents/kWh excluding VAT or 5.518 including VAT. These are
-**provider-reported observations, not an independent audit or a promise of
-future performance**; the tool retrieves current metrics rather than using
-these fixed examples.
-
-Use the forecast to compare likely cheaper days and trends; use published
-prices to refine exact hours once available. No device-control or trading
-automation is included.
-
-The API is free without a key at 60 requests/minute/IP, returns HTTP 429 with
-Retry-After on rate limiting, and has no SLA. Display attribution with results:
-**Wattcast; prices from Elering (Nord Pool day-ahead); weather from
-Open-Meteo.com (CC BY 4.0)**. See the [API terms](https://wattcast.eu/legal#api).
-
-### GitHub Copilot CLI
-
-Register the server in Copilot CLI's user-level configuration so it is
-available in every new session:
-
-```bash
-copilot mcp add \
-  --transport stdio \
-  --tools get_estonia_current_day_prices,get_estonia_next_day_prices,get_estonia_prices_for_hour,get_estonia_price_forecast \
-  electro -- \
-  uvx --from "git+https://github.com/vasilyevstan/electro.git@main" \
-  nordpool-ee-mcp
-```
-
-For an immutable installation, replace `@main` with `@<commit-sha>`.
-
-The equivalent `~/.copilot/mcp-config.json` entry is:
-
-```json
-{
-  "mcpServers": {
-    "electro": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/vasilyevstan/electro.git@main",
-        "nordpool-ee-mcp"
-      ],
-      "tools": [
-        "get_estonia_current_day_prices",
-        "get_estonia_next_day_prices",
-        "get_estonia_prices_for_hour",
-        "get_estonia_price_forecast"
-      ]
-    }
-  }
-}
-```
-
-Copilot CLI inherits `PATH` for local MCP servers, so `uvx` must be available
-on `PATH`. The server writes only MCP protocol messages to stdout, as required
-for stdio transport.
-
-## Household consumption MCP
-
-`elering-kodala-consumption` is a **separate, read-only MCP server** using the
-[Elering customer portal](https://estfeed.elering.ee/), not the public price
-API. It does not change the four price/forecast tools or the standalone CLI.
-
-Run from a checkout:
-
-```bash
-uv run elering-kodala-consumption-mcp
-```
-
-Or from GitHub:
-
-```bash
-uvx --from "git+https://github.com/vasilyevstan/electro.git@main" \
-  elering-kodala-consumption-mcp
-```
-
-It exposes only these two tools, annotated read-only:
-
-| Tool | Inputs and result |
-| --- | --- |
-| `list_household_metering_points` | Optional `start_date` and inclusive `end_date`; defaults to the latest 31 Tallinn calendar days including today. Returns authorized electricity EICs and access periods, not profile data. |
-| `get_household_consumption` | Required `start_date`, optional inclusive `end_date` (one day by default), and `resolution`: `hourly` (default) or `15_minutes`. Returns interval import/export and daily/monthly summaries. |
-
-Dates must use `YYYY-MM-DD`, must not be in the future, and each call covers at
-most **31 calendar days**. Query successive ranges for longer history.
-Metering-point discovery is cached in memory for five minutes for the same
-date window; measurements are fetched on demand, without a disk cache.
-The data tool requires exactly one authorized electricity metering point in
-the requested period. It does not guess between multiple points or aggregate
-different households.
-
-### Energy quantities and completeness
-
-Values are **kWh**, not kW, prices or bills. `consumption_kwh` means grid
-import; `export_kwh` is the provider's `productionKwh` reading at the grid
-connection, not necessarily all solar generation. VAT does not apply to
-energy quantities.
-
-The result includes offset-aware Estonia timestamps, requested bounds,
-retrieval time, the latest returned reading within that window, intervals,
-and separate consumption/export summaries. kWh values are summed with Decimal
-arithmetic, not averaged or duration-weighted a second time. DST days have
-23/24/25 hours or 92/96/100 quarter-hours.
-
-Each direction's summary reports `total_kwh`, `known_intervals`,
-`missing_elapsed_intervals`, `complete`, and `elapsed_complete`. Nulls and
-missing intervals are **not zero**; a numeric zero remains zero. Totals cover
-known readings and are explicitly partial when readings are absent. An
-entirely missing direction has a null total. An entirely unavailable window
-returns an MCP error, not a zero-consumption result.
-
-Only completed accounting intervals are returned and summed. Today's running
-interval and future intervals within today are listed as `pending_intervals`,
-not missing elapsed data. A current-day result is therefore not a final
-full-day total. `complete` requires the entire requested period;
-`elapsed_complete` refers only to intervals that have finished.
-
-Daily and monthly summaries retain their actual start/end bounds.
-`covers_full_calendar_period=false` identifies a requested slice of a month,
-not the full month's consumption. Coverage is not a guarantee of settlement:
-the supported API schema has no finality flag, and readings can arrive late
-or be revised. Historical readings are not labeled stale just because the
-requested period is old. This is **not real-time or per-appliance telemetry**.
-
-### Credentials
-
-Create customer API credentials through Elering's portal and authorize only the
-intended household. Do not put credentials in source, issue comments, tool
-arguments, `.env` files committed to Git, or MCP configuration.
-
-On macOS, store the pair in the login Keychain using these interactive commands.
-Keep `-w` as the final argument so `security` prompts instead of putting the
-credential value in command history or process arguments:
-
-```bash
-security add-generic-password \
-  -s elering-kodala-consumption -a client_id -w
-security add-generic-password \
-  -s elering-kodala-consumption -a client_secret -w
-```
-
-The server reads these entries without printing them. Missing, empty, locked
-or inaccessible Keychain entries produce explicit errors. Do not use
-`security`'s unrestricted `-A` access option.
-
-Alternatively, provide **both** `ELERING_CLIENT_ID` and `ELERING_CLIENT_SECRET`
-through the process environment using your own secure credential mechanism.
-An explicit environment pair takes precedence over Keychain; a partial or
-empty pair fails instead of mixing credential sources. Non-macOS hosts need
-the environment pair.
-
-GitHub Actions secrets with these same names can store credentials for
-separately authorized workflows, but **a local MCP cannot read their values
-back from GitHub**. The Keychain/environment credentials are a separate runtime
-source. This repository does not add a workflow that uses household secrets.
-
-OAuth uses the official `elering-sso` client-credentials endpoint. Access tokens
-are held only in memory and refreshed before expiry. Requests are paced at
-least five seconds apart in this process; rate-limit retries are bounded and
-respect Retry-After. Other applications/sessions sharing the same key can
-still exhaust its limit. Unexpected redirects are rejected, and private
-response bodies and tokens are excluded from errors.
-
-### Register the additional MCP
-
-Add this entry to your existing user-level MCP configuration; do not replace
-other server entries. The Mac uses Keychain, so this example contains no
-credentials:
-
-```json
-{
-  "mcpServers": {
-    "elering-kodala-consumption": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/vasilyevstan/electro.git@main",
-        "elering-kodala-consumption-mcp"
-      ],
-      "tools": [
-        "list_household_metering_points",
-        "get_household_consumption"
-      ],
-      "timeout": 120000
-    }
-  }
-}
-```
-
-Replace `@main` with a tested commit SHA for an immutable installation.
-Keep household EICs, readings, credentials and private API captures out of
-public fixtures, documentation and CI logs. Deterministic tests use synthetic
-data; live account checks belong on the authorized local machine.
-
-## Household electricity pricing MCP
-
-`electrisity-price` is a third **read-only stdio server**. It uses a private
-JSON tariff profile, published market prices and either supplied readings or
-the existing Elering customer client. It does not alter the other MCPs,
-control appliances, use forecasts, learn rates automatically or run a hosted
-service.
-
-### Private configuration
-
-Start with [the synthetic example](examples/pricing-profile.example.json),
-outside the repository:
-
-```bash
-mkdir -p ~/.config/electro/pricing
-chmod 700 ~/.config/electro/pricing
-cp -n examples/pricing-profile.example.json ~/.config/electro/pricing/profile.json
-chmod 600 ~/.config/electro/pricing/profile.json
-```
-
-**Replace the invented example rates, tax fractions and dates before using
-the profile for real costs.** There is no built-in household tariff or
-silent fallback. Keep contracts, invoices, profile history and real replay
-fixtures private; only synthetic examples belong in this repository.
-
-```bash
-ELECTRICITY_PRICING_PROFILE="$HOME/.config/electro/pricing/profile.json" \
-  uv run electrisity-price-mcp
-```
-
-The profile specifies EUR, Europe/Tallinn, a version, finite coverage dates,
-an explicit rounding policy, source evidence and effective-dated rules.
-`from` is inclusive; `until` is exclusive and may be null on an individual
-indefinite rule. The overall profile requires a finite coverage end.
-Unknown fields, missing sources, rule gaps/overlaps and unsupported structures
-are errors. Rate fields are **VAT-exclusive decimal strings**; `vat_rate` is
-a fraction, not a percentage. Gross rates are not accepted as a separate
-input basis or silently converted.
-
-| Component kind | Meaning of its configured `rate` |
-| --- | --- |
-| `spot` | EUR/kWh adjustment added to the matching published EUR/MWh price divided by 1000. Import is a cost; export proceeds are negated into customer-cost convention. Use a negative adjustment for a buyback deduction. |
-| `unit` | EUR/kWh charge on the selected billable import/export direction, such as excise or balancing fees. |
-| `banded` | Net EUR/kWh `band_rates`: `day` and `night`, optionally with both `weekday_peak` and `rest_peak`. |
-| `monthly` | Net EUR per calendar month for one stable component/obligation ID. No energy direction. |
-
-The supported network calendar uses Tallinn working weekdays 07:00-22:00 for
-day pricing; weekends, statutory holidays and other hours are night.
-Configured winter peaks apply November-March: working days 09:00-12:00 and
-16:00-20:00; rest days 16:00-20:00. The holiday calendar follows the current
-Estonian holiday act, including Good Friday, Easter Sunday and Pentecost;
-Easter Monday is not a statutory holiday.
-
-Effective-dated netting rules choose either `gross` or `quarter_hour_net`.
-The latter bills `max(import - export, 0)` and `max(export - import, 0)`
-**within each quarter**, never across a whole day or month.
-
-`tax_treatment` distinguishes `taxable` from `outside_vat`. Outside-VAT
-amounts require a zero VAT fraction but are not labeled zero-rated taxable
-sales. Export balancing can therefore be taxable even when the energy credit
-is outside VAT. Negative spot prices and negative export proceeds are retained.
-
-### Tools
-
-| Tool | Inputs and behavior |
-| --- | --- |
-| `quote_electricity_interval` | Offset-aware `start`/`end` for exactly one aligned 15-minute interval, `consumption_kwh` and/or `export_kwh`, and `quantity_basis` (`raw` by default, or `billable`). Returns variable costs before VAT, VAT and after VAT; monthly fees are excluded. |
-| `calculate_electricity_period` | `start_date`, optional inclusive `end_date`, optional `intervals`, `quantity_basis`, `mode` (`report` or `monthly`) and optional `include_daily`. Supports complete days, weeks, months and multi-month/year ranges. |
-| `estimate_electricity_scenario` | `mode="load"` for constant kW or uniformly distributed hypothetical kWh over a run, or `mode="comparison"` for supplied before/after quarter-hour grid profiles. Returns the incremental variable cost, including network, statutory fees and VAT, but not unchanged monthly fees. |
-
-Quantities are interval **kWh**, not power. They are multiplied by their
-matching market price without another duration factor. Decimal strings are
-preferred; numeric readings from the consumption MCP are also accepted at
-their supplied precision. No measured hourly/monthly quantity is distributed
-into invented quarters. Only the scenario tool's explicit hypothetical load
-mode allocates energy by a declared constant-power/uniform-energy assumption.
-Timestamps require UTC offsets and may not lose sub-microsecond precision.
-
-An interval quote can select just one explicitly billable direction. Raw
-quotes require both directions whenever netting applies. Period calculations
-require both directions for every interval. Missing/null is never zero.
-Already-netted billable inputs are not netted again, and cannot contain two
-positive directions in one netting interval.
-
-For example, a supplied-quantity quote uses:
-
-```json
-{
-  "start": "2026-10-01T22:00:00+03:00",
-  "end": "2026-10-01T22:15:00+03:00",
-  "consumption_kwh": "2",
-  "export_kwh": "0",
-  "quantity_basis": "raw"
-}
-```
-
-To calculate a month from the authorized household automatically:
-
-```json
-{
-  "start_date": "2026-09-01",
-  "end_date": "2026-09-30",
-  "mode": "monthly",
-  "include_daily": true
-}
-```
-
-Omitting `intervals` selects automatic retrieval. It reuses the existing
-Keychain/environment credentials and single-household checks, requests
-quarter-hour readings and bounds upstream requests rather than issuing one
-request per quoted interval. The separate consumption MCP retains its own
-31-day limit; the pricing server composes bounded requests for longer ranges.
-Automatic pricing requires completed past calendar days. Today's unfinished
-day, missing readings, ambiguous households, unknown tariffs and unpublished
-market prices produce explicit tool errors with no partial total.
-
-Alternatively, supply `intervals` containing the consumption MCP's
-`start`, `end`, `consumption_kwh` and `export_kwh` fields. An empty list is
-not an automatic-retrieval request. Caller-provided quantities are identified
-as such, including hypothetical future quantities when the market prices
-have actually been published.
-
-### Appliance estimates and before/after scenarios
-
-For a **hypothetical all-grid load**, call `estimate_electricity_scenario`
-with an offset-aware start, positive duration in minutes, and exactly one of
-`power_kw` or `energy_kwh`:
-
-```json
-{
-  "mode": "load",
-  "start": "2026-08-03T10:07:30+03:00",
-  "duration_minutes": "60",
-  "power_kw": "2"
-}
-```
-
-The example represents a constant 2 kW load for one hour, or 2 kWh.
-Alternatively, replace `power_kw` with `"energy_kwh": "2"` to explicitly
-spread that hypothetical energy evenly across the run. These are scenario
-assumptions, **not measurements or inferred appliance consumption**.
-All energy in this mode is additional **billable grid import**; it does not
-assume the rest of the household consumes zero. Omit `quantity_basis` and
-both interval profiles in load mode. Zero power/energy is valid; zero or
-negative duration is not.
-
-Partial first/last market quarters are allocated by real elapsed overlap.
-UTC arithmetic preserves duration through daylight-saving changes, while
-network bands and displayed times use Tallinn time. Derived energy uses at
-most 24 significant digits and 18 decimal places; cumulative allocation
-preserves the represented total without accumulating rounding drift.
-Durations must resolve to whole microseconds and stay within profile coverage.
-
-For **solar/battery-aware pricing**, supply complete before-and-after grid
-profiles instead. The following synthetic example reduces export and
-increases import:
-
-```json
-{
-  "mode": "comparison",
-  "quantity_basis": "raw",
-  "baseline_intervals": [
-    {
-      "start": "2026-08-03T10:00:00+03:00",
-      "end": "2026-08-03T10:15:00+03:00",
-      "consumption_kwh": "0",
-      "export_kwh": "2"
-    }
-  ],
-  "scenario_intervals": [
-    {
-      "start": "2026-08-03T10:00:00+03:00",
-      "end": "2026-08-03T10:15:00+03:00",
-      "consumption_kwh": "1",
-      "export_kwh": "0"
-    }
-  ]
-}
-```
-
-Comparison mode takes no load-mode start, duration, power or energy argument.
-Both profiles need known import **and** export in every aligned 15-minute
-interval over the same window; their bounds define the comparison period.
-`quantity_basis` defaults to `raw` and applies to both sides. Historical
-gross-flow or quarter-hour netting rules are applied separately to each
-profile; explicitly billable inputs are not netted again.
-
-The tool prices **scenario minus baseline**, including lost export credits,
-changes in import/export balancing, transmission, statutory fees, excise
-and each component's VAT treatment. A negative result is a saving, not an
-error. It does not infer solar output, battery state, dispatch or efficiency.
-Recharge energy, battery losses and later export changes count only when
-represented in the supplied comparison window. Data outside that window is
-not silently assumed free or included. Use the existing consumption MCP to
-obtain actual baseline readings when appropriate; this tool never retrieves
-or substitutes household readings automatically.
-
-In both modes, top-level `amounts`, `lines` and `vat_groups` describe the
-**unrounded incremental cost**, not the whole household's bill. `baseline`
-(null for a load estimate) and `scenario` show the separately priced variable
-costs and quantities. `start`/`end` describe the requested run or comparison;
-`accounting_start`/`accounting_end` describe the containing full quarters.
-`energy_allocation` records the active overlap and kWh in each load quarter;
-`energy_kwh` is null in comparison mode because grid differences do not
-establish appliance energy use.
-
-Unchanged monthly fees are excluded. Prices and the profile are shared
-across both sides from one request snapshot, with source, version/hash and
-invoice-derived qualifications retained. Unpublished prices, missing rates,
-incomplete/mismatched profiles or mixed input modes fail explicitly.
-There are no forecasts, appliance controls or silent missing-as-zero defaults.
-An estimate is not an exact difference between two cent-rounded monthly
-invoices; use the existing monthly calculation for complete energy bills.
-
-### Reporting versus invoice arithmetic
-
-`report` returns **unrounded** variable amounts plus calendar-day allocation
-of fixed fees within each covered month. This is suitable for days, weeks
-and partial months; it is not a standalone supplier bill.
-
-`monthly` requires complete calendar months. It sums unrounded interval
-contributions into monthly component lines, rounds those lines, and calculates
-and rounds VAT separately per month, contract section and VAT rate. An
-annual total sums these finalized monthly results; it does not reround one
-annual taxable base.
-
-Each monthly fee is charged once per stable component ID, even if unchanged
-financial rules have different source versions. A fixed-fee amount or tax
-change inside a billing month is rejected in monthly mode because actual
-partial-contract proration is not configured; an explicitly allocated report
-remains available. Calendar-day report allocation must not be mistaken for
-a supplier's contractual partial-period billing rule.
-
-`include_daily=true` adds analytical daily allocations even in monthly mode.
-**Summing rounded displayed days or interval quotes is not an exact monthly
-invoice reconstruction.** For composition, supply the underlying interval
-readings instead.
-
-Results include exact decimal-string amounts, separate taxable net and
-outside-VAT amounts, component lines, VAT groups, raw/billable quantities,
-monthly summaries and optional daily allocations. Finalized monthly amounts
-have two decimals. Every result includes profile version/hash, source IDs and
-evidence basis, input provenance and warnings. Rates based on invoices stay
-labeled `invoice_derived`; listing reference invoice months never implies
-that a different input or an unbilled period has been invoice-verified.
-Complete metering coverage also does not establish final settlement.
-
-`ROUND_HALF_UP` and `ROUND_HALF_EVEN` are explicit profile choices. Preserve
-the supplier's demonstrated rounding stages and document any unproven tie
-policy instead of silently using the Decimal default.
-
-Totals represent energy costs and credits, not an account ledger. Interest,
-previous balances, payments and amount due are excluded. Reconcile such items
-separately when comparing a complete invoice.
-
-### Updating rates and retaining evidence
-
-Document any accepted contract-versus-invoice discrepancy alongside the
-private profile, including the written rule, working rule, checked periods
-and unresolved qualifications. Preserve repeatable private comparisons of
-line amounts, quantities and section VAT. If a future invoice differs, inspect
-those differences before changing the profile; do not fit rates automatically.
-
-Append effective-dated changes, retain prior amounts and sources, increment
-the profile version and rerun historical fixtures plus the new case. The MCP
-loads one immutable profile snapshot per call, so edits take effect on the
-next call without a restart or mixed old/new rates. Its hash is provenance,
-not a billing-line or monthly-fee occurrence ID.
-
-### Register the pricing MCP
-
-Add an entry without replacing existing servers:
-
-```json
-{
-  "mcpServers": {
-    "electrisity-price": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/vasilyevstan/electro.git@<tested-commit-sha>",
-        "electrisity-price-mcp"
-      ],
-      "env": {
-        "ELECTRICITY_PRICING_PROFILE": "~/.config/electro/pricing/profile.json"
-      },
-      "tools": [
-        "quote_electricity_interval",
-        "calculate_electricity_period",
-        "estimate_electricity_scenario"
-      ],
-      "timeout": 600000
-    }
-  }
-}
-```
-
-Only the profile path belongs in MCP configuration, never its rates, household
-identifiers or credentials. This is still a local process: GitHub publishes the
-generic executable code but does not host the private profile or household API.
-
-## Local Tapo socket MCP
-
-`tp-tapo-mcp` is a separate **local stdio server** for single-outlet Tapo plugs.
-It uses the community-maintained
-[`python-kasa`](https://python-kasa.readthedocs.io/en/stable/) client, not a cloud
-relay service. The existing price, forecast, consumption, and pricing servers
-do not require the new dependency or change their behavior.
-
-### Installation and tools
-
-Use Python 3.11+ for this server; the checkout already selects Python 3.12.
-The base package and existing entry points continue to support Python 3.10.
-
-```bash
-uv sync --locked --extra tapo
-uv run --locked --extra tapo tp-tapo-mcp
-```
-
-Without a checkout, install the published server and its optional extra:
-
-```bash
-uvx --python 3.12 \
-  --from "estonia-nordpool-prices[tapo] @ git+https://github.com/vasilyevstan/electro.git@main" \
-  tp-tapo-mcp
-```
-
-For an immutable installation, replace `@main` with `@<commit-sha>`.
-
-Keep `--extra tapo` when launching with `uv run`. Starting this MCP without the
-extra or on Python 3.10 fails with an explicit setup error instead of silently
-omitting its functionality. Startup itself neither contacts nor switches plugs.
-
-| Tool | Inputs and behavior |
-| --- | --- |
-| `list_tapo_plugs` | Optional boolean `refresh` (default `true`). Discover local plugs and merge them with known MACs. `false` returns cached inventory only. No credentials or relay commands are used. |
-| `get_tapo_plug` | Required `mac`. Authenticate the exact plug, verify its MAC, and read its relay state, electrical measurements, and supported operating sensors. |
-| `set_tapo_plug_power` | Required `mac` and explicit boolean `on`. Set the desired state and verify it with a fresh authenticated read. This tool changes a physical load. |
-
-MACs use six hexadecimal octets separated by colons or hyphens; output uses
-uppercase colon notation, for example the **synthetic** `02:00:00:00:00:01`.
-Names and old IPs are not accepted as control targets. Duplicate/conflicting
-identities fail explicitly. If a cached address has changed, the client makes
-one bounded rediscovery and rechecks the authenticated MAC rather than sending
-a command to the new occupant of an old address.
-
-There are no toggle, bulk-control, scheduling, firmware-update, generic
-feature-setting, or price-based automation tools. Only request a power change
-for a specific socket and a load that is safe to interrupt. Discovery and
-reading never issue a relay command, including when checking capabilities.
-
-### Local credentials and compatibility
-
-Discovery works without credentials. Authenticated readings and control need
-the TP-Link account that owns the plugs, available **locally**:
-
-```bash
-security add-generic-password -s tp-tapo-mcp -a username -w
-security add-generic-password -s tp-tapo-mcp -a password -w
-```
-
-Run these in your own terminal. Keep `-w` last so the command prompts rather
-than including the credential value in command history or process arguments.
-Use the account's TP-Link ID/email as `username`. Do not use unrestricted
-Keychain access (`-A`). Missing, locked, empty, or inaccessible entries produce
-explicit errors. Keychain credentials are read when a data/control tool runs.
-
-Alternatively, supply both `TAPO_USERNAME` and `TAPO_PASSWORD` to the MCP process
-using a secure environment mechanism. An explicit environment pair takes
-precedence over Keychain; an incomplete or empty pair fails instead of mixing
-sources. Non-macOS hosts need the environment pair. Setting variables in an
-unrelated terminal does not update an already-running MCP process.
-
-**GitHub Actions secrets are not a runtime credential source for a local MCP.**
-GitHub exposes their names and metadata, not their saved values. Keeping
-GitHub copies does not populate Keychain or the MCP process environment.
-Do not paste credentials into conversations or add them to tool arguments,
-MCP configuration, source, the device registry, or logs. No secret-export
-workflow is provided.
-
-Discovery uses local UDP broadcasts on ports 9999 and 20002. The host and
-plugs need suitable LAN connectivity; guest isolation, VLAN boundaries,
-firewalls, and host local-network permissions can prevent discovery.
-An unplugged socket cannot respond or be switched back on over the network.
-
-Some firmware advertises TPAP, which the selected client does not support.
-Such devices remain visible in inventory as `unsupported_protocol`, not as
-an empty network. TP-Link's optional
-[Third-Party Compatibility setting](https://www.tp-link.com/us/support/faq/4416/)
-may expose a compatible protocol. The server does not change this setting or
-assume that enabling it guarantees access: rediscovery and a successful
-authenticated read are still required. Do not install an unreviewed protocol
-fork or downgrade firmware to work around an error.
-
-### Readings and power-change outcomes
-
-Both `get_tapo_plug` and a verified power-setting result include consumption
-when on. `measurements` distinguishes:
-
-| Field | Unit and meaning |
-| --- | --- |
-| `power` | W, measured instantaneous power |
-| `energy_today` | kWh, the device's current local-day counter |
-| `energy_this_month` | kWh, the device's current local-month counter |
-| `energy_total` | kWh since reboot, only if that capability is exposed |
-| `voltage` | V, when supported |
-| `current` | A, when supported |
-
-Each measurement has `value`, `unit`, `status`, `reason`, and `period`.
-`available` may legitimately contain zero; `unsupported` and `unavailable`
-contain null, never an invented zero. Availability is detected from the device,
-not assumed from a model name. Operating sensors are returned separately;
-private network/account identifiers and writable features are not dumped.
-
-An on relay does not imply a positive load. Turning a socket off does not
-reset its daily/monthly energy counters. Power in W is not energy in kWh;
-there is no background sampling, historical database, or cost calculation.
-Counter boundaries follow the device's clock. The response preserves its
-reported time and collection time rather than assuming the host timezone.
-
-Power setting is a desired-state operation, not a toggle. If the relay is
-already in the requested state, no command is sent and `acknowledged` is null.
-Otherwise, the client sends one command with automatic write retries disabled.
-A new authenticated connection reads back the state and consumption, avoiding
-the library's cached energy-update interval.
-
-`verified=true` means the requested state was observed at read-back, not that
-it will remain unchanged or that a connected appliance is drawing power.
-A lost acknowledgement may be resolved by read-back, with an explicit warning.
-If the outcome cannot be confirmed, the tool returns an MCP error saying the
-command may have taken effect; inspect state rather than blindly repeating it.
-External applications and manual buttons can still change a plug's state.
-
-### Private inventory and registration
-
-Known devices persist in `~/.config/electro/tapo/devices.json`, keyed by MAC.
-The directory/file use permissions 700/600; writes replace the file atomically.
-The registry stores only identity, last-known addresses/labels, and capability
-metadata, not credentials or measurement history. Invalid or conflicting
-registry data is an error, not a reason to reset the inventory.
-
-Devices not seen during a refresh remain listed with their last-known metadata.
-`not_seen` does not prove an off relay or physical disconnection.
-`capabilities_verified_at` labels the age of cached capabilities; listing does
-not reauthenticate devices. Keep real inventories, MACs, readings, and private
-device captures out of public source, examples, PRs, and CI output.
-
-After read-only local verification, add only the new entry to the existing
-user-level MCP configuration. This example uses the published source; pin a
-verified commit for an immutable installation. Do not replace existing server
-entries or add credentials to the configuration:
-
-```json
-{
-  "mcpServers": {
-    "tp-tapo-mcp": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": [
-        "--python", "3.12",
-        "--from", "estonia-nordpool-prices[tapo] @ git+https://github.com/vasilyevstan/electro.git@main",
-        "tp-tapo-mcp"
-      ],
-      "tools": [
-        "list_tapo_plugs",
-        "get_tapo_plug",
-        "set_tapo_plug_power"
-      ],
-      "timeout": 300000
-    }
-  }
-}
-```
-
-Use a specifically approved safe test MAC/load for any later physical on/off
-check, record its original state, and verify restoration. Mocked tests and
-successful discovery are not proof of authenticated readings or relay control.
-
-## Sensibo climate MCP
-
-`sensibo-mcp` is a separate stdio server for Sensibo Sky (`skyv2`) controllers.
-It uses the official **cloud API**, not a local device API. Internet access to
-`home.sensibo.com` and a Sensibo API key are required. Devices are addressed by
-stable device IDs, with verified MACs retained privately; DHCP/IP changes do
-not affect control. Other device models are rejected during enrollment rather
-than assigned guessed capabilities.
-
-### Credentials and explicit enrollment
-
-Generate a key at <https://home.sensibo.com/me/api> while signed into the account
-containing the intended devices. Do not paste it into chat, source files, MCP
-configuration, or command arguments. If a key has been exposed, rotate it.
-
-On macOS, store it interactively, with `-w` last:
-
-```bash
-security add-generic-password -s sensibo-mcp -a api_key -w
-```
-
-Alternatively, supply `SENSIBO_API_KEY` securely through the server's process
-environment. An explicit environment value takes precedence; empty or
-whitespace-containing values fail rather than falling back to Keychain.
-GitHub secret `SENSIBO_API_KEY` can retain a separate encrypted copy, but a local
-MCP **cannot read secret values back from GitHub**.
-
-From a checkout, enroll the account only after confirming the expected count:
-
-```bash
-uv run --locked python -m sensibo --enroll-account --expected-devices 4
-```
-
-This is explicit account enrollment, not an HVAC command. It validates the
-count, model, and unique device-ID/MAC associations before atomically writing
-`~/.config/electro/sensibo/devices.json` (directory `700`, file `600`).
-Previously enrolled devices are retained when absent from the account.
-Conflicting identities fail rather than being reassigned. New account devices
-are never silently authorized for control.
-
-To retain the verified inventory in a GitHub repository secret:
-
-```bash
-gh secret set SENSIBO_DEVICES --repo vasilyevstan/electro \
-  < ~/.config/electro/sensibo/devices.json
-```
-
-The local inventory remains necessary; GitHub is not a runtime secret-fetch
-service. Neither credentials nor real device inventory belong in commits,
-examples, fixtures, or public logs.
-
-### Tools, readings, and control semantics
-
-| Tool | Behavior |
-| --- | --- |
-| `list_sensibo_devices()` | Enrolled IDs/MACs, connectivity, and mode-specific capabilities; missing devices remain visible and new account devices are counted but not enrolled |
-| `get_sensibo_device(device_id)` | Cloud-reported AC state, measured temperature/humidity, derived feels-like temperature, RSSI, timestamps, and freshness |
-| `get_sensibo_measurements(device_id, days=1)` | Provider-available historical samples for 1-7 days, UTC timestamps, actual coverage, and nulls/gaps without interpolation |
-| `set_sensibo_ac_state(device_id, ...)` | One explicit desired power/mode/temperature/fan/swing update after fresh identity, connectivity, capability, and policy checks |
-
-Current account reads share a **60-second on-demand cache**. Sensor timestamps
-remain the original measurement times; cache age and sensor age are different.
-Samples older than ten minutes are marked stale. Unknown timestamps, offline
-status, missing readings, and null values are explicit, never fabricated zeros.
-Sensor temperatures and feels-like values are **Celsius**, independently of the
-AC setpoint's C/F unit. Feels-like temperature is provider-derived; RSSI is
-Wi-Fi signal strength in dBm. This version does not infer power consumption,
-air quality, or occupancy from Sky readings.
-
-History has a separate short cache and retains its original requested window
-and retrieval time. The seven-day request bound is an application limit, not a
-promise of provider retention, complete samples, or uninterrupted recording.
-There is no background collector, database, subscription, or schedule.
-
-Control accepts `on`, `mode`, `target_temperature`, `temperature_unit`,
-`fan_level`, `swing`, and `horizontal_swing`. Provide temperature and its unit
-together; allowed values come from that device's selected mode, not a global
-list. For example, a dry mode may have no fan-level control. Unspecified
-settings are not sent, and incompatible retained settings require an explicit
-choice instead of a silent reset. Account/device restrictions remain enforced.
-
-Commands are serialized in this MCP process, but other apps/controllers can
-still act independently. Every explicit command can emit infrared, including
-a repeated desired state. There are no toggle or bulk-control tools and no
-automatic write retries. A timeout, rejected command, or unsuccessful read-back
-returns a tool error explaining that the outcome may be uncertain; read the
-state before deciding whether another command is needed.
-
-A successful result distinguishes `api_acknowledged` and
-`cloud_state_matches` from `physical_effect_verified=false`. Neither cloud
-state nor an accepted IR command proves that the HVAC unit received it or that
-its compressor is running. Never test physical switching without selecting an
-authorized device and explicit safe command.
-
-### Launching and registering Sensibo
-
-From a checkout:
-
-```bash
-uv run --locked sensibo-mcp
-```
-
-From the published repository:
-
-```bash
-uvx --from "git+https://github.com/vasilyevstan/electro.git@main" sensibo-mcp
-```
-
-Add a separate entry to the existing user-level `~/.copilot/mcp-config.json`,
-preserving its other servers. Pin `@main` to a published commit SHA when a
-reproducible launch is required. No credentials are embedded in this entry:
-
-```json
-{
-  "mcpServers": {
-    "sensibo-mcp": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/vasilyevstan/electro.git@main",
-        "sensibo-mcp"
-      ],
-      "tools": [
-        "list_sensibo_devices",
-        "get_sensibo_device",
-        "get_sensibo_measurements",
-        "set_sensibo_ac_state"
-      ],
-      "timeout": 120000
-    }
-  }
-}
-```
-
-Run deterministic, synthetic tests without a real account or physical writes:
-
-```bash
-uv run --locked python -m unittest discover -s tests -p 'test_sensibo*.py' -v
-```
-
-References: [official Sensibo API](https://support.sensibo.com/sensibo.openapi.yaml)
-and [Home Assistant's Sensibo integration](https://www.home-assistant.io/integrations/sensibo/).
-
-## Data source
-
-The published-price tools query Elering, Estonia's transmission system operator:
-
-```text
-https://dashboard.elering.ee/api/nps/price
-```
-
-The Estonia series is returned as `data.ee` in EUR/MWh. Elering explains that
-Nord Pool day-ahead prices use 15-minute market periods from September 30,
-2025:
-
-- <https://dashboard.elering.ee/assets/api-doc.html>
-- <https://www.elering.ee/en/transition-15-minute-market-time-unit>
-
-The implementation calculates the requested day in `Europe/Tallinn` and does
-not assume exactly 96 intervals. Daylight-saving transitions produce 92 or 100
-quarter-hour intervals.
-
-Nord Pool applies separate terms to customer-facing display and data
-redistribution. Publishing this source code under the MIT License does not
-grant rights to redistribute upstream market data. Review the applicable terms
-before exposing price data through a public website or API:
-
-- <https://www.nordpoolgroup.com/en/services/power-market-data-services/faq/faq-premium-container/redistribution/>
+For registrations that must survive a later checkout rename, use a
+Git-commit-pinned `uvx --from` launch or a non-editable installation in a
+separate persistent environment. Do not point those registrations at
+`uv run --directory /path/to/the/checkout`. Preserve their tool allowlists and
+private environment settings when updating the executable source.
+
+After moving a development checkout, run `uv sync --locked --inexact` from its
+new root to refresh the editable installation and generated entry points.
+Keep any needed `--extra` selections. Independently installed MCPs do not need
+the checkout to be present.
+
+Existing `~/.config/electro/`, `~/.local/share/electro/`, environment variable
+names, and Keychain services are intentionally unchanged. Do not move private
+configuration or re-provision devices merely because the repository was renamed.
 
 ## Validation
 
 Run the deterministic test suite without live network access:
 
 ```bash
-uv run python -m unittest discover -s tests -v
+uv run --locked --inexact python -m unittest discover -s tests -v
 ```
 
 Check syntax:
 
 ```bash
-uv run python -m py_compile nordpool_ee.py mcp_server.py wattcast_forecast.py \
-  elering_consumption.py elering_consumption_mcp.py electricity_pricing.py \
-  electricity_pricing_mcp.py tapo_plugs.py tapo_mcp.py
+uv run --locked --inexact python -m compileall -q home_automation *.py
 ```
 
 Run the CLI for a live next-day source check:
@@ -1136,6 +160,18 @@ mutations, and confirmed/uncertain read-back. Without the extra, the
 library-dependent tests are explicitly skipped; base startup/credential and
 MCP schema tests still run. Automated tests never require real Tapo or GitHub
 secrets and must not switch household loads.
+
+For the complete optional-runtime suite:
+
+```bash
+uv run --locked --all-extras --inexact python -m unittest discover -s tests -v
+```
+
+`test_package_layout.py` checks packaged console commands, legacy module
+identity, per-MCP documentation, and lazy imports. Each MCP's maintenance file
+lists its focused tests. Device tests use synthetic identities and mocked
+controls; a repository refactor or installation check does not authorize
+physical switching, heating, playback, regrouping, or dish reconfiguration.
 
 ## License
 
