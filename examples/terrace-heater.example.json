@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "device_id": "syntheticheater001",
+  "name": "Synthetic example only - not a verified real heater",
+  "product_id": "synthetic-product",
+  "protocol_version": "3.3",
+  "address_hint": "10.20.30.40",
+  "verified_at": "2026-01-01T00:00:00+00:00",
+  "standby_settings_verified": false,
+  "fields": {
+    "power": {
+      "dp": "11",
+      "kind": "Boolean",
+      "writable": true
+    },
+    "temperature": {
+      "dp": "12",
+      "kind": "Integer",
+      "writable": false,
+      "minimum": -20,
+      "maximum": 80,
+      "step": 1,
+      "scale": 0,
+      "unit": "C"
+    },
+    "setpoint": {
+      "dp": "13",
+      "kind": "Integer",
+      "writable": true,
+      "minimum": 5,
+      "maximum": 40,
+      "step": 1,
+      "scale": 0,
+      "unit": "C"
+    },
+    "mode": {
+      "dp": "14",
+      "kind": "Enum",
+      "writable": true,
+      "values": ["smart", "auto"]
+    },
+    "power_level": {
+      "dp": "15",
+      "kind": "Enum",
+      "writable": true,
+      "values": ["1", "2", "3", "4"]
+    }
+  }
+}

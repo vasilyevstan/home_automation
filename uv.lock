@@ -578,13 +578,21 @@ wheels = [
 
 [[package]]
 name = "estonia-nordpool-prices"
-version = "0.8.0"
+version = "0.9.0"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
 ]
 
 [package.optional-dependencies]
+heater = [
+    { name = "tinytuya" },
+]
+heater-setup = [
+    { name = "qrcode" },
+    { name = "tinytuya" },
+    { name = "tuya-device-sharing-sdk" },
+]
 sonos = [
     { name = "soco" },
 ]
@@ -604,9 +612,13 @@ requires-dist = [
     { name = "mcp", specifier = ">=2.2,<3" },
     { name = "protobuf", marker = "extra == 'starlink'", specifier = ">=6.31,<8" },
     { name = "python-kasa", marker = "python_full_version >= '3.11' and extra == 'tapo'", specifier = ">=0.10.2,<0.11" },
+    { name = "qrcode", marker = "extra == 'heater-setup'", specifier = ">=8,<9" },
     { name = "soco", marker = "extra == 'sonos'", specifier = ">=0.31.4,<0.32" },
+    { name = "tinytuya", marker = "extra == 'heater'", specifier = ">=1.20,<2" },
+    { name = "tinytuya", marker = "extra == 'heater-setup'", specifier = ">=1.20,<2" },
+    { name = "tuya-device-sharing-sdk", marker = "extra == 'heater-setup'", specifier = ">=0.2.11,<0.3" },
 ]
-provides-extras = ["tapo", "starlink", "sonos"]
+provides-extras = ["tapo", "starlink", "sonos", "heater", "heater-setup"]
 
 [[package]]
 name = "exceptiongroup"
@@ -1314,6 +1326,15 @@ wheels = [
 ]
 
 [[package]]
+name = "paho-mqtt"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/39/15/0a6214e76d4d32e7f663b109cf71fb22561c2be0f701d67f93950cd40542/paho_mqtt-2.1.0.tar.gz", hash = "sha256:12d6e7511d4137555a3f6ea167ae846af2c7357b10bc6fa4f7c3968fc1723834", size = 148848, upload-time = "2024-04-29T19:52:55.591Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c4/cb/00451c3cf31790287768bb12c6bec834f5d292eaf3022afc88e14b8afc94/paho_mqtt-2.1.0-py3-none-any.whl", hash = "sha256:6db9ba9b34ed5bc6b6e3812718c7e06e2fd7444540df2455d2c51bd58808feee", size = 67219, upload-time = "2024-04-29T19:52:48.345Z" },
+]
+
+[[package]]
 name = "propcache"
 version = "0.5.4"
 source = { registry = "https://pypi.org/simple" }
@@ -1681,6 +1702,18 @@ wheels = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "8.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8f/b2/7fc2931bfae0af02d5f53b174e9cf701adbb35f39d69c2af63d4a39f81a9/qrcode-8.2.tar.gz", hash = "sha256:35c3f2a4172b33136ab9f6b3ef1c00260dd2f66f858f24d88418a015f446506c", size = 43317, upload-time = "2025-05-01T15:44:24.726Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/dd/b8/d2d6d731733f51684bbf76bf34dab3b70a9148e8f2cef2bb544fccec681a/qrcode-8.2-py3-none-any.whl", hash = "sha256:16e64e0716c14960108e85d853062c9e8bba5ca8252c0b4d0231b9df4060ff4f", size = 45986, upload-time = "2025-05-01T15:44:22.781Z" },
+]
+
+[[package]]
 name = "referencing"
 version = "0.37.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2006,12 +2039,39 @@ wheels = [
 ]
 
 [[package]]
+name = "tinytuya"
+version = "1.20.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama" },
+    { name = "cryptography" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/68/ba/4199064373d6aa310e32e69b2c397937b4c25f5f8862a514ecdaeb34fe36/tinytuya-1.20.0.tar.gz", hash = "sha256:54bfcd0b3411ae4c94cf473e1ca28a2ffa4d376ed2d8e7e4e4adfcdf4ca1657c", size = 190632, upload-time = "2026-07-06T04:39:14.342Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d7/87/3b1ac3cae266e82bf40cbc5cccb7a80e0c28b9a0b65a4ad9b088e190d507/tinytuya-1.20.0-py3-none-any.whl", hash = "sha256:ac5650c30f1153b1eae0b8d75f67043fb2397a168d3834e47da2d88d2c08c722", size = 170518, upload-time = "2026-07-06T04:39:12.997Z" },
+]
+
+[[package]]
 name = "truststore"
 version = "0.10.4"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/53/a3/1585216310e344e8102c22482f6060c7a6ea0322b63e026372e6dcefcfd6/truststore-0.10.4.tar.gz", hash = "sha256:9d91bd436463ad5e4ee4aba766628dd6cd7010cf3e2461756b3303710eebc301", size = 26169, upload-time = "2025-08-12T18:49:02.73Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/19/97/56608b2249fe206a67cd573bc93cd9896e1efb9e98bce9c163bcdc704b88/truststore-0.10.4-py3-none-any.whl", hash = "sha256:adaeaecf1cbb5f4de3b1959b42d41f6fab57b2b1666adb59e89cb0b53361d981", size = 18660, upload-time = "2025-08-12T18:49:01.46Z" },
+]
+
+[[package]]
+name = "tuya-device-sharing-sdk"
+version = "0.2.15"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "paho-mqtt" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4f/ed/1b29b857830d31ade134d3cb733c2a1555a5a919c897b5c32aa5737fc014/tuya_device_sharing_sdk-0.2.15.tar.gz", hash = "sha256:360e29e95b63019ba179b8b9b43530fd4f02647ec41deaedd735b753d7877041", size = 27142, upload-time = "2026-08-20T10:32:47.132Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/26/16/dcbe536c14875f753c783b1806bd47de2d27c8a13c422d73b400616d6965/tuya_device_sharing_sdk-0.2.15-py3-none-any.whl", hash = "sha256:415ef070c7b6059f9df97b0f89462d5834af99115f2c6a548c888658cf23e420", size = 41486, upload-time = "2026-08-20T10:32:45.719Z" },
 ]
 
 [[package]]

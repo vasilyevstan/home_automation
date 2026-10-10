@@ -1,0 +1,1 @@
+"""Enrolled Sensibo climate controllers."""
