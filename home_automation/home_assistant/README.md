@@ -156,6 +156,24 @@ entry/path. Profile contents are reloaded on each calculation refresh.
 No default real tariff is supplied. Missing, invalid, or expired profiles are
 errors, not a reason to assume free energy or extrapolate rates.
 
+For automatic household billing, optionally deploy a separate private JSON file:
+
+```json
+{
+  "client_id": "YOUR_ELERING_CLIENT_ID",
+  "client_secret": "YOUR_ELERING_CLIENT_SECRET"
+}
+```
+
+Select its configuration-relative path, for example
+`private/elering/credentials.json`, in the integration's configure/reconfigure
+form. Keep its directory private and set the file to mode `0600`. Paths escaping
+the configuration directory, group/other-readable files, partial credentials
+and duplicate JSON fields are rejected. Credentials are used only by the existing
+read-only Elering client; they are never action arguments, results, or bundle
+contents. Omitting this configuration preserves all price sensors, quotes and
+caller-supplied calculations; automatic metering requests fail explicitly.
+
 ## Sensors, price windows, and MCP queries
 
 The calculated integration exposes:
@@ -193,10 +211,69 @@ The response includes `complete`, `expected_intervals`,
 Never present an incomplete window as a complete next-day schedule. Profile
 coverage and market coverage are separate. No forecast is substituted.
 
-The separately selectable **Household electricity prices (read only)** LLM API
-exposes `GetHouseholdElectricityPrices` through HA's native MCP. It accepts only
-`period: today` or `period: tomorrow`; it has no device controls, file arguments,
-or arbitrary service access.
+The separately selectable **Household electricity prices and bills (read only)**
+LLM API exposes `GetHouseholdElectricityPrices`,
+`QuoteHouseholdElectricityInterval`, `CalculateHouseholdElectricityPeriod` and
+`EstimateHouseholdElectricityScenario` through HA's native MCP. The existing
+price-window tool still accepts only `period: today` or `period: tomorrow`.
+The API has no device controls, per-call file arguments or arbitrary service
+access. Existing clients with explicit tool allowlists must add the three new
+calculator names without removing their existing tools.
+
+## Native bill and estimate actions
+
+**Developer tools > Actions** exposes the same SDK-free financial engine through
+three response-returning actions:
+
+| Action | Purpose |
+| --- | --- |
+| `household_electricity_pricing.quote_electricity_interval` | One supplied 15-minute import/export interval; monthly fees excluded |
+| `household_electricity_pricing.calculate_electricity_period` | Actual household bill presets or custom dates/length, with automatic Elering or complete supplied energy |
+| `household_electricity_pricing.estimate_electricity_scenario` | Additional hypothetical load or before/after grid-profile variable cost; unchanged monthly fees excluded |
+
+For the current bill:
+
+```yaml
+action: household_electricity_pricing.calculate_electricity_period
+data:
+  config_entry: YOUR_HOUSEHOLD_PRICING_ENTRY_ID
+  period: month_to_date
+```
+
+`month_to_date` prices the contiguous complete delivery days currently available,
+starting on the first of the Tallinn calendar month. It includes **full known
+monthly fixed charges** and applies the engine's component-line/section-VAT
+rounding to the observed totals. The response is explicitly a `provisional_bill`,
+not a finalized full-month invoice; today's unfinished day is excluded, and
+`coverage` identifies the requested/actual cutoff and pending completed days.
+Holes inside the included days remain errors. Known fixed-fee changes anywhere
+in that month must be resolved, not silently prorated. Optional daily breakdowns
+still allocate fixed fees by day and must not be summed to reconstruct this bill.
+
+`previous_month` selects the last complete calendar month; `last_12_months`
+selects the last 12 **complete** calendar months. Both default to the existing
+monthly invoice arithmetic. Every requested date needs sourced tariff history:
+if the private profile does not cover the older months, the action fails before
+retrieving household data. It does not extrapolate a current margin into history.
+
+Use `period: custom` with inclusive `start_date`/`end_date`, or with a positive
+whole-number `days`. A supplied start plus `days` counts forward; `days` alone
+selects that many latest completed calendar days. Do not combine presets with
+custom dates/length, or `end_date` with `days`. `mode: report` uses unrounded,
+calendar-day-allocated fees; `mode: monthly` still requires whole calendar months.
+All energy is real 15-minute **kWh**, not redistributed hourly/monthly totals.
+
+Published prices are always the default, fetched through the canonical public
+market-data helper in bounded 31-day batches. There is **no automatic forecast
+provider or fallback**. For a future period, supply complete energy intervals,
+`price_basis: estimate` and complete `price_intervals` objects containing
+offset-aware `start`, `end` and net `price_eur_mwh`. Use report mode for such
+planning periods; estimates cannot finalize actual monthly bills or use automatic
+future metering. The result and nested scenario prices retain explicit estimated
+provenance, profile qualifications and unrounded amounts.
+
+The native extension does not change the original pricing MCP's tool signatures
+or its published-price-only billing behavior.
 
 Calculations join actual UTC instants and use Tallinn tariff rules, accounting
 for adjacent CET market days and 92/96/100-quarter days. Nord Pool's generic
@@ -264,7 +341,7 @@ The source adapter and bundle tests run in the existing project environment:
 
 ```sh
 uv run --locked --inexact python -m unittest discover \
-  -s tests -p 'test_home_assistant_pricing.py' -v
+  -s tests -p 'test_home_assistant_pricing*.py' -v
 ```
 
 Run the actual HA API tests separately so its dependencies cannot replace those

@@ -9,6 +9,7 @@ from homeassistant.helpers import llm
 from homeassistant.helpers.llm import LLMContext, ToolAnnotations, ToolInput, ToolResult
 
 from .const import DOMAIN
+from .calculation_api import CALCULATION_FIELDS, HouseholdCalculationTool
 from .coordinator import HouseholdPriceCoordinator
 
 
@@ -42,18 +43,25 @@ class HouseholdPricesTool(llm.Tool):
 
 class HouseholdPriceAPI(llm.API):
     def __init__(self, hass: HomeAssistant, coordinator: HouseholdPriceCoordinator) -> None:
-        super().__init__(hass=hass, id=DOMAIN, name="Household electricity prices (read only)")
+        super().__init__(hass=hass, id=DOMAIN, name="Household electricity prices and bills (read only)")
         self.coordinator = coordinator
 
     async def async_get_api_instance(self, llm_context: LLMContext) -> llm.APIInstance:
         return llm.APIInstance(
             api=self,
             api_prompt=(
-                "Use the household price tool for published, tariff-aware quarter prices. "
-                "These are marginal rates, not an invoice. Preserve negative export "
+                "Use the household price tool for published, tariff-aware quarter prices, "
+                "and calculator tools for explicitly covered bills, date ranges and estimates. "
+                "Current month-to-date includes full fixed fees but excludes unmeasured days. "
+                "Never replace missing historical tariffs or published prices with guesses. "
+                "Only explicitly labeled estimates may use caller-supplied future prices. "
+                "Calculated totals are not issued invoices. Preserve negative export "
                 "earnings, missing-data reasons, and invoice-derived qualifications. "
                 "Do not call incomplete next-day coverage a complete forecast."
             ),
             llm_context=llm_context,
-            tools=[HouseholdPricesTool(self.coordinator)],
+            tools=[
+                HouseholdPricesTool(self.coordinator),
+                *(HouseholdCalculationTool(action, self.coordinator) for action in CALCULATION_FIELDS),
+            ],
         )

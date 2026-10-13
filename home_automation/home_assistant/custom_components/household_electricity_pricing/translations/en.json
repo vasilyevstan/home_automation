@@ -8,6 +8,7 @@
         "data": {
           "nordpool_config_entry": "Nord Pool configuration",
           "profile_path": "Private profile path relative to the HA configuration directory",
+          "elering_credentials_path": "Optional private Elering credentials JSON path for automatic bills",
           "solar_config_entry": "Optional inverter for separately enabled guarded MCP controls",
           "daikin_config_entry": "Optional Daikin for separately enabled guarded MCP controls"
         }
@@ -18,13 +19,14 @@
         "data": {
           "nordpool_config_entry": "Nord Pool configuration",
           "profile_path": "Private profile path relative to the HA configuration directory",
+          "elering_credentials_path": "Optional private Elering credentials JSON path for automatic bills",
           "solar_config_entry": "Optional inverter for separately enabled guarded MCP controls",
           "daikin_config_entry": "Optional Daikin for separately enabled guarded MCP controls"
         }
       }
     },
     "error": {
-      "invalid_configuration": "Check the EE/EUR Nord Pool configuration and the private profile."
+      "invalid_configuration": "Check the EE/EUR Nord Pool configuration, private profile and any configured private Elering credentials file."
     },
     "abort": {
       "already_configured": "Household electricity pricing is already configured.",
@@ -43,6 +45,141 @@
         "period": {
           "name": "Local delivery day",
           "description": "Today or tomorrow in Europe/Tallinn."
+        }
+      }
+    },
+    "quote_electricity_interval": {
+      "name": "Quote a household electricity interval",
+      "description": "Calculate exactly one 15-minute interval, including tariff charges and VAT but excluding monthly fees. Quantities are interval kWh, not power.",
+      "fields": {
+        "config_entry": {
+          "name": "Configuration"
+        },
+        "start": {
+          "name": "Interval start",
+          "description": "ISO timestamp with UTC offset, such as 2026-08-03T10:00:00+03:00."
+        },
+        "end": {
+          "name": "Interval end",
+          "description": "Exactly 15 minutes after start, with its UTC offset."
+        },
+        "consumption_kwh": {
+          "name": "Imported energy (kWh)",
+          "description": "Decimal strings preserve precision. Missing is not zero."
+        },
+        "export_kwh": {
+          "name": "Exported energy (kWh)",
+          "description": "Supply both raw directions when quarter-hour netting applies."
+        },
+        "quantity_basis": {
+          "name": "Quantity basis",
+          "description": "Raw metered flows or already billable quantities; never net billable quantities twice."
+        },
+        "price_basis": {
+          "name": "Price basis",
+          "description": "Published prices are retrieved automatically. Supplied future prices require estimate."
+        },
+        "price_intervals": {
+          "name": "Explicit estimated prices",
+          "description": "Estimate only: a list of start, end and price_eur_mwh objects, excluding VAT."
+        }
+      }
+    },
+    "calculate_electricity_period": {
+      "name": "Calculate a household electricity bill or period",
+      "description": "Choose a bill preset or custom calendar dates/length. Automatic metering needs private Elering credentials. Current month-to-date includes full monthly fees and explicitly reports incomplete metering coverage; no missing usage is zero-filled.",
+      "fields": {
+        "config_entry": {
+          "name": "Configuration"
+        },
+        "period": {
+          "name": "Period",
+          "description": "Current month-to-date, previous complete month, last 12 complete months, or custom dates/length."
+        },
+        "start_date": {
+          "name": "Start date",
+          "description": "Custom periods only; calendar date in Europe/Tallinn."
+        },
+        "end_date": {
+          "name": "Inclusive end date",
+          "description": "Custom periods only. Omit for one day, or use days instead."
+        },
+        "days": {
+          "name": "Length in calendar days",
+          "description": "Custom periods only. With a start date, counts forward; without one, selects the latest completed days."
+        },
+        "intervals": {
+          "name": "Supplied quarter-hour energy",
+          "description": "Optional list of start, end, consumption_kwh and export_kwh objects. Both flows and complete coverage are required. Omit to use actual Elering readings."
+        },
+        "quantity_basis": {
+          "name": "Quantity basis",
+          "description": "Automatic Elering readings are raw. Use billable only for already netted supplied quantities."
+        },
+        "mode": {
+          "name": "Accounting mode",
+          "description": "Auto selects the preset's accounting. Report allocates monthly fees by calendar day; monthly requires complete calendar months. Keep auto for month-to-date."
+        },
+        "include_daily": {
+          "name": "Include daily analytical breakdown",
+          "description": "Daily fixed-fee allocations are not additive finalized invoice lines."
+        },
+        "price_basis": {
+          "name": "Price basis",
+          "description": "Actual-bill presets require published prices. Custom planning estimates need supplied energy and explicitly estimated prices."
+        },
+        "price_intervals": {
+          "name": "Explicit estimated prices",
+          "description": "Estimate only: complete 15-minute start/end/price_eur_mwh objects, excluding VAT. Never a fallback for an actual bill."
+        }
+      }
+    },
+    "estimate_electricity_scenario": {
+      "name": "Estimate an appliance or grid-profile change",
+      "description": "Calculate additional variable cost or saving with the same tariffs and VAT rules. Unchanged monthly fees are excluded; no appliance consumption, solar or battery behavior is inferred.",
+      "fields": {
+        "config_entry": {
+          "name": "Configuration"
+        },
+        "mode": {
+          "name": "Scenario",
+          "description": "Load assumes additional billable grid import; comparison prices supplied before/after grid profiles."
+        },
+        "start": {
+          "name": "Load start",
+          "description": "Load only: ISO timestamp with UTC offset."
+        },
+        "duration_minutes": {
+          "name": "Load duration (minutes)",
+          "description": "Load only: positive duration."
+        },
+        "power_kw": {
+          "name": "Constant load power (kW)",
+          "description": "Load only: supply this or energy_kwh, never both."
+        },
+        "energy_kwh": {
+          "name": "Uniform load energy (kWh)",
+          "description": "Load only: explicit hypothetical energy, not a redistributed meter total."
+        },
+        "baseline_intervals": {
+          "name": "Baseline grid profile",
+          "description": "Comparison only: complete quarter-hour import/export objects."
+        },
+        "scenario_intervals": {
+          "name": "Changed grid profile",
+          "description": "Comparison only: the same accounting window as the baseline."
+        },
+        "quantity_basis": {
+          "name": "Comparison quantity basis",
+          "description": "Comparison only: raw by default, or explicitly already billable. Omit for load mode."
+        },
+        "price_basis": {
+          "name": "Price basis",
+          "description": "Published prices by default. Unpublished future prices require an explicitly supplied estimate."
+        },
+        "price_intervals": {
+          "name": "Explicit estimated prices",
+          "description": "Estimate only: complete accounting-quarter start/end/price_eur_mwh objects, excluding VAT."
         }
       }
     }

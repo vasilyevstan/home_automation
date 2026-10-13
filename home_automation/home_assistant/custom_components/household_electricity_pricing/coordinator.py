@@ -13,8 +13,10 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from ._vendor.home_automation.electricity_market.prices import MARKET_INTERVAL, TALLINN, UTC
+from ._vendor.home_automation.electricity_market.prices import MARKET_INTERVAL, TALLINN, UTC, PriceError
 from ._vendor.home_automation.electricity_pricing.engine import PricingError, load_profile
+from ._vendor.home_automation.household_consumption.client import ConsumptionError, Credentials, EstfeedClient
+from ._vendor.home_automation.home_assistant.calculator import ElectricityCalculator, load_credentials_file
 from ._vendor.home_automation.home_assistant.pricing import (
     NORDPOOL_TIMEZONE,
     PriceSnapshot,
@@ -25,7 +27,7 @@ from ._vendor.home_automation.home_assistant.pricing import (
     parse_nordpool_prices,
     profile_path,
 )
-from .const import CONF_NORDPOOL_ENTRY, CONF_PROFILE_PATH, DOMAIN
+from .const import CONF_ELERING_PATH, CONF_NORDPOOL_ENTRY, CONF_PROFILE_PATH, DOMAIN
 
 
 LOGGER = logging.getLogger(__name__)
@@ -39,6 +41,23 @@ class HouseholdPriceCoordinator(DataUpdateCoordinator[PriceSnapshot]):
         self.market_errors: dict[date, str] = {}
         self._cache: dict[date, dict[datetime, Decimal]] = {}
         self._attempted: dict[date, datetime] = {}
+        self.credentials_name = entry.data.get(CONF_ELERING_PATH)
+        self.calculator = ElectricityCalculator(
+            profile_provider=lambda: load_profile(profile_path(Path(hass.config.config_dir), self.profile_name)),
+            client=EstfeedClient(credentials_provider=self._credentials),
+            now_provider=dt_util.utcnow,
+        )
+
+    def _credentials(self) -> Credentials:
+        if not self.credentials_name:
+            raise ConsumptionError("Configure the optional private Elering credentials path for automatic household measurements.")
+        return load_credentials_file(Path(self.hass.config.config_dir), self.credentials_name)
+
+    async def async_calculate_response(self, action: str, arguments: dict) -> dict:
+        try:
+            return await self.hass.async_add_executor_job(self.calculator.invoke, action, arguments)
+        except (PricingError, ConsumptionError, PriceError) as error:
+            raise ServiceValidationError(str(error)) from error
 
     async def async_quarter_changed(self, now: datetime) -> None:
         # Expire the previous quarter before any provider request can block.

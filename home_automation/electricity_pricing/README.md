@@ -65,6 +65,11 @@ is outside VAT. Negative spot prices and negative export proceeds are retained.
 
 ## Tools
 
+The [native Home Assistant integration](../home_assistant/README.md#native-bill-and-estimate-actions)
+also reuses this engine without the MCP SDK. Its additional month-to-date path
+is explicitly provisional and includes full known monthly fees; the original
+MCP's `report`/`monthly` behavior and published-price-only contract remain unchanged.
+
 | Tool | Inputs and behavior |
 | --- | --- |
 | `quote_electricity_interval` | Offset-aware `start`/`end` for exactly one aligned 15-minute interval, `consumption_kwh` and/or `export_kwh`, and `quantity_basis` (`raw` by default, or `billable`). Returns variable costs before VAT, VAT and after VAT; monthly fees are excluded. |
