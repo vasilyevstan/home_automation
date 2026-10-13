@@ -254,6 +254,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         api = self.llm_module.HouseholdPriceAPI(self.hass, self.coordinator)
         instance = await api.async_get_api_instance(None)
         self.assertEqual(api.id, DOMAIN)
+        self.assertEqual(api.name, "Household electricity prices (read only)")
         self.assertEqual(len(instance.tools), 4)
         self.assertEqual(
             {tool.name for tool in instance.tools},

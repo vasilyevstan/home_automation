@@ -211,7 +211,7 @@ The response includes `complete`, `expected_intervals`,
 Never present an incomplete window as a complete next-day schedule. Profile
 coverage and market coverage are separate. No forecast is substituted.
 
-The separately selectable **Household electricity prices and bills (read only)**
+The separately selectable **Household electricity prices (read only)**
 LLM API exposes `GetHouseholdElectricityPrices`,
 `QuoteHouseholdElectricityInterval`, `CalculateHouseholdElectricityPeriod` and
 `EstimateHouseholdElectricityScenario` through HA's native MCP. The existing
@@ -219,6 +219,8 @@ price-window tool still accepts only `period: today` or `period: tomorrow`.
 The API has no device controls, per-call file arguments or arbitrary service
 access. Existing clients with explicit tool allowlists must add the three new
 calculator names without removing their existing tools.
+The API's existing display name is intentionally retained: HA uses it to form
+the native MCP tool namespace, so renaming it would break existing allowlists.
 
 ## Native bill and estimate actions
 

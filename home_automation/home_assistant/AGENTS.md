@@ -19,6 +19,9 @@
 - `price_api.py` and `controls.py` register explicitly selected APIs. Do not name
   an internal helper `llm.py`: HA treats that filename as a contributed platform
   and expects an `async_get_tools` hook.
+- Native MCP prefixes tools with the API display-name slug, not only its ID.
+  Keep existing API display names stable when adding tools; otherwise an
+  unchanged price-tool suffix still breaks the client's existing allowlist.
 - Current rates are marginal EUR/kWh, not monthly invoices. Preserve negative
   prices, net export earnings, invoice-derived qualifications, exact decimal
   values, period boundaries, and missing/unpublished data. No zero fallbacks.

@@ -43,7 +43,7 @@ class HouseholdPricesTool(llm.Tool):
 
 class HouseholdPriceAPI(llm.API):
     def __init__(self, hass: HomeAssistant, coordinator: HouseholdPriceCoordinator) -> None:
-        super().__init__(hass=hass, id=DOMAIN, name="Household electricity prices and bills (read only)")
+        super().__init__(hass=hass, id=DOMAIN, name="Household electricity prices (read only)")
         self.coordinator = coordinator
 
     async def async_get_api_instance(self, llm_context: LLMContext) -> llm.APIInstance:
