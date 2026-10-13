@@ -8,6 +8,9 @@
   `bundle.py`; no private profile, credential, SDK, or server is bundled.
 - Keep HA and MCP dependency environments isolated. Preserve existing MCP tools,
   entry points, imports, and financial behavior.
+- `price_api.py` and `controls.py` register explicitly selected APIs. Do not name
+  an internal helper `llm.py`: HA treats that filename as a contributed platform
+  and expects an `async_get_tools` hook.
 - Current rates are marginal EUR/kWh, not monthly invoices. Preserve negative
   prices, net export earnings, invoice-derived qualifications, exact decimal
   values, period boundaries, and missing/unpublished data. No zero fallbacks.
@@ -16,6 +19,10 @@
 - Restrict native MCP to selected APIs/entities and specifically requested
   controls. The pricing API itself is read-only. Do not expose arbitrary service,
   register, file, administrator, installer, or protection-setting operations.
+- Optional device bindings enable a separate guarded API. Reuse the existing
+  HA device clients and real-command authentication, not setup write probes or
+  another Modbus connection. Journal intent before a write and retain uncertain
+  outcomes; no automatic retries or rollback.
 - HA must be the sole Huawei Modbus client during handover. Keep the old local
   solar MCP disconnected as rollback; cloud history is independent. Generation
   caps, export limits, and household load are not interchangeable.

@@ -11,9 +11,10 @@ from homeassistant.helpers.event import async_track_utc_time_change
 from homeassistant.helpers.selector import ConfigEntrySelector
 from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN, SERVICE_GET_PRICES
+from .const import CONF_DAIKIN_ENTRY, CONF_SOLAR_ENTRY, DOMAIN, SERVICE_GET_PRICES
+from .controls import HomeEnergyDeviceAPI
 from .coordinator import HouseholdPriceCoordinator
-from .llm import HouseholdPriceAPI
+from .price_api import HouseholdPriceAPI
 
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -42,6 +43,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
     entry.async_on_unload(ha_llm.async_register_api(hass, HouseholdPriceAPI(hass, coordinator)))
+    if entry.data.get(CONF_SOLAR_ENTRY) or entry.data.get(CONF_DAIKIN_ENTRY):
+        entry.async_on_unload(ha_llm.async_register_api(hass, HomeEnergyDeviceAPI(hass, entry.data)))
     entry.async_on_unload(
         async_track_utc_time_change(
             hass, coordinator.async_quarter_changed, minute=[0, 15, 30, 45], second=0,

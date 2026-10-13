@@ -5,3 +5,5 @@ recursive-include home_automation README.md AGENTS.md
 recursive-include home_automation/home_assistant/custom_components *.json *.yaml
 include home_automation/home_assistant/tests/requirements.txt
 include home_automation/home_assistant/tests/test_component.py
+include home_automation/home_assistant/tests/test_controls.py
+recursive-include home_automation/home_assistant/compat *.patch

@@ -246,6 +246,8 @@ class HomeAssistantBundleTests(unittest.TestCase):
                     for name in names
                 ))
                 self.assertIn(prefix + "LICENSE", names)
+                self.assertIn(prefix + "price_api.py", names)
+                self.assertNotIn(prefix + "llm.py", names)
 
     def test_generated_calculator_imports_and_runs_without_ha_or_mcp(self):
         with tempfile.TemporaryDirectory() as directory:

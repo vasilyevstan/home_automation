@@ -15,10 +15,12 @@ Copilot -> native HA MCP -> approved HA entities and APIs
                             -> Nord Pool + household price integration
 ```
 
-The price integration is a read-only, calculated integration targeted and tested
-against **Home Assistant 2026.10.1**. Its device connectors are separate community
+The pricing API is read-only and calculated, targeted and tested against
+**Home Assistant 2026.10.1**. Optional, explicitly selected device bindings enable
+a separate guarded control API. Its device connectors are separate community
 integrations and must be checked against the installed HA version and hardware.
-It does not install them, change device settings, or implement an optimizer.
+It does not install them or change device settings during setup. There is no
+automatic optimizer.
 
 ## Native MCP connection
 
@@ -34,11 +36,12 @@ Copilot CLI supports the native Streamable HTTP transport:
 
 ```sh
 copilot mcp add --transport http \
-  --tools GetLiveContext,GetHouseholdElectricityPrices \
+  --tools assist__homeassistant__GetLiveContext,household-electricity-prices-read-only__GetHouseholdElectricityPrices \
   home-assistant http://homeassistant.local/api/mcp
 ```
 
-This is an example read-only allowlist, not automatic authorization. Authenticate
+HA prefixes exported MCP tool names; discover the actual names before setting
+the allowlist. This is an example read-only allowlist, not automatic authorization. Authenticate
 using the supported HA/client OAuth flow, then inspect the actual exposed tools
 before enabling additional operations. A configured URL or successful HTTP
 response alone is not an authenticated MCP connection.
@@ -91,6 +94,11 @@ Validate the community integration on the actual HA version before retiring a
 working client. Use a stable, verified device-specific network binding. In LWT
 control mode, heating adjustment is a **leaving-water-temperature offset**, not
 an absolute room-temperature target.
+
+The [v1.5.3 compatibility patch](compat/daikin-altherma-1.5.3-asyncio.patch)
+replaces the removed `async_timeout` dependency with `asyncio.timeout` and uses
+`async with` in both configuration paths. Apply it to that exact upstream release;
+it changes no device operations or tariff logic.
 
 Keep manufacturer control loops, protection, and hygiene settings intact.
 Do not copy a generic on/off thermostat example onto the heat pump. Only expose
@@ -150,7 +158,7 @@ errors, not a reason to assume free energy or extrapolate rates.
 
 ## Sensors, price windows, and MCP queries
 
-The integration exposes:
+The calculated integration exposes:
 
 | Sensor | Meaning |
 | --- | --- |
@@ -199,13 +207,50 @@ invoices. Physical raw flows, quarter-hour netting, settled metering, and invoic
 line/section-VAT rounding still matter. Keep the existing Elering-based billing
 and private invoice-replay tools for reconciliation.
 
+For historical storage, HA's official InfluxDB integration runs alongside
+Recorder. Use an explicit entity allowlist, a dedicated database/bucket, scoped
+writer/reader credentials, persistent storage, and backups. Do not turn high-cardinality
+timestamps or profile hashes into tags or automatically expire data without a
+selected retention policy. Enabling export does not backfill older readings.
+
+On HA OS, the maintained community **InfluxDB v1** app is a supported local
+option and uses API version 1. It is not interchangeable with v2/v3 configuration.
+Disable unneeded host-port mappings, retain database authentication, and use
+HA's authenticated ingress for administration. Native app backups include its
+database storage; verify backup contents and recovery credentials without
+restoring over a live database just to test connectivity.
+
+InfluxDB's HA exporter coerces numeric-looking attributes. Use
+`profile_version_str`, `profile_sha256_str`, `period_start_str`, and
+`period_end_str` for their original text, not the generated numeric counterparts.
+`exact_price_text_str` retains the complete decimal rate plus `EUR/kWh`; the
+ordinary numeric `value` field is useful for charts, not invoice finalization.
+
 ## Controls and ownership
 
-The pricing integration never controls equipment. Native MCP control exposure
-must be configured separately for specifically approved entities/operations.
-Use fixed-target scripts or narrow HA LLM tools when generic intents cannot
-represent the needed guarded operation. Preserve numeric bounds, mode checks,
-serialization, no-op handling, and fresh read-back.
+The pricing API never controls equipment. When a verified Huawei and/or Daikin
+config entry is explicitly selected in the integration's optional device fields,
+HA also offers **Home energy devices (guarded)** as a separate LLM API. It is not
+automatically selected by an MCP server whose all-APIs option is off.
+
+That API provides `GetSolarGenerationLimit`, `SetSolarGenerationLimit`,
+`GetDaikinStatus`, and/or `ControlDaikin` for the selected devices only. Add only the discovered, prefixed
+tool names to the client's allowlist after selecting the API. Solar requests
+require expected configured/active limits and explicit permission for a mode
+change. Daikin requests require known inactive guard flags, native mode/range/step,
+and configured/effective read-back where applicable.
+
+Controls reuse HA's existing device clients. They do not open another inverter
+connection or write a permission-test register during setup. Device
+authentication/permission errors are still enforced on actual requested writes;
+no password is guessed or authentication disabled. Broad Huawei parameter UI
+configuration can remain off while these narrowly scoped MCP operations are
+enabled separately.
+
+Intent is journaled privately in HA's
+`.storage/home_energy_control.jsonl` before dispatch. Requests are serialized per
+device, unchanged verified targets produce read-only no-ops, and uncertain
+outcomes are reported instead of automatically replayed or rolled back.
 
 Do not expose an unrestricted service caller, register access, administrator
 tools, boost/installer controls, or automatic optimization. A write may take
@@ -229,6 +274,10 @@ used by existing MCPs:
 uv run --no-project --isolated --python 3.14 \
   --with-requirements home_automation/home_assistant/tests/requirements.txt \
   python home_automation/home_assistant/tests/test_component.py -v
+
+uv run --no-project --isolated --python 3.14 \
+  --with-requirements home_automation/home_assistant/tests/requirements.txt \
+  python home_automation/home_assistant/tests/test_controls.py -v
 ```
 
 Tests build and load the real bundle, use synthetic rates and mocked market

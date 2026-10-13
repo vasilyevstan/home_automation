@@ -75,12 +75,12 @@ class HouseholdPriceSensor(CoordinatorEntity[HouseholdPriceCoordinator], SensorE
     def extra_state_attributes(self) -> dict:
         if self.coordinator.data is None:
             return {}
+        exact = getattr(self.coordinator.data.current, self.entity_description.key) if self.available else None
         return {
             **self.coordinator.data.attributes(),
-            "exact_eur_kwh": (
-                getattr(self.coordinator.data.current, self.entity_description.key)
-                if self.available else None
-            ),
+            "exact_eur_kwh": exact,
+            # InfluxDB converts numeric strings to floats; this companion keeps the decimal text.
+            "exact_price_text": exact + " EUR/kWh" if exact is not None else None,
             "market_errors": list(self.coordinator.market_errors.values()),
             "price_source": "published_nordpool_ee",
         }

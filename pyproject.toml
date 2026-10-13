@@ -58,6 +58,7 @@ exclude = ["home_automation.home_assistant.tests*"]
 
 [tool.setuptools.package-data]
 "*" = ["README.md", "AGENTS.md"]
+"home_automation.home_assistant" = ["compat/*.patch"]
 "home_automation.home_assistant.custom_components.household_electricity_pricing" = ["*.json", "*.yaml", "translations/*.json"]
 
 [tool.setuptools.exclude-package-data]

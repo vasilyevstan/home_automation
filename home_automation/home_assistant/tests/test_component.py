@@ -66,7 +66,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         self.coordinator_module = importlib.import_module(COMPONENT + ".coordinator")
         self.sensor_module = importlib.import_module(COMPONENT + ".sensor")
         self.flow_module = importlib.import_module(COMPONENT + ".config_flow")
-        self.llm_module = importlib.import_module(COMPONENT + ".llm")
+        self.llm_module = importlib.import_module(COMPONENT + ".price_api")
         self.pricing = importlib.import_module(COMPONENT + "._vendor.home_automation.home_assistant.pricing")
         self.profile_module = importlib.import_module(COMPONENT + "._vendor.home_automation.electricity_pricing.engine")
         self.config_directory = tempfile.TemporaryDirectory()
@@ -145,6 +145,10 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sensor.native_unit_of_measurement, "EUR/kWh")
             self.assertEqual(sensor.extra_state_attributes["fixed_fees"], "excluded")
             self.assertEqual(sensor.extra_state_attributes["profile_version"], self.profile_value["version"])
+            self.assertEqual(
+                sensor.extra_state_attributes["exact_price_text"],
+                str(sensor.native_value) + " EUR/kWh",
+            )
 
     async def test_complete_market_days_are_cached_but_tariffs_reload(self):
         before = await self.refresh()

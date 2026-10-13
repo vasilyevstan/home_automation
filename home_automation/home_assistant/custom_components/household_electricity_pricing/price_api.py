@@ -1,4 +1,4 @@
-"""A deliberately selected read-only LLM API served by HA's native MCP."""
+"""A deliberately selected read-only API, not an implicit HA LLM platform."""
 
 from __future__ import annotations
 
