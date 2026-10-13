@@ -1,0 +1,50 @@
+diff --git a/__init__.py b/__init__.py
+--- a/__init__.py
++++ b/__init__.py
+@@ -4,3 +4,3 @@
+ import logging
+-from asyncio import CancelledError
++from asyncio import CancelledError, timeout
+ from datetime import timedelta
+@@ -8,3 +8,2 @@
+-import async_timeout
+ from aiohttp import ClientConnectionError, ServerTimeoutError
+ from homeassistant.components.water_heater import STATE_OFF, STATE_ON, STATE_PERFORMANCE
+@@ -56,6 +55,6 @@ def create_update_function(api):
+     async def async_update_data():
+         try:
+-            async with async_timeout.timeout(ASYNC_UPDATE_TIMEOUT_SECONDS):
++            async with timeout(ASYNC_UPDATE_TIMEOUT_SECONDS):
+                 await _api.async_update()
+         except:
+             raise
+diff --git a/config_flow.py b/config_flow.py
+--- a/config_flow.py
++++ b/config_flow.py
+@@ -6,7 +6,7 @@ import asyncio
+ import logging
+ import voluptuous as vol
+ from aiohttp import ClientError
+-from async_timeout import timeout
++from asyncio import timeout
+ from homeassistant import config_entries
+ from homeassistant.const import CONF_HOST
+ from homeassistant.data_entry_flow import FlowResult
+@@ -43,7 +43,7 @@ class DaikinAlthermaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+         errors = {}
+         if user_input is not None:
+             try:
+-                with timeout(TIMEOUT):
++                async with timeout(TIMEOUT):
+                     self.host = user_input[CONF_HOST]
+                     conn = DaikinWSConnection(
+                         async_get_clientsession(self.hass),
+@@ -71,7 +71,7 @@ class DaikinAlthermaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+         self.host = discovery_info.host
+         self._async_abort_entries_match({CONF_HOST: self.host})
+         try:
+-            with timeout(TIMEOUT):
++            async with timeout(TIMEOUT):
+                 conn = DaikinWSConnection(
+                     async_get_clientsession(self.hass),
+                     self.host,

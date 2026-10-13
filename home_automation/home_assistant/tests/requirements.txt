@@ -1,0 +1,3 @@
+homeassistant==2026.10.1
+huawei-solar==3.0.7
+pyaltherma==0.0.21

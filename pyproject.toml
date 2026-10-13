@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "estonia-nordpool-prices"
-version = "0.9.0"
+version = "0.10.0"
 description = "Local home-automation MCPs and Estonia electricity prices, consumption and costs"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -54,6 +54,12 @@ py-modules = ["nordpool_ee", "mcp_server", "wattcast_forecast", "elering_consump
 
 [tool.setuptools.packages.find]
 include = ["home_automation", "home_automation.*"]
+exclude = ["home_automation.home_assistant.tests*"]
 
 [tool.setuptools.package-data]
 "*" = ["README.md", "AGENTS.md"]
+"home_automation.home_assistant" = ["compat/*.patch"]
+"home_automation.home_assistant.custom_components.household_electricity_pricing" = ["*.json", "*.yaml", "translations/*.json"]
+
+[tool.setuptools.exclude-package-data]
+"home_automation.home_assistant" = ["tests/*"]
