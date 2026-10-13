@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 import importlib
 import json
@@ -58,6 +59,7 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.solar = SimpleNamespace(
             serial_number="synthetic-inverter",
+            update_lock=asyncio.Lock(),
             client=SimpleNamespace(get=AsyncMock(side_effect=get), get_multiple=AsyncMock(side_effect=get_multiple)),
             set=AsyncMock(side_effect=set_limit),
             has_write_permission=Mock(side_effect=AssertionError("A setup write probe must never run")),
@@ -147,6 +149,33 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
         self.solar.set.assert_not_awaited()
         self.solar.has_write_permission.assert_not_called()
 
+    async def test_solar_read_waits_for_the_native_coordinator_lock(self):
+        await self.solar.update_lock.acquire()
+        task = asyncio.create_task(self.devices.get_solar_limit())
+        await asyncio.sleep(0)
+        self.solar.client.get.assert_not_awaited()
+        self.assertFalse(task.done())
+        self.solar.update_lock.release()
+        result = await task
+        self.assertEqual(result["active"], 100.0)
+        self.assertFalse(self.solar.update_lock.locked())
+
+    async def test_solar_write_holds_the_native_lock_through_readback(self):
+        native_set = self.solar.set.side_effect
+        async def write(name, value):
+            self.assertTrue(self.solar.update_lock.locked())
+            return await native_set(name, value)
+        self.solar.set.side_effect = write
+        result = await self.devices.set_solar_limit(self.solar_request())
+        self.assertTrue(result["changed"])
+        self.assertFalse(self.solar.update_lock.locked())
+
+    async def test_solar_read_timeout_is_explicit_and_releases_native_lock(self):
+        self.solar.client.get.side_effect = TimeoutError()
+        with self.assertRaisesRegex(HomeAssistantError, "no control command was sent"):
+            await self.devices.get_solar_limit()
+        self.assertFalse(self.solar.update_lock.locked())
+        self.solar.set.assert_not_awaited()
     async def test_solar_noop_is_read_only(self):
         result = await self.devices.set_solar_limit(self.solar_request(value=100.0))
         self.assertFalse(result["changed"])

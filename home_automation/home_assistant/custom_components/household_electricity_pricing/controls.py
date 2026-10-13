@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import json
@@ -122,15 +123,27 @@ class EnergyDevices:
         }
 
     async def get_solar_limit(self):
-        async with self.solar_lock, asyncio.timeout(30):
-            return await self.solar_limit(self.solar_device())
+        try:
+            async with self.solar_session() as device:
+                return await self.solar_limit(device)
+        except TimeoutError as error:
+            raise HomeAssistantError(
+                "The inverter did not respond within the read deadline; no control command was sent."
+            ) from error
+
+    @asynccontextmanager
+    async def solar_session(self):
+        async with asyncio.timeout(30), self.solar_lock:
+            device = self.solar_device()
+            # Native coordinator batches use this same lock.
+            async with device.update_lock:
+                yield device
 
     async def set_solar_limit(self, args):
         entry = self.entry(self.solar_entry, "huawei_solar")
         from huawei_solar import HuaweiSolarException, register_names as rn
 
-        async with self.solar_lock, asyncio.timeout(30):
-            device = self.solar_device()
+        async with self.solar_session() as device:
             previous = await self.solar_limit(device)
             expected = number(
                 args["expected_value"], "Expected limit", 0,

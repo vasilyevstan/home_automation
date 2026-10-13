@@ -23,6 +23,8 @@
   HA device clients and real-command authentication, not setup write probes or
   another Modbus connection. Journal intent before a write and retain uncertain
   outcomes; no automatic retries or rollback.
+- Huawei control/read transactions must hold the device's `update_lock`, shared
+  with its native polling coordinator, not only the API's own per-device lock.
 - HA must be the sole Huawei Modbus client during handover. Keep the old local
   solar MCP disconnected as rollback; cloud history is independent. Generation
   caps, export limits, and household load are not interchangeable.
