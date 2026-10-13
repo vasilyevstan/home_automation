@@ -14,8 +14,12 @@ CORE_FILES = (
     "electricity_market/__init__.py",
     "electricity_market/prices.py",
     "electricity_pricing/__init__.py",
+    "electricity_pricing/data.py",
     "electricity_pricing/engine.py",
+    "household_consumption/__init__.py",
+    "household_consumption/client.py",
     "home_assistant/__init__.py",
+    "home_assistant/calculator.py",
     "home_assistant/pricing.py",
 )
 COMPONENT_FILES = (
@@ -27,6 +31,7 @@ COMPONENT_FILES = (
     "controls.py",
     "sensor.py",
     "price_api.py",
+    "calculation_api.py",
     "services.yaml",
     "strings.json",
     "translations/en.json",

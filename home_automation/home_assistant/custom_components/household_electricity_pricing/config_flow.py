@@ -10,9 +10,11 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.helpers.selector import ConfigEntrySelector
 
 from ._vendor.home_automation.electricity_pricing.engine import PricingError, load_profile
+from ._vendor.home_automation.household_consumption.client import ConsumptionError
+from ._vendor.home_automation.home_assistant.calculator import load_credentials_file
 from ._vendor.home_automation.home_assistant.pricing import profile_path
 from .const import (
-    CONF_DAIKIN_ENTRY, CONF_NORDPOOL_ENTRY, CONF_PROFILE_PATH, CONF_SOLAR_ENTRY,
+    CONF_DAIKIN_ENTRY, CONF_ELERING_PATH, CONF_NORDPOOL_ENTRY, CONF_PROFILE_PATH, CONF_SOLAR_ENTRY,
     DEFAULT_PROFILE_PATH, DOMAIN, NAME,
 )
 
@@ -20,6 +22,7 @@ from .const import (
 DATA_SCHEMA = probatio.Schema({
     probatio.Required(CONF_NORDPOOL_ENTRY): ConfigEntrySelector({"integration": "nordpool"}),
     probatio.Required(CONF_PROFILE_PATH, default=DEFAULT_PROFILE_PATH): str,
+    probatio.Optional(CONF_ELERING_PATH): str,
     probatio.Optional(CONF_SOLAR_ENTRY): ConfigEntrySelector({"integration": "huawei_solar"}),
     probatio.Optional(CONF_DAIKIN_ENTRY): ConfigEntrySelector({"integration": "daikin_altherma"}),
 })
@@ -36,6 +39,10 @@ class HouseholdPriceConfigFlow(ConfigFlow, domain=DOMAIN):
             raise PricingError("Configure the selected Nord Pool entry for EUR and area EE first.")
         path = profile_path(Path(self.hass.config.config_dir), user_input[CONF_PROFILE_PATH])
         await self.hass.async_add_executor_job(load_profile, path)
+        if user_input.get(CONF_ELERING_PATH):
+            await self.hass.async_add_executor_job(
+                load_credentials_file, Path(self.hass.config.config_dir), user_input[CONF_ELERING_PATH],
+            )
         for key, domain in ((CONF_SOLAR_ENTRY, "huawei_solar"), (CONF_DAIKIN_ENTRY, "daikin_altherma")):
             if key in user_input:
                 selected = self.hass.config_entries.async_get_entry(user_input[key])
@@ -50,7 +57,7 @@ class HouseholdPriceConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             try:
                 await self._validate(user_input)
-            except PricingError as error:
+            except (PricingError, ConsumptionError) as error:
                 errors["base"] = "invalid_configuration"
                 reason = str(error)
             else:
@@ -67,7 +74,7 @@ class HouseholdPriceConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             try:
                 await self._validate(user_input)
-            except PricingError as error:
+            except (PricingError, ConsumptionError) as error:
                 errors["base"] = "invalid_configuration"
                 reason = str(error)
             else:

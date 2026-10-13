@@ -219,6 +219,24 @@ class HomeAssistantPriceTests(unittest.TestCase):
 
 
 class HomeAssistantBundleTests(unittest.TestCase):
+    def test_native_action_forms_and_english_copy_stay_in_sync(self):
+        component = (
+            Path(__file__).resolve().parents[1]
+            / "home_automation/home_assistant/custom_components/household_electricity_pricing"
+        )
+        strings = json.loads((component / "strings.json").read_text())
+        self.assertEqual(strings, json.loads((component / "translations/en.json").read_text()))
+        self.assertEqual(
+            set(strings["services"]),
+            {"get_prices", "quote_electricity_interval", "calculate_electricity_period", "estimate_electricity_scenario"},
+        )
+        self.assertEqual(set(strings["config"]), {"step", "error", "abort"})
+        forms = (component / "services.yaml").read_text()
+        for action in strings["services"]:
+            self.assertIn(action + ":", forms)
+        for step in ("user", "reconfigure"):
+            self.assertIn("elering_credentials_path", strings["config"]["step"][step]["data"])
+
     def test_bundle_is_reproducible_and_contains_unchanged_core_not_sdk_or_private_data(self):
         package = Path(__file__).resolve().parents[1] / "home_automation"
         with tempfile.TemporaryDirectory() as directory:
@@ -267,10 +285,15 @@ class HomeAssistantBundleTests(unittest.TestCase):
                 "sys.path.insert(0,sys.argv[1])\n"
                 "from home_automation.electricity_pricing.engine import parse_profile\n"
                 "from home_automation.home_assistant.pricing import build_snapshot,parse_nordpool_prices\n"
-                "from datetime import datetime\n"
+                "from home_automation.home_assistant.calculator import ElectricityCalculator\n"
+                "from datetime import datetime,timedelta\n"
                 "data=json.load(sys.stdin)\n"
                 "result=build_snapshot(parse_profile(data['profile']),parse_nordpool_prices([data['prices']]),datetime.fromisoformat(data['now']))\n"
                 "assert result.current.import_eur_kwh == data['expected_import']\n"
+                "calculator=ElectricityCalculator(lambda:parse_profile(data['profile']),price_provider=lambda first,last:parse_nordpool_prices([data['prices']]))\n"
+                "start=datetime.fromisoformat(data['now'])\n"
+                "quote=calculator.quote(start.isoformat(),(start+timedelta(minutes=15)).isoformat(),'1','0',quantity_basis='billable')\n"
+                "assert quote['amounts']['including_vat_eur'] == data['expected_import']\n"
                 "assert 'mcp' not in sys.modules and 'homeassistant' not in sys.modules\n"
                 "print('SDK-free calculator works')\n"
             )

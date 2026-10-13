@@ -13,7 +13,7 @@ import sys
 import tempfile
 from types import MappingProxyType, SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 import zipfile
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
@@ -69,6 +69,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         self.llm_module = importlib.import_module(COMPONENT + ".price_api")
         self.pricing = importlib.import_module(COMPONENT + "._vendor.home_automation.home_assistant.pricing")
         self.profile_module = importlib.import_module(COMPONENT + "._vendor.home_automation.electricity_pricing.engine")
+        self.calculation_module = importlib.import_module(COMPONENT + ".calculation_api")
         self.config_directory = tempfile.TemporaryDirectory()
         self.hass = HomeAssistant(self.config_directory.name)
         profile_file = Path(self.config_directory.name) / "private" / "profile.json"
@@ -253,7 +254,18 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         api = self.llm_module.HouseholdPriceAPI(self.hass, self.coordinator)
         instance = await api.async_get_api_instance(None)
         self.assertEqual(api.id, DOMAIN)
-        self.assertEqual(len(instance.tools), 1)
+        self.assertEqual(api.name, "Household electricity prices (read only)")
+        self.assertEqual(len(instance.tools), 4)
+        self.assertEqual(
+            {tool.name for tool in instance.tools},
+            {
+                "GetHouseholdElectricityPrices", "QuoteHouseholdElectricityInterval",
+                "CalculateHouseholdElectricityPeriod", "EstimateHouseholdElectricityScenario",
+            },
+        )
+        for item in instance.tools:
+            self.assertTrue(item.annotations.read_only)
+            self.assertFalse(item.annotations.destructive)
         tool = instance.tools[0]
         self.assertEqual(tool.name, "GetHouseholdElectricityPrices")
         self.assertTrue(tool.annotations.read_only)
@@ -269,6 +281,129 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
             self.hass, SimpleNamespace(tool_args={}), None
         )
         self.assertEqual(default_result.data["delivery_date"], "2026-08-03")
+
+    async def test_native_interval_action_returns_exact_engine_response(self):
+        await self.integration.async_setup(self.hass, {})
+        self.coordinator.calculator.price_provider = Mock(return_value={self.now.replace(minute=0): Decimal("100")})
+        result = await self.hass.services.async_call(
+            DOMAIN, "quote_electricity_interval",
+            {
+                "config_entry": "pricing", "start": "2026-08-03T10:00:00+03:00",
+                "end": "2026-08-03T10:15:00+03:00", "consumption_kwh": "2", "export_kwh": "0.5",
+            },
+            blocking=True, return_response=True,
+        )
+        self.assertEqual(result["billable_import_kwh"], "1.5")
+        self.assertEqual(result["amounts"]["including_vat_eur"], "0.3519")
+        self.assertEqual(result["fixed_fees"], "excluded")
+        self.assertEqual(result["price_basis"], "published")
+
+    async def test_native_actions_reject_forecast_bill_and_unknown_action(self):
+        await self.integration.async_setup(self.hass, {})
+        with self.assertRaisesRegex(ServiceValidationError, "published prices only"):
+            await self.hass.services.async_call(
+                DOMAIN, "calculate_electricity_period",
+                {"config_entry": "pricing", "period": "previous_month", "price_basis": "estimate"},
+                blocking=True, return_response=True,
+            )
+        with self.assertRaisesRegex(ServiceValidationError, "Unknown"):
+            await self.coordinator.async_calculate_response("homeassistant.turn_on", {})
+
+    async def test_native_future_load_estimate_needs_supplied_prices(self):
+        await self.integration.async_setup(self.hass, {})
+        start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        prices = [
+            {
+                "start": (start + index * timedelta(minutes=15)).isoformat(),
+                "end": (start + (index + 1) * timedelta(minutes=15)).isoformat(),
+                "price_eur_mwh": "-30",
+            }
+            for index in range(4)
+        ]
+        result = await self.hass.services.async_call(
+            DOMAIN, "estimate_electricity_scenario",
+            {
+                "config_entry": "pricing", "start": start.isoformat(),
+                "duration_minutes": "60", "power_kw": "2",
+                "price_basis": "estimate", "price_intervals": prices,
+            },
+            blocking=True, return_response=True,
+        )
+        self.assertEqual(result["calculation_kind"], "estimate")
+        self.assertEqual(result["price_source"], "caller_supplied_estimated_prices")
+        self.assertEqual(result["energy_kwh"], "2")
+        self.assertEqual(result["fixed_fees"], "excluded")
+
+    async def test_native_presets_fail_explicitly_for_unconfigured_history(self):
+        await self.integration.async_setup(self.hass, {})
+        with self.assertRaisesRegex(ServiceValidationError, "coverage"):
+            await self.hass.services.async_call(
+                DOMAIN, "calculate_electricity_period",
+                {"config_entry": "pricing", "period": "last_12_months"},
+                blocking=True, return_response=True,
+            )
+        with self.assertRaisesRegex(ServiceValidationError, "Elering"):
+            await self.hass.services.async_call(
+                DOMAIN, "calculate_electricity_period",
+                {"config_entry": "pricing", "period": "month_to_date"},
+                blocking=True, return_response=True,
+            )
+
+    async def test_native_month_to_date_returns_full_fees_and_actual_metering_cutoff(self):
+        client = importlib.import_module(COMPONENT + "._vendor.home_automation.household_consumption.client")
+        _, _, start, end = self.profile_module.period_bounds("2026-08-01", "2026-08-02")
+        values = []
+        current = start
+        while current < end:
+            values.append(client.Reading(current, Decimal("1"), Decimal("0")) if current < end - timedelta(days=1)
+                          else client.Reading(current, None, None))
+            current += timedelta(minutes=15)
+        self.coordinator.calculator.client = Mock()
+        self.coordinator.calculator.client.get_consumption.return_value = client.ConsumptionReport(
+            client.DateWindow(date(2026, 8, 1), date(2026, 8, 2), start, end),
+            "SYNTHETIC-POINT", "15_minutes", tuple(values), self.now,
+        )
+        self.coordinator.calculator.price_provider = Mock(
+            return_value={item.start: Decimal("100") for item in values},
+        )
+        await self.integration.async_setup(self.hass, {})
+        result = await self.hass.services.async_call(
+            DOMAIN, "calculate_electricity_period",
+            {"config_entry": "pricing", "period": "month_to_date"},
+            blocking=True, return_response=True,
+        )
+        self.assertEqual(result["calculation_kind"], "provisional_bill")
+        self.assertEqual(result["fixed_fees"], "full_current_month")
+        self.assertEqual(result["interval_count"], 96)
+        self.assertEqual(result["coverage"]["pending_completed_days"], 1)
+        fees = {line["component_id"]: line["net_eur"] for line in result["lines"]}
+        self.assertEqual(fees["supplier_monthly"], "2.35")
+        self.assertEqual(fees["network_monthly"], "13.75")
+        self.assertFalse(result["monthly_periods"][0]["complete_calendar_month"])
+
+    async def test_config_flow_accepts_only_private_scoped_credentials_file(self):
+        path = Path(self.config_directory.name) / "private/elering.json"
+        path.write_text(json.dumps({"client_id": "synthetic-id", "client_secret": "not-a-real-secret"}))
+        path.chmod(0o600)
+        flow = self.flow_module.HouseholdPriceConfigFlow()
+        flow.hass = self.hass
+        data = {**self.pricing_entry.data, "elering_credentials_path": "private/elering.json"}
+        await flow._validate(data)
+        path.chmod(0o644)
+        with self.assertRaisesRegex(self.coordinator_module.ConsumptionError, "group"):
+            await flow._validate(data)
+
+    async def test_llm_calculator_parameters_and_calls_use_the_same_action_schema(self):
+        tool = self.calculation_module.HouseholdCalculationTool("quote_electricity_interval", self.coordinator)
+        self.coordinator.calculator.price_provider = Mock(return_value={self.now.replace(minute=0): Decimal("100")})
+        arguments = tool.parameters({
+            "start": "2026-08-03T10:00:00+03:00", "end": "2026-08-03T10:15:00+03:00",
+            "consumption_kwh": "1", "export_kwh": "0",
+        })
+        result = await tool.async_call(self.hass, SimpleNamespace(tool_args=arguments), None)
+        self.assertFalse(result.error)
+        self.assertEqual(result.data["calculation_kind"], "interval_quote")
+        self.assertEqual(result.data["fixed_fees"], "excluded")
 
     async def test_entry_setup_registers_the_selected_api_and_cleanup(self):
         from homeassistant.helpers import llm

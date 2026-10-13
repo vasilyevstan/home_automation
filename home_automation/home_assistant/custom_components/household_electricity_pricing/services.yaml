@@ -12,3 +12,152 @@ get_prices:
           options:
             - today
             - tomorrow
+
+quote_electricity_interval:
+  fields:
+    config_entry:
+      required: true
+      selector:
+        config_entry:
+          integration: household_electricity_pricing
+    start:
+      required: true
+      selector:
+        text:
+    end:
+      required: true
+      selector:
+        text:
+    consumption_kwh:
+      selector:
+        text:
+    export_kwh:
+      selector:
+        text:
+    quantity_basis:
+      default: raw
+      selector:
+        select:
+          options:
+            - raw
+            - billable
+    price_basis:
+      default: published
+      selector:
+        select:
+          options:
+            - published
+            - estimate
+    price_intervals:
+      selector:
+        object:
+
+calculate_electricity_period:
+  fields:
+    config_entry:
+      required: true
+      selector:
+        config_entry:
+          integration: household_electricity_pricing
+    period:
+      default: custom
+      selector:
+        select:
+          options:
+            - custom
+            - month_to_date
+            - previous_month
+            - last_12_months
+    start_date:
+      selector:
+        date:
+    end_date:
+      selector:
+        date:
+    days:
+      selector:
+        number:
+          min: 1
+          step: 1
+          mode: box
+    intervals:
+      selector:
+        object:
+    quantity_basis:
+      default: raw
+      selector:
+        select:
+          options:
+            - raw
+            - billable
+    mode:
+      default: auto
+      selector:
+        select:
+          options:
+            - auto
+            - report
+            - monthly
+    include_daily:
+      default: false
+      selector:
+        boolean:
+    price_basis:
+      default: published
+      selector:
+        select:
+          options:
+            - published
+            - estimate
+    price_intervals:
+      selector:
+        object:
+
+estimate_electricity_scenario:
+  fields:
+    config_entry:
+      required: true
+      selector:
+        config_entry:
+          integration: household_electricity_pricing
+    mode:
+      default: load
+      selector:
+        select:
+          options:
+            - load
+            - comparison
+    start:
+      selector:
+        text:
+    duration_minutes:
+      selector:
+        text:
+    power_kw:
+      selector:
+        text:
+    energy_kwh:
+      selector:
+        text:
+    baseline_intervals:
+      selector:
+        object:
+    scenario_intervals:
+      selector:
+        object:
+    quantity_basis:
+      selector:
+        select:
+          options:
+            - raw
+            - billable
+    price_basis:
+      default: published
+      selector:
+        select:
+          options:
+            - published
+            - estimate
+    price_intervals:
+      selector:
+        object:

@@ -12,6 +12,7 @@ from homeassistant.helpers.selector import ConfigEntrySelector
 from homeassistant.helpers.typing import ConfigType
 
 from .const import CONF_DAIKIN_ENTRY, CONF_SOLAR_ENTRY, DOMAIN, SERVICE_GET_PRICES
+from .calculation_api import CALCULATION_FIELDS
 from .controls import HomeEnergyDeviceAPI
 from .coordinator import HouseholdPriceCoordinator
 from .price_api import HouseholdPriceAPI
@@ -34,6 +35,21 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         DOMAIN, SERVICE_GET_PRICES, get_prices,
         schema=GET_PRICES_SCHEMA, supports_response=SupportsResponse.ONLY,
     )
+    for action, fields in CALCULATION_FIELDS.items():
+        async def calculate(call: ServiceCall) -> dict:
+            entry = service.async_get_config_entry(hass, DOMAIN, call.data["config_entry"])
+            coordinator: HouseholdPriceCoordinator = entry.runtime_data
+            arguments = {key: value for key, value in call.data.items() if key != "config_entry"}
+            return await coordinator.async_calculate_response(call.service, arguments)
+
+        hass.services.async_register(
+            DOMAIN, action, calculate,
+            schema=probatio.Schema({
+                probatio.Required("config_entry"): ConfigEntrySelector({"integration": DOMAIN}),
+                **fields,
+            }),
+            supports_response=SupportsResponse.ONLY,
+        )
     return True
 
 

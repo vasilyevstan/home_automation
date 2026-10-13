@@ -13,6 +13,7 @@ from mcp.types import ToolAnnotations
 from pydantic import StrictFloat, StrictInt, StrictStr
 
 from ..household_consumption.client import API_BASE, ConsumptionError, DateWindow, EstfeedClient
+from .data import market_prices
 from .engine import (
     EnergyInterval,
     PeriodMode,
@@ -92,19 +93,7 @@ def _profile() -> PricingProfile:
 
 
 def _market_prices(first: date, last: date) -> Dict[datetime, Decimal]:
-    prices = {}
-    current = first
-    while current <= last:
-        stop = min(current + timedelta(days=30), last)
-        reports = fetch_prices_range(current, stop)
-        for report in reports:
-            for interval in report.intervals:
-                timestamp = interval.start.astimezone(UTC)
-                if timestamp in prices:
-                    raise PricingError("Duplicate market price across range batches.")
-                prices[timestamp] = interval.price_eur_mwh
-        current = stop + timedelta(days=1)
-    return prices
+    return market_prices(first, last, fetcher=fetch_prices_range)
 
 
 @mcp.tool(title="Quote household electricity for a delivery interval", annotations=_READ_ONLY)

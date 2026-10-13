@@ -950,3 +950,47 @@ def price_period(
                 daily.append(_amount_period(profile, current, current, day_rows, False))
                 current += timedelta(days=1)
         return _result(profile, intervals, rows, quantity_basis, mode, contributions, sources, monthly, daily)
+
+
+def price_month_to_date(
+    profile: PricingProfile, intervals: Sequence[EnergyInterval], prices: Mapping[datetime, Decimal],
+    start_date: str, end_date: str, quantity_basis: QuantityBasis = "raw",
+    include_daily: bool = False,
+) -> PricingResult:
+    """Round a provisional month-to-date bill with full, known monthly charges."""
+    with localcontext() as context:
+        context.prec = 80
+        first, last, start, end = period_bounds(start_date, end_date)
+        if first.day != 1 or first.replace(day=1) != last.replace(day=1):
+            raise PricingError("Month-to-date pricing must start on the first day of one calendar month.")
+        _, month_end = market_bounds(_month_end(first) - timedelta(days=1))
+        profile.check_coverage(start, month_end)
+        rows, sources = validate_intervals(profile, intervals, quantity_basis, start, end, False)
+        variable = _variable_contributions(profile, rows, prices)
+        contributions = variable + _fixed_contributions(
+            profile, first, _month_end(first) - timedelta(days=1), True,
+        )
+        monthly = [_amount_period(profile, first, last, contributions, True)]
+        daily = []
+        if include_daily:
+            grouped: Dict[date, List[_Contribution]] = {}
+            for item in variable:
+                grouped.setdefault(item.day, []).append(item)
+            current = first
+            while current <= last:
+                day_rows = grouped.get(current, []) + _fixed_contributions(profile, current, current, False)
+                daily.append(_amount_period(profile, current, current, day_rows, False))
+                current += timedelta(days=1)
+        result = _result(
+            profile, intervals, rows, quantity_basis, "monthly",
+            contributions, sources, monthly, daily,
+        )
+        return replace(
+            result, mode="month_to_date", fixed_fees="full_current_month",
+            warnings=result.warnings + [
+                "Provisional month-to-date bill: full current-month fixed charges are included, "
+                "but only the explicitly covered delivery intervals are priced. Missing days are not zero.",
+                "Component and section-VAT rounding uses the currently observed totals and may change "
+                "when more readings arrive. This is not a finalized calendar-month invoice.",
+            ],
+        )

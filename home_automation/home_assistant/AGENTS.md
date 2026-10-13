@@ -6,11 +6,22 @@
   engine's billable-unit quotes. Never duplicate tariff/VAT/calendar formulas.
   Canonical core files are bundled unchanged by the explicit allowlist in
   `bundle.py`; no private profile, credential, SDK, or server is bundled.
+- `calculator.py` adapts the canonical engine and read-only Elering client.
+  Native bill presets use published prices only. Explicit supplied future-price
+  estimates must remain labeled estimates and cannot finalize actual invoices.
+  Month-to-date uses its dedicated provisional/full-fixed-fee engine path;
+  do not weaken `monthly` complete-month checks or zero-fill unmeasured days.
+- Automatic household reads require a confined private, mode-0600 credential
+  file. Snapshot one profile per calculation, retain the real metering cutoff,
+  and reject historical tariff gaps before requesting household data.
 - Keep HA and MCP dependency environments isolated. Preserve existing MCP tools,
   entry points, imports, and financial behavior.
 - `price_api.py` and `controls.py` register explicitly selected APIs. Do not name
   an internal helper `llm.py`: HA treats that filename as a contributed platform
   and expects an `async_get_tools` hook.
+- Native MCP prefixes tools with the API display-name slug, not only its ID.
+  Keep existing API display names stable when adding tools; otherwise an
+  unchanged price-tool suffix still breaks the client's existing allowlist.
 - Current rates are marginal EUR/kWh, not monthly invoices. Preserve negative
   prices, net export earnings, invoice-derived qualifications, exact decimal
   values, period boundaries, and missing/unpublished data. No zero fallbacks.
