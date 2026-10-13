@@ -1,7 +1,8 @@
 # Home automation
 
 Nine independent local stdio MCP servers for electricity data, household
-costs, and explicitly selected device controls. They share one installable
+costs, and explicitly selected device controls, plus integration with Home
+Assistant's native HTTP MCP server. The local servers share one installable
 Python distribution, not a hosted service or a background automation daemon.
 
 Repository: <https://github.com/vasilyevstan/home_automation>
@@ -22,11 +23,17 @@ documentation, and an `AGENTS.md` with maintenance and safety guidance.
 | `sonos-mcp` | [sonos](home_automation/sonos/README.md) | Local speakers, playback, groups, and queues | `sonos` |
 | `govee-mcp` | [govee](home_automation/govee/README.md) | LAN-enabled lights | None |
 | `terrace-heater-mcp` | [terrace_heater](home_automation/terrace_heater/README.md) | Privately provisioned direct-LAN heater | `heater` |
+| `home-assistant` (native remote) | [home_assistant](home_automation/home_assistant/README.md) | Direct HA device integrations and SDK-free household price sensors | Runs in HA; no extra MCP gateway |
 
 The heater's one-time provisioning utility additionally uses `heater-setup`.
 Tests and synthetic examples remain in the shared `tests/` and `examples/`
 directories. The pricing server reuses the market and household clients
 directly rather than launching other MCP processes.
+
+The HA pricing integration bundles the same pure financial engine without its
+MCP dependencies. It calculates inside HA; it does not call the pricing MCP or
+require the checkout/CLI to stay running. See its guide for installation,
+private profiles, scoped MCP access, and direct-device handover.
 
 The distribution name **`estonia-nordpool-prices`**, all existing console
 commands, MCP registration names, and tool names are retained for compatibility.

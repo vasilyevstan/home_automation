@@ -1,0 +1,14 @@
+get_prices:
+  fields:
+    config_entry:
+      required: true
+      selector:
+        config_entry:
+          integration: household_electricity_pricing
+    period:
+      default: today
+      selector:
+        select:
+          options:
+            - today
+            - tomorrow

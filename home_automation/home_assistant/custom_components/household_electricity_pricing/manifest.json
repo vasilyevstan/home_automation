@@ -1,0 +1,13 @@
+{
+  "domain": "household_electricity_pricing",
+  "name": "Household electricity pricing",
+  "codeowners": ["@vasilyevstan"],
+  "config_flow": true,
+  "dependencies": ["nordpool"],
+  "documentation": "https://github.com/vasilyevstan/home_automation/tree/main/home_automation/home_assistant",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}

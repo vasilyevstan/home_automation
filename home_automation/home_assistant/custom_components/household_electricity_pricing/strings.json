@@ -1,0 +1,46 @@
+{
+  "title": "Household electricity pricing",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Household electricity pricing",
+        "description": "Select an existing Nord Pool entry configured for EE and EUR. The private, effective-dated JSON profile must already be inside your HA configuration directory. {error}",
+        "data": {
+          "nordpool_config_entry": "Nord Pool configuration",
+          "profile_path": "Private profile path relative to the HA configuration directory"
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure household electricity pricing",
+        "description": "Update the selected price feed or private profile path. Profile file contents are loaded again on each calculation refresh. {error}",
+        "data": {
+          "nordpool_config_entry": "Nord Pool configuration",
+          "profile_path": "Private profile path relative to the HA configuration directory"
+        }
+      }
+    },
+    "error": {
+      "invalid_configuration": "Check the EE/EUR Nord Pool configuration and the private profile."
+    },
+    "abort": {
+      "already_configured": "Household electricity pricing is already configured.",
+      "reconfigure_successful": "The household pricing configuration was updated."
+    }
+  },
+  "services": {
+    "get_prices": {
+      "name": "Get household price window",
+      "description": "Return published quarter-hour marginal import costs and net export earnings. Missing market or tariff coverage is explicitly marked; monthly fees and invoice finalization are excluded.",
+      "fields": {
+        "config_entry": {
+          "name": "Configuration",
+          "description": "The household pricing configuration."
+        },
+        "period": {
+          "name": "Local delivery day",
+          "description": "Today or tomorrow in Europe/Tallinn."
+        }
+      }
+    }
+  }
+}
