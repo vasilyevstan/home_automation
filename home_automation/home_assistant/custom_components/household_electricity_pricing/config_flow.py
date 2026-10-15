@@ -6,7 +6,9 @@ from pathlib import Path
 
 import probatio
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.core import callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.selector import ConfigEntrySelector
 
 from ._vendor.home_automation.electricity_pricing.engine import PricingError, load_profile
@@ -14,9 +16,19 @@ from ._vendor.home_automation.household_consumption.client import ConsumptionErr
 from ._vendor.home_automation.home_assistant.calculator import load_credentials_file
 from ._vendor.home_automation.home_assistant.pricing import profile_path
 from .const import (
-    CONF_DAIKIN_ENTRY, CONF_ELERING_PATH, CONF_NORDPOOL_ENTRY, CONF_PROFILE_PATH, CONF_SOLAR_ENTRY,
+    CONF_DAIKIN_ENTRY, CONF_DHW_COAST_HOURS, CONF_DHW_EVENING_READY,
+    CONF_DHW_FLOOR_TARGET, CONF_DHW_INITIAL_HEAT_MINUTES, CONF_DHW_MAX_LEASE_HOURS,
+    CONF_DHW_MORNING_READY, CONF_DHW_NORMAL_TARGET, CONF_DHW_PREHEAT_TARGET,
+    CONF_DHW_PRICE_DELTA, CONF_DHW_PRICE_PERCENT, CONF_DHW_SOFT_TARGET,
+    CONF_ELERING_PATH, CONF_NORDPOOL_ENTRY, CONF_PROFILE_PATH, CONF_SOLAR_ENTRY,
+    DEFAULT_DHW_COAST_HOURS, DEFAULT_DHW_EVENING_READY, DEFAULT_DHW_FLOOR_TARGET,
+    DEFAULT_DHW_INITIAL_HEAT_MINUTES, DEFAULT_DHW_MAX_LEASE_HOURS,
+    DEFAULT_DHW_MORNING_READY, DEFAULT_DHW_NORMAL_TARGET, DEFAULT_DHW_PREHEAT_TARGET,
+    DEFAULT_DHW_PRICE_DELTA, DEFAULT_DHW_PRICE_PERCENT, DEFAULT_DHW_SOFT_TARGET,
     DEFAULT_PROFILE_PATH, DOMAIN, NAME,
 )
+from .controls import number
+from .dhw_optimizer import DhwPolicy
 
 
 DATA_SCHEMA = probatio.Schema({
@@ -83,4 +95,67 @@ class HouseholdPriceConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="reconfigure",
             data_schema=self.add_suggested_values_to_schema(DATA_SCHEMA, user_input or entry.data),
             errors=errors, description_placeholders={"error": reason},
+        )
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry) -> OptionsFlow:
+        return HouseholdPriceOptionsFlow()
+
+
+OPTIONS_SCHEMA = probatio.Schema({
+    probatio.Required(CONF_DHW_MORNING_READY, default=DEFAULT_DHW_MORNING_READY): str,
+    probatio.Required(CONF_DHW_EVENING_READY, default=DEFAULT_DHW_EVENING_READY): str,
+    probatio.Required(CONF_DHW_SOFT_TARGET, default=DEFAULT_DHW_SOFT_TARGET): probatio.Any(int, float),
+    probatio.Required(CONF_DHW_FLOOR_TARGET, default=DEFAULT_DHW_FLOOR_TARGET): probatio.Any(int, float),
+    probatio.Required(CONF_DHW_NORMAL_TARGET, default=DEFAULT_DHW_NORMAL_TARGET): probatio.Any(int, float),
+    probatio.Required(CONF_DHW_PREHEAT_TARGET, default=DEFAULT_DHW_PREHEAT_TARGET): probatio.Any(int, float),
+    probatio.Required(CONF_DHW_MAX_LEASE_HOURS, default=DEFAULT_DHW_MAX_LEASE_HOURS): probatio.Any(int, float),
+    probatio.Required(CONF_DHW_PRICE_DELTA, default=DEFAULT_DHW_PRICE_DELTA): probatio.Any(int, float),
+    probatio.Required(CONF_DHW_PRICE_PERCENT, default=DEFAULT_DHW_PRICE_PERCENT): probatio.Any(int, float),
+    probatio.Required(CONF_DHW_INITIAL_HEAT_MINUTES, default=DEFAULT_DHW_INITIAL_HEAT_MINUTES): probatio.Any(int, float),
+    probatio.Required(CONF_DHW_COAST_HOURS, default=DEFAULT_DHW_COAST_HOURS): probatio.Any(int, float),
+})
+
+
+class HouseholdPriceOptionsFlow(OptionsFlow):
+    def _validate(self, user_input: dict) -> None:
+        if not self.config_entry.data.get(CONF_DAIKIN_ENTRY):
+            raise PricingError("Select a Daikin entry before configuring the DHW optimizer.")
+        policy = DhwPolicy.from_options(user_input)
+        runtime = self.hass.data.get(DOMAIN, {}).get(self.config_entry.entry_id, {})
+        devices = runtime.get("devices")
+        if devices is None:
+            raise PricingError("The configured Daikin runtime is unavailable.")
+        _, api = devices.daikin_api()
+        profile = api.water_tank_target_temp_config
+        if not profile or profile.get("settable") is not True:
+            raise PricingError("The native Daikin DHW target is not settable.")
+        for label, value in (
+            ("Soft-standby target", policy.soft_target),
+            ("Comfort target", policy.floor_target),
+            ("Normal target", policy.normal_target),
+            ("Preheat target", policy.preheat_target),
+        ):
+            number(value, label, profile["minValue"], profile["maxValue"], profile["stepValue"])
+
+    async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
+        errors = {}
+        reason = ""
+        if user_input is not None:
+            try:
+                self._validate(user_input)
+            except (HomeAssistantError, PricingError) as error:
+                errors["base"] = "invalid_optimizer"
+                reason = str(error)
+            else:
+                return self.async_create_entry(data=user_input)
+        suggested = self.add_suggested_values_to_schema(
+            OPTIONS_SCHEMA, user_input or self.config_entry.options
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=suggested,
+            errors=errors,
+            description_placeholders={"error": reason},
         )

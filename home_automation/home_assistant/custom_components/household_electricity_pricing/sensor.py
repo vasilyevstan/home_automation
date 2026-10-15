@@ -38,10 +38,14 @@ DESCRIPTIONS = (
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
-    async_add_entities(
+    entities = [
         HouseholdPriceSensor(entry.runtime_data, entry.entry_id, description)
         for description in DESCRIPTIONS
-    )
+    ]
+    optimizer = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("optimizer")
+    if optimizer:
+        entities.append(DhwOptimizerSensor(optimizer, entry.entry_id))
+    async_add_entities(entities)
 
 
 class HouseholdPriceSensor(CoordinatorEntity[HouseholdPriceCoordinator], SensorEntity):
@@ -84,3 +88,29 @@ class HouseholdPriceSensor(CoordinatorEntity[HouseholdPriceCoordinator], SensorE
             "market_errors": list(self.coordinator.market_errors.values()),
             "price_source": "published_nordpool_ee",
         }
+
+
+class DhwOptimizerSensor(SensorEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Hot water optimizer"
+    _attr_icon = "mdi:water-boiler-auto"
+
+    def __init__(self, optimizer, entry_id: str) -> None:
+        self.optimizer = optimizer
+        self._attr_unique_id = entry_id + "_dhw_optimizer"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)}, name=NAME, manufacturer="home_automation"
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            self.optimizer.async_add_listener(self.async_write_ha_state)
+        )
+
+    @property
+    def native_value(self) -> str:
+        return self.optimizer.decision.state if self.optimizer.decision else "starting"
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return self.optimizer.attributes

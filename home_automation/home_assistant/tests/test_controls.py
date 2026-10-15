@@ -335,6 +335,14 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tools[2].annotations.read_only)
         self.assertFalse(tools[3].annotations.read_only)
 
+    async def test_control_api_can_share_one_serialized_device_runtime(self):
+        api = self.controls.HomeEnergyDeviceAPI(
+            self.hass,
+            {"daikin_config_entry": "daikin"},
+            devices=self.devices,
+        )
+        self.assertIs(api.devices, self.devices)
+
     def test_control_journal_is_private_and_records_only_explicit_events(self):
         path = Path(self.config_directory.name) / ".storage/control.jsonl"
         self.controls.append_record(path, {"event": "prepared", "request_id": "synthetic"})
