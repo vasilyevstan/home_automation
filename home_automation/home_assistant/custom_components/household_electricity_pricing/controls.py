@@ -232,17 +232,29 @@ class EnergyDevices:
         return heating, water
 
     async def get_daikin_status(self):
-        async with self.daikin_lock, asyncio.timeout(30):
-            _, api = self.daikin_api()
-            heating, water = await self.daikin_observation(api)
-            mode = await self.daikin_resource(
-                api, {"function/SpaceHeating"}, "UnitStatus/ControlModeState"
-            )
-            return {
-                "heating": heating, "hot_water": water, "control_mode": mode,
-                "observed_at": datetime.now(timezone.utc).isoformat(),
-                "measurement_freshness": "Fresh adapter retrieval does not prove the age of every measurement.",
-            }
+        from pyaltherma.controllers import AlthermaException
+
+        try:
+            async with self.daikin_lock, asyncio.timeout(30):
+                _, api = self.daikin_api()
+                heating, water = await self.daikin_observation(api)
+                mode = await self.daikin_resource(
+                    api, {"function/SpaceHeating"}, "UnitStatus/ControlModeState"
+                )
+                effective = await self.daikin_resource(
+                    api, {"function/DomesticHotWaterTank", "function/DomesticHotWater"},
+                    "Operation/TargetTemperature",
+                )
+                return {
+                    "heating": heating, "hot_water": water, "control_mode": mode,
+                    "effective_hot_water_target": effective,
+                    "observed_at": datetime.now(timezone.utc).isoformat(),
+                    "measurement_freshness": "Fresh adapter retrieval does not prove the age of every measurement.",
+                }
+        except (AlthermaException, aiohttp.ClientError, TimeoutError, OSError, ValueError, KeyError) as error:
+            raise HomeAssistantError(
+                "Fresh Daikin status is unavailable; no control command was sent."
+            ) from error
 
     async def daikin_snapshot(self, api):
         heating, water = await self.daikin_observation(api)
@@ -462,9 +474,9 @@ class DaikinRead(llm.Tool):
 
 
 class HomeEnergyDeviceAPI(llm.API):
-    def __init__(self, hass, options):
+    def __init__(self, hass, options, devices=None):
         super().__init__(hass=hass, id=CONTROL_API_ID, name="Home energy devices (guarded)")
-        self.devices = EnergyDevices(hass, options)
+        self.devices = devices or EnergyDevices(hass, options)
 
     async def async_get_api_instance(self, llm_context: LLMContext) -> llm.APIInstance:
         tools = []

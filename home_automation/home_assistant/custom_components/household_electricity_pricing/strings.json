@@ -33,6 +33,30 @@
       "reconfigure_successful": "The household pricing configuration was updated."
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Domestic hot-water price optimizer",
+        "description": "Configure the deterministic Daikin target policy. Saving options does not enable writes; the optimizer starts and remains in Shadow until its mode is explicitly promoted. {error}",
+        "data": {
+          "dhw_morning_ready": "Morning readiness time (HH:MM, Europe/Tallinn)",
+          "dhw_evening_ready": "Evening readiness time (HH:MM, Europe/Tallinn)",
+          "dhw_soft_target": "Soft-standby target (°C)",
+          "dhw_floor_target": "Comfort threshold and safe coast target (°C)",
+          "dhw_normal_target": "Normal readiness target (°C)",
+          "dhw_preheat_target": "Cheap-period preheat target (°C)",
+          "dhw_max_lease_hours": "Maximum soft-standby lease (hours)",
+          "dhw_price_delta_eur_kwh": "Minimum absolute price advantage (EUR/kWh)",
+          "dhw_price_delta_percent": "Minimum relative price advantage (%)",
+          "dhw_initial_heat_minutes": "Initial conservative heating allowance (minutes)",
+          "dhw_coast_horizon_hours": "Maximum preheat coast horizon (hours)"
+        }
+      }
+    },
+    "error": {
+      "invalid_optimizer": "The optimizer policy is invalid or the selected Daikin target capability is unavailable."
+    }
+  },
   "services": {
     "get_prices": {
       "name": "Get household price window",

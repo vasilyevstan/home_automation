@@ -231,6 +231,8 @@ class HomeAssistantBundleTests(unittest.TestCase):
             {"get_prices", "quote_electricity_interval", "calculate_electricity_period", "estimate_electricity_scenario"},
         )
         self.assertEqual(set(strings["config"]), {"step", "error", "abort"})
+        self.assertEqual(set(strings["options"]), {"step", "error"})
+        self.assertIn("dhw_preheat_target", strings["options"]["step"]["init"]["data"])
         forms = (component / "services.yaml").read_text()
         for action in strings["services"]:
             self.assertIn(action + ":", forms)
@@ -265,6 +267,9 @@ class HomeAssistantBundleTests(unittest.TestCase):
                 ))
                 self.assertIn(prefix + "LICENSE", names)
                 self.assertIn(prefix + "price_api.py", names)
+                self.assertIn(prefix + "dhw_optimizer.py", names)
+                self.assertIn(prefix + "select.py", names)
+                self.assertIn(prefix + "button.py", names)
                 self.assertNotIn(prefix + "llm.py", names)
 
     def test_generated_calculator_imports_and_runs_without_ha_or_mcp(self):

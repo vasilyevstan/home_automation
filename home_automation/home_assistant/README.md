@@ -20,7 +20,8 @@ The pricing API is read-only and calculated, targeted and tested against
 a separate guarded control API. Its device connectors are separate community
 integrations and must be checked against the installed HA version and hardware.
 It does not install them or change device settings during setup. There is no
-automatic optimizer.
+LLM-driven optimizer. An explicitly configured deterministic DHW optimizer is
+separate from the guarded MCP tools and always starts in zero-write shadow mode.
 
 ## Native MCP connection
 
@@ -332,10 +333,84 @@ device, unchanged verified targets produce read-only no-ops, and uncertain
 outcomes are reported instead of automatically replayed or rolled back.
 
 Do not expose an unrestricted service caller, register access, administrator
-tools, boost/installer controls, or automatic optimization. A write may take
-effect even if acknowledgement/read-back fails: report uncertainty and inspect
-fresh state rather than replaying it. Connectivity tests are read-only, not
-same-value writes, toggles, heating changes, or power-limit changes.
+tools, boost/installer controls, or automatic optimization through the LLM API.
+A write may take effect even if acknowledgement/read-back fails: report
+uncertainty and inspect fresh state rather than replaying it. Connectivity tests
+are read-only, not same-value writes, toggles, heating changes, or power-limit
+changes.
+
+## Domestic-hot-water price optimizer
+
+Selecting a Daikin entry also creates a deterministic HA-native DHW optimizer.
+It consumes the coordinator's published all-in `import_eur_kwh` quarters; it
+does not call MCP, duplicate tariff rules, use wholesale-only prices, substitute
+forecasts, or depend on Copilot or another process. Missing coverage through the
+next readiness deadline fails safe to the normal target.
+
+The default policy is:
+
+| Setting | Value |
+| --- | --- |
+| Readiness deadlines | 07:00 and 21:00 Europe/Tallinn |
+| Soft-standby target | 30°C |
+| Comfort threshold / safe coast target | 45°C |
+| Normal target | 50°C |
+| Cheap-period preheat target | 55°C |
+| Maximum 30°C lease | 4 hours |
+| Price gate | Current all-in price at least €0.05/kWh and 20% above the selected cheap-window average |
+| Initial heating allowance | 90 minutes |
+| Preheat coast horizon | 8 hours |
+
+For each readiness cycle, the optimizer anchors one cheapest contiguous
+all-in-price block instead of selecting a new trailing block every quarter.
+It compares that block with the highest-cost feasible block of the same
+duration. The 55°C target is proposed only when that preheat opportunity passes
+the same €0.05/kWh and 20% gates; flat or low-value price shapes stay at 50°C.
+This is a price opportunity per kWh, not a measured saving, because whole-Daikin
+electrical energy is unavailable.
+
+Comfort or missed-deadline recovery is latched until the measured tank reaches
+50°C. Ordinary 45/50°C cost-driven transitions use a 30-minute minimum dwell,
+while comfort, readiness, incomplete-data and lease-expiry exits bypass it.
+Each policy revision clears prior qualification evidence so changed Shadow
+behavior must earn a new observation period.
+
+The options flow validates every target against the selected Daikin's native
+range and step. On the verified BRP069A62 installation that range is 30–55°C in
+1°C steps; 60°C is rejected rather than clamped.
+
+The runtime mode select provides:
+
+- `shadow`: default; calculate and record the same 55/45/50°C decisions the safe
+  pilot would make, but send no device commands.
+- `safe_target_shift`: after at least seven observed days, five usable heat
+  cycles and ten successful readiness checks with no failed check, permit
+  guarded 55°C preheat, 45°C coast, and latched 50°C recovery targets.
+- `soft_standby`: after a validated seven-day safe pilot and ten confirmed
+  writes, permit the 30°C target under a persisted four-hour lease.
+- `paused`: issue no automatic targets.
+
+The 30°C target is soft standby, not active cooling and not the comfort floor.
+It leaves the DHW circuit enabled but relies on HA to restore 50°C at the 45°C
+threshold, lease expiry, readiness lead time, incomplete data, or a failed price
+gate. A complete HA outage can leave that low target in place until HA returns,
+so the mode is never enabled automatically and its residual risk must remain
+visible in the UI.
+
+One shared `EnergyDevices` instance serializes optimizer and explicit MCP writes.
+The controller yields to circuit standby, powerful/hygiene-like operation,
+weather-dependent control, active/unknown safety flags, configured/effective
+target mismatch, and external target changes. It only modifies a target it owns.
+An uncertain write latches the optimizer in fault, creates a persistent
+notification, and requires a fresh read plus explicit resume; there is no
+automatic retry, inversion, or rollback.
+
+The integration exposes an optimizer status sensor with current/proposed
+targets, decision reason, selected price window, readiness deadline, price-gate
+evidence, lease, learning counters and recent decisions; a mode select; and
+explicit resume and return-to-normal buttons. Return-to-normal pauses scheduling
+before requesting an ownership-aware 50°C restore. Whole-unit electrical energy
+is unavailable, so reported price opportunity is not measured kWh or savings.
 
 ## Validation
 
@@ -357,6 +432,10 @@ uv run --no-project --isolated --python 3.14 \
 uv run --no-project --isolated --python 3.14 \
   --with-requirements home_automation/home_assistant/tests/requirements.txt \
   python home_automation/home_assistant/tests/test_controls.py -v
+
+uv run --no-project --isolated --python 3.14 \
+  --with-requirements home_automation/home_assistant/tests/requirements.txt \
+  python home_automation/home_assistant/tests/test_dhw_optimizer.py -v
 ```
 
 Tests build and load the real bundle, use synthetic rates and mocked market

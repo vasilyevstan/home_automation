@@ -34,6 +34,26 @@
   HA device clients and real-command authentication, not setup write probes or
   another Modbus connection. Journal intent before a write and retain uncertain
   outcomes; no automatic retries or rollback.
+- The deterministic DHW optimizer is not an LLM tool. It must use the existing
+  all-in price snapshot and the same shared guarded `EnergyDevices` instance.
+  Default to shadow with zero writes; never let installation, setup, status
+  reads, or option saves promote it.
+- Preserve the 07:00/21:00 readiness, 30/45/50/55°C ordering, native target
+  range/step validation, complete published-price requirement, sign-safe
+  absolute/relative price gate, four-hour lease, and ownership-aware restore.
+  Anchor one cheap and comparison block per readiness cycle; require a material
+  all-in-price advantage before 55°C preheat. Missing data and comfort/readiness
+  recovery override optimization. Keep recovery latched through measured 50°C,
+  use minimum dwell for ordinary price-driven transitions, and reset promotion
+  evidence whenever a policy revision changes those behaviors.
+- Treat 30°C as explicitly promoted soft standby, not a comfort or hygiene
+  setting. Keep the circuit enabled, never actively cool, never use boost, and
+  never hide the HA-outage residual risk. Native DHW standby/off remains out of
+  scope unless a later task supplies new evidence and policy.
+- Manual/manufacturer changes, powerful/hygiene-like operation, safety flags,
+  circuit standby, weather-dependent control, and configured/effective target
+  mismatch suspend optimizer ownership. An uncertain write latches fault and
+  needs an explicit fresh-read resume; do not replay or invert it.
 - Huawei control/read transactions must hold the device's `update_lock`, shared
   with its native polling coordinator, not only the API's own per-device lock.
 - HA must be the sole Huawei Modbus client during handover. Keep the old local
@@ -43,6 +63,6 @@
   checks and obtain fresh read-back. Never toggle a device or perform a
   same-value write as an installation/connectivity check.
 - Run the root `test_home_assistant_pricing.py` suite and the isolated real-HA
-  test command in the README. Do not install HA dependencies into the shared
-  MCP environment. Use synthetic data; keep live captures and private profiles
-  out of commits and public logs.
+  test commands in the README, including `test_dhw_optimizer.py`. Do not install
+  HA dependencies into the shared MCP environment. Use synthetic data; keep
+  live captures and private profiles out of commits and public logs.
