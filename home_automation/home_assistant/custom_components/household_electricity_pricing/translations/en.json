@@ -36,8 +36,8 @@
   "options": {
     "step": {
       "init": {
-        "title": "Domestic hot-water price optimizer",
-        "description": "Configure the deterministic Daikin target policy. Saving options does not enable writes; the optimizer starts and remains in Shadow until its mode is explicitly promoted. {error}",
+        "title": "Heating price optimizers",
+        "description": "Configure the deterministic Daikin target policy and select occupied-room temperature sources for floor Shadow. Saving options does not enable writes; both evaluators remain in Shadow until explicitly promoted. {error}",
         "data": {
           "dhw_morning_ready": "Morning readiness time (HH:MM, Europe/Tallinn)",
           "dhw_evening_ready": "Evening readiness time (HH:MM, Europe/Tallinn)",
@@ -49,7 +49,8 @@
           "dhw_price_delta_eur_kwh": "Minimum absolute price advantage (EUR/kWh)",
           "dhw_price_delta_percent": "Minimum relative price advantage (%)",
           "dhw_initial_heat_minutes": "Initial conservative heating allowance (minutes)",
-          "dhw_coast_horizon_hours": "Maximum preheat coast horizon (hours)"
+          "dhw_coast_horizon_hours": "Maximum preheat coast horizon (hours)",
+          "floor_indoor_temperature_entities": "Occupied-room temperatures for floor Shadow"
         }
       }
     },

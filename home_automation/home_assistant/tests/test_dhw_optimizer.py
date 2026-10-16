@@ -539,6 +539,11 @@ class DhwOptimizerTests(base.HAComponentTests):
         flow = flow_module.HouseholdPriceOptionsFlow()
         flow.hass = self.hass
         flow.handler = "pricing"
+        self.hass.states.async_set(
+            "sensor.room_temperature",
+            "21.5",
+            {"unit_of_measurement": "°C"},
+        )
         valid = {
             "dhw_morning_ready": "07:00",
             "dhw_evening_ready": "21:00",
@@ -551,6 +556,7 @@ class DhwOptimizerTests(base.HAComponentTests):
             "dhw_price_delta_percent": 20,
             "dhw_initial_heat_minutes": 90,
             "dhw_coast_horizon_hours": 8,
+            "floor_indoor_temperature_entities": ["sensor.room_temperature"],
         }
         flow._validate(valid)
         with self.assertRaisesRegex(HomeAssistantError, "native range"):

@@ -4,8 +4,14 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from homeassistant.components.sensor import SensorEntity, SensorEntityDescription, SensorStateClass
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+    SensorStateClass,
+)
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -50,6 +56,7 @@ async def async_setup_entry(
     )
     if floor_shadow:
         entities.append(FloorHeatingShadowSensor(floor_shadow, entry.entry_id))
+        entities.append(FloorRoomTemperatureSensor(floor_shadow, entry.entry_id))
     async_add_entities(entities)
 
 
@@ -145,3 +152,50 @@ class FloorHeatingShadowSensor(SensorEntity):
     @property
     def extra_state_attributes(self) -> dict:
         return self.shadow.attributes
+
+
+class FloorRoomTemperatureSensor(SensorEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Floor heating room temperature"
+    _attr_icon = "mdi:home-thermometer"
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 1
+
+    def __init__(self, shadow, entry_id: str) -> None:
+        self.shadow = shadow
+        self._attr_unique_id = entry_id + "_floor_heating_room_temperature"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)}, name=NAME, manufacturer="home_automation"
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            self.shadow.async_add_listener(self.async_write_ha_state)
+        )
+
+    @property
+    def available(self) -> bool:
+        return (
+            self.shadow.decision is not None
+            and self.shadow.decision.indoor_temperature is not None
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        if not self.available:
+            return None
+        return self.shadow.decision.indoor_temperature
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        details = self.shadow.room_temperature_details
+        return {
+            "source": details["indoor_temperature_source"],
+            "source_entities": details["indoor_temperature_entities"],
+            "source_values_c": details["indoor_temperature_values_c"],
+            "oldest_source_update": details["indoor_temperature_oldest_update"],
+            "source_error": details["indoor_temperature_source_error"],
+            "daikin_garage_temperature_c": details["daikin_indoor_temperature_c"],
+        }

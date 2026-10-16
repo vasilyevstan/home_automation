@@ -10,14 +10,23 @@ import math
 from typing import Callable, Iterable
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import (
+    ATTR_UNIT_OF_MEASUREMENT,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import (
+    async_track_state_change_event,
+    async_track_time_interval,
+)
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from ._vendor.home_automation.electricity_market.prices import MARKET_INTERVAL, TALLINN, UTC
 from .const import (
+    CONF_FLOOR_INDOOR_TEMPERATURE_ENTITIES,
     DOMAIN,
     EVENT_FLOOR_SHADOW_DECISION,
     FLOOR_COMFORT_FLOOR,
@@ -33,6 +42,7 @@ from .const import (
     FLOOR_PREHEAT_OFFSET,
     FLOOR_PRICE_DELTA,
     FLOOR_PRICE_PERCENT,
+    FLOOR_ROOM_TEMPERATURE_MAX_AGE_MINUTES,
     FLOOR_SHADOW_MODE,
     FLOOR_WINDOW_MINUTES,
 )
@@ -50,7 +60,7 @@ from .dhw_optimizer import (
 
 STORE_VERSION = 1
 STORE_KEY_SUFFIX = "floor_heating_shadow"
-POLICY_REVISION = 1
+POLICY_REVISION = 2
 DECISION_HISTORY_LIMIT = 96
 
 
@@ -69,6 +79,71 @@ def _instant(value: object) -> datetime | None:
     except ValueError:
         return None
     return result if result.utcoffset() is not None else None
+
+
+def _temperature_celsius(value: object, unit: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    if unit in ("°C", "C"):
+        return result
+    if unit in ("°F", "F"):
+        return (result - 32) * 5 / 9
+    if unit in ("K", "kelvin"):
+        return result - 273.15
+    return None
+
+
+def read_room_temperature_source(
+    hass: HomeAssistant,
+    entity_id: object,
+    *,
+    now: datetime | None = None,
+    maximum_age: timedelta | None = timedelta(
+        minutes=FLOOR_ROOM_TEMPERATURE_MAX_AGE_MINUTES
+    ),
+) -> tuple[float | None, datetime | None, str | None]:
+    if not isinstance(entity_id, str) or "." not in entity_id:
+        return None, None, "The occupied-room temperature entity ID is invalid."
+    state = hass.states.get(entity_id)
+    if state is None:
+        return None, None, f"Occupied-room temperature entity {entity_id} is missing."
+    if state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+        return None, None, f"Occupied-room temperature entity {entity_id} is unavailable."
+    domain = entity_id.split(".", 1)[0]
+    if domain == "climate":
+        raw_value = state.attributes.get("current_temperature")
+        unit = (
+            state.attributes.get("temperature_unit")
+            or hass.config.units.temperature_unit
+        )
+    elif domain == "sensor":
+        raw_value = state.state
+        unit = state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
+    else:
+        return None, None, f"{entity_id} is not a sensor or climate entity."
+    value = _temperature_celsius(raw_value, unit)
+    if value is None:
+        return (
+            None,
+            None,
+            f"Occupied-room temperature entity {entity_id} has no supported temperature.",
+        )
+    updated = getattr(state, "last_reported", None) or state.last_updated
+    if maximum_age is not None and now is not None:
+        age = now.astimezone(UTC) - updated.astimezone(UTC)
+        if age > maximum_age:
+            return (
+                None,
+                updated,
+                f"Occupied-room temperature entity {entity_id} is stale.",
+            )
+    return value, updated, None
 
 
 @dataclass(frozen=True)
@@ -113,6 +188,7 @@ class FloorHeatingObservation:
     actual_offset: float | None
     enabled: bool | None
     override_reason: str | None
+    unavailable_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -324,7 +400,8 @@ def plan_floor_heating(
     ):
         return decision(
             "unavailable",
-            "Fresh indoor, outdoor, leaving-water and LWT-offset observations are required.",
+            observation.unavailable_reason
+            or "Fresh indoor, outdoor, leaving-water and LWT-offset observations are required.",
             None,
         )
     if not policy.minimum_offset <= observation.actual_offset <= policy.preheat_offset:
@@ -422,6 +499,30 @@ class FloorHeatingShadow:
         self.devices = devices
         self.dhw_optimizer = dhw_optimizer
         self.policy = FloorHeatingPolicy()
+        configured_entities = entry.options.get(
+            CONF_FLOOR_INDOOR_TEMPERATURE_ENTITIES, []
+        )
+        self.room_temperature_entities = (
+            tuple(
+                entity_id
+                for entity_id in configured_entities
+                if isinstance(entity_id, str)
+            )
+            if isinstance(configured_entities, (list, tuple))
+            else ()
+        )
+        self.room_temperature_details = {
+            "indoor_temperature_source": "minimum_of_configured_occupied_rooms",
+            "indoor_temperature_entities": list(self.room_temperature_entities),
+            "indoor_temperature_values_c": {},
+            "indoor_temperature_oldest_update": None,
+            "indoor_temperature_max_age_minutes": (
+                FLOOR_ROOM_TEMPERATURE_MAX_AGE_MINUTES
+            ),
+            "indoor_temperature_source_error": None,
+            "daikin_indoor_temperature_c": None,
+            "daikin_indoor_temperature_role": "garage_diagnostic_only",
+        }
         self.store = Store(
             hass,
             STORE_VERSION,
@@ -462,6 +563,14 @@ class FloorHeatingShadow:
             self.unsubscribers.append(
                 self.dhw_optimizer.async_add_listener(self._schedule_evaluation)
             )
+        if self.room_temperature_entities:
+            self.unsubscribers.append(
+                async_track_state_change_event(
+                    self.hass,
+                    self.room_temperature_entities,
+                    self._room_temperature_changed,
+                )
+            )
         self.unsubscribers.append(
             async_track_time_interval(
                 self.hass,
@@ -498,20 +607,70 @@ class FloorHeatingShadow:
     def _schedule_evaluation(self) -> None:
         self.hass.async_create_task(self.async_evaluate())
 
+    @callback
+    def _room_temperature_changed(self, _event) -> None:
+        self._schedule_evaluation()
+
     async def _async_interval(self, now: datetime) -> None:
         await self.async_evaluate(now)
 
     async def _save(self) -> None:
         await self.store.async_save(self.state)
 
-    def _observation(self, status: dict) -> FloorHeatingObservation:
+    def _room_temperature(
+        self, observed_at: datetime
+    ) -> tuple[float | None, str | None]:
+        values = {}
+        updates = []
+        errors = []
+        if not self.room_temperature_entities:
+            errors.append(
+                "Configure at least one occupied-room temperature entity; "
+                "the Daikin garage sensor is diagnostic only."
+            )
+        for entity_id in self.room_temperature_entities:
+            value, updated, reason = read_room_temperature_source(
+                self.hass,
+                entity_id,
+                now=observed_at,
+            )
+            if reason is not None or value is None:
+                errors.append(reason or f"{entity_id} is unavailable.")
+                continue
+            values[entity_id] = round(value, 3)
+            if updated is not None:
+                updates.append(updated)
+        self.room_temperature_details.update({
+            "indoor_temperature_entities": list(self.room_temperature_entities),
+            "indoor_temperature_values_c": values,
+            "indoor_temperature_oldest_update": (
+                min(updates).isoformat() if updates else None
+            ),
+            "indoor_temperature_source_error": "; ".join(errors) or None,
+        })
+        if errors:
+            return None, "; ".join(errors)
+        return min(values.values()), None
+
+    def _observation(
+        self, status: dict, observed_at: datetime
+    ) -> FloorHeatingObservation:
         heating = status.get("heating")
         if not isinstance(heating, dict):
-            return FloorHeatingObservation(None, None, None, None, None, "Fresh Daikin space-heating data is unavailable.")
+            return FloorHeatingObservation(
+                None,
+                None,
+                None,
+                None,
+                None,
+                "Fresh Daikin space-heating data is unavailable.",
+            )
         states = heating.get("states", {})
         operations = heating.get("operations", {})
         sensors = heating.get("sensors", {})
-        indoor = _number(sensors.get("IndoorTemperature"))
+        daikin_indoor = _number(sensors.get("IndoorTemperature"))
+        self.room_temperature_details["daikin_indoor_temperature_c"] = daikin_indoor
+        indoor, indoor_reason = self._room_temperature(observed_at)
         outdoor = _number(sensors.get("OutdoorTemperature"))
         leaving = _number(
             sensors.get(
@@ -533,7 +692,15 @@ class FloorHeatingShadow:
             reason = "Daikin is not in heating operation mode."
         elif enabled is not True:
             reason = "The space-heating circuit is in standby or its state is unknown."
-        return FloorHeatingObservation(indoor, outdoor, leaving, offset, enabled, reason)
+        return FloorHeatingObservation(
+            indoor,
+            outdoor,
+            leaving,
+            offset,
+            enabled,
+            reason,
+            indoor_reason,
+        )
 
     def _clear_plan(self) -> None:
         for key in (
@@ -639,7 +806,7 @@ class FloorHeatingShadow:
             observed_at = (now or dt_util.utcnow()).astimezone(UTC)
             try:
                 status = await self.devices.get_daikin_status()
-                observation = self._observation(status)
+                observation = self._observation(status, observed_at)
                 planned = self._stored_plan(observed_at)
                 dhw_decision = (
                     self.dhw_optimizer.decision
@@ -728,6 +895,7 @@ class FloorHeatingShadow:
                 "Fresh signed net-grid power is unavailable; PV generation alone "
                 "cannot prove household surplus."
             ),
+            **self.room_temperature_details,
             "recent_decisions": self.state["decision_history"][-12:],
         })
         return result
