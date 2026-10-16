@@ -12,6 +12,7 @@ DOMAIN = "household_electricity_pricing"
 CORE_FILES = (
     "__init__.py",
     "electricity_market/__init__.py",
+    "electricity_market/forecast.py",
     "electricity_market/prices.py",
     "electricity_pricing/__init__.py",
     "electricity_pricing/data.py",
@@ -31,6 +32,7 @@ COMPONENT_FILES = (
     "controls.py",
     "dhw_optimizer.py",
     "floor_heating_shadow.py",
+    "price_forecast.py",
     "sensor.py",
     "select.py",
     "button.py",

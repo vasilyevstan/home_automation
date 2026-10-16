@@ -20,6 +20,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, NAME
 from .coordinator import HouseholdPriceCoordinator
+from .price_forecast import HouseholdPriceForecastCoordinator
 
 
 DESCRIPTIONS = (
@@ -48,6 +49,9 @@ async def async_setup_entry(
         HouseholdPriceSensor(entry.runtime_data, entry.entry_id, description)
         for description in DESCRIPTIONS
     ]
+    forecast = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("forecast")
+    if forecast:
+        entities.append(PriceForecastSensor(forecast, entry.entry_id))
     optimizer = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("optimizer")
     if optimizer:
         entities.append(DhwOptimizerSensor(optimizer, entry.entry_id))
@@ -99,6 +103,68 @@ class HouseholdPriceSensor(CoordinatorEntity[HouseholdPriceCoordinator], SensorE
             "exact_price_text": exact + " EUR/kWh" if exact is not None else None,
             "market_errors": list(self.coordinator.market_errors.values()),
             "price_source": "published_nordpool_ee",
+        }
+
+
+class PriceForecastSensor(
+    CoordinatorEntity[HouseholdPriceForecastCoordinator], SensorEntity
+):
+    _attr_has_entity_name = True
+    _attr_name = "Seven-day price forecast"
+    _attr_icon = "mdi:chart-bell-curve"
+    _attr_native_unit_of_measurement = "EUR/kWh"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 5
+
+    def __init__(
+        self,
+        coordinator: HouseholdPriceForecastCoordinator,
+        entry_id: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = entry_id + "_seven_day_price_forecast"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)},
+            name=NAME,
+            manufacturer="home_automation",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self.coordinator.data is None:
+            self.coordinator.hass.async_create_task(
+                self.coordinator.async_request_refresh()
+            )
+
+    @property
+    def available(self) -> bool:
+        return (
+            super().available
+            and self.coordinator.data is not None
+            and self.coordinator.data.next_prediction is not None
+        )
+
+    @property
+    def native_value(self) -> Decimal | None:
+        if not self.available:
+            return None
+        return self.coordinator.data.next_prediction
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        if self.coordinator.data is None:
+            return {
+                "refresh_status": (
+                    "failed" if self.coordinator.refresh_error else "pending"
+                ),
+                "refresh_error": self.coordinator.refresh_error,
+            }
+        return {
+            **self.coordinator.data.attributes,
+            "refresh_status": (
+                "failed" if self.coordinator.refresh_error else "ok"
+            ),
+            "refresh_error": self.coordinator.refresh_error,
         }
 
 

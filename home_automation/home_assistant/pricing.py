@@ -181,6 +181,20 @@ def unit_prices(
     )
 
 
+def forecast_import_eur_kwh(
+    profile: PricingProfile, price_eur_mwh: Decimal, start: datetime
+) -> str:
+    """Apply the household tariff to one forecast quarter without inventing export."""
+    end = start + MARKET_INTERVAL
+    result = quote_interval(
+        profile,
+        EnergyInterval(start, end, ONE, ZERO),
+        {start: price_eur_mwh},
+        "billable",
+    )
+    return result.amounts.including_vat_eur
+
+
 def price_window(
     profile: PricingProfile, prices: Mapping[datetime, Decimal], delivery_day: date
 ) -> PriceWindow:

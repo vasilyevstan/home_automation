@@ -184,6 +184,7 @@ The calculated integration exposes:
 | Spot price excluding VAT | Published market energy price in EUR/kWh |
 | All-in import price | Variable cost of one additional billable imported kWh, including applicable VAT |
 | Net export earnings | Net earnings for one billable exported kWh after export deductions and taxable balancing fees; negative means exporting costs money |
+| Seven-day price forecast | Next available p50 all-in import estimate; attributes summarize freshness, coverage, uncertainty and retained evidence |
 
 Rates exclude unchanged monthly fixed fees. They preserve unrounded Decimal
 calculations; suggested display precision does not round the billing engine.
@@ -211,6 +212,58 @@ The response includes `complete`, `expected_intervals`,
 `missing_market_intervals`, `unavailable_reason`, and the known priced intervals.
 Never present an incomplete window as a complete next-day schedule. Profile
 coverage and market coverage are separate. No forecast is substituted.
+
+### Seven-day forecast and application API
+
+The integration also retrieves Wattcast's Estonia forecast and returns seven
+complete `Europe/Tallinn` delivery days starting tomorrow. A normal week has
+168 hourly predictions; a daylight-saving transition can have 167 or 169. Raw
+hourly p10/p50/p90 wholesale estimates are expanded to real quarter-hour
+instants and passed through the same effective-dated household tariff engine as
+published prices. The resulting primary values are marginal all-in import
+EUR/kWh, including applicable VAT and excluding unchanged monthly fees.
+
+Canonical HA Nord Pool quarters always replace predictions once published. If
+the provider labels an hour published but HA has no canonical price, that hour
+is unavailable rather than accepted from a second source. Negative predictions
+remain negative when the tariff calculation permits them. The p10-p90 range is
+the provider's nominal 80% uncertainty interval, not a guaranteed bound.
+Provider MAE and coverage are evidence supplied by the provider, not an
+independent audit.
+
+Use the response-returning action for the complete dashboard/application
+payload:
+
+```yaml
+action: household_electricity_pricing.get_price_forecast
+data:
+  config_entry: YOUR_HOUSEHOLD_PRICING_ENTRY_ID
+  view: current
+```
+
+`view: current` returns all quarter-hour published/p10/p50/p90 values, daily
+summaries, freshness, completeness, warnings, attribution and provider accuracy.
+The integration stores the latest provider issuance for each delivery hour and
+D-1 through D-7 horizon for 90 days. Query that evidence with:
+
+```yaml
+action: household_electricity_pricing.get_price_forecast
+data:
+  config_entry: YOUR_HOUSEHOLD_PRICING_ENTRY_ID
+  view: archive
+  history_days: 7
+  horizon_days: 1
+```
+
+A future application can call the same action through HA's authenticated REST
+service API instead of introducing a separate unauthenticated server. Use a
+least-privilege HA credential over an existing trusted local or remote-access
+path; do not embed an administrator token in a public client. The summary sensor
+is recorder-safe and intentionally omits the full interval array.
+
+Forecasts and their archive are advisory evidence only. They do not authorize
+DHW, floor-heating or other device writes, do not replace published prices in
+actual bills, and must not be described as measured savings.
 
 The separately selectable **Household electricity prices (read only)**
 LLM API exposes `GetHouseholdElectricityPrices`,
@@ -485,6 +538,10 @@ uv run --no-project --isolated --python 3.14 \
 uv run --no-project --isolated --python 3.14 \
   --with-requirements home_automation/home_assistant/tests/requirements.txt \
   python home_automation/home_assistant/tests/test_floor_heating_shadow.py -v
+
+uv run --no-project --isolated --python 3.14 \
+  --with-requirements home_automation/home_assistant/tests/requirements.txt \
+  python home_automation/home_assistant/tests/test_price_forecast.py -v
 ```
 
 Tests build and load the real bundle, use synthetic rates and mocked market

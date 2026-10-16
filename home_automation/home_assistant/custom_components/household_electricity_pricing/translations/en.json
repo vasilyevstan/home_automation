@@ -58,6 +58,13 @@
       "invalid_optimizer": "The optimizer policy is invalid or the selected Daikin target capability is unavailable."
     }
   },
+  "entity": {
+    "sensor": {
+      "price_forecast": {
+        "name": "Seven-day price forecast"
+      }
+    }
+  },
   "services": {
     "get_prices": {
       "name": "Get household price window",
@@ -70,6 +77,28 @@
         "period": {
           "name": "Local delivery day",
           "description": "Today or tomorrow in Europe/Tallinn."
+        }
+      }
+    },
+    "get_price_forecast": {
+      "name": "Get seven-day household price forecast",
+      "description": "Return published and predicted quarter-hour all-in import prices. Forecast quantiles are advisory, monthly fees are excluded, and missing canonical published prices remain unavailable.",
+      "fields": {
+        "config_entry": {
+          "name": "Configuration",
+          "description": "The household pricing configuration."
+        },
+        "view": {
+          "name": "View",
+          "description": "Current seven-day outlook or retained historical forecast issuances."
+        },
+        "history_days": {
+          "name": "Archive history (days)",
+          "description": "Archive view only: include delivery hours from the last 1 to 90 days."
+        },
+        "horizon_days": {
+          "name": "Provider horizon day",
+          "description": "Archive view only: select the D-1 through D-7 prediction horizon."
         }
       }
     },

@@ -228,7 +228,13 @@ class HomeAssistantBundleTests(unittest.TestCase):
         self.assertEqual(strings, json.loads((component / "translations/en.json").read_text()))
         self.assertEqual(
             set(strings["services"]),
-            {"get_prices", "quote_electricity_interval", "calculate_electricity_period", "estimate_electricity_scenario"},
+            {
+                "get_prices",
+                "get_price_forecast",
+                "quote_electricity_interval",
+                "calculate_electricity_period",
+                "estimate_electricity_scenario",
+            },
         )
         self.assertEqual(set(strings["config"]), {"step", "error", "abort"})
         self.assertEqual(set(strings["options"]), {"step", "error"})
@@ -269,6 +275,12 @@ class HomeAssistantBundleTests(unittest.TestCase):
                 self.assertIn(prefix + "price_api.py", names)
                 self.assertIn(prefix + "dhw_optimizer.py", names)
                 self.assertIn(prefix + "floor_heating_shadow.py", names)
+                self.assertIn(prefix + "price_forecast.py", names)
+                self.assertIn(
+                    prefix
+                    + "_vendor/home_automation/electricity_market/forecast.py",
+                    names,
+                )
                 self.assertIn(prefix + "select.py", names)
                 self.assertIn(prefix + "button.py", names)
                 self.assertNotIn(prefix + "llm.py", names)
