@@ -9,7 +9,7 @@ import probatio
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.selector import ConfigEntrySelector
+from homeassistant.helpers.selector import ConfigEntrySelector, EntitySelector
 
 from ._vendor.home_automation.electricity_pricing.engine import PricingError, load_profile
 from ._vendor.home_automation.household_consumption.client import ConsumptionError
@@ -20,7 +20,8 @@ from .const import (
     CONF_DHW_FLOOR_TARGET, CONF_DHW_INITIAL_HEAT_MINUTES, CONF_DHW_MAX_LEASE_HOURS,
     CONF_DHW_MORNING_READY, CONF_DHW_NORMAL_TARGET, CONF_DHW_PREHEAT_TARGET,
     CONF_DHW_PRICE_DELTA, CONF_DHW_PRICE_PERCENT, CONF_DHW_SOFT_TARGET,
-    CONF_ELERING_PATH, CONF_NORDPOOL_ENTRY, CONF_PROFILE_PATH, CONF_SOLAR_ENTRY,
+    CONF_ELERING_PATH, CONF_FLOOR_INDOOR_TEMPERATURE_ENTITIES,
+    CONF_NORDPOOL_ENTRY, CONF_PROFILE_PATH, CONF_SOLAR_ENTRY,
     DEFAULT_DHW_COAST_HOURS, DEFAULT_DHW_EVENING_READY, DEFAULT_DHW_FLOOR_TARGET,
     DEFAULT_DHW_INITIAL_HEAT_MINUTES, DEFAULT_DHW_MAX_LEASE_HOURS,
     DEFAULT_DHW_MORNING_READY, DEFAULT_DHW_NORMAL_TARGET, DEFAULT_DHW_PREHEAT_TARGET,
@@ -29,6 +30,7 @@ from .const import (
 )
 from .controls import number
 from .dhw_optimizer import DhwPolicy
+from .floor_heating_shadow import read_room_temperature_source
 
 
 DATA_SCHEMA = probatio.Schema({
@@ -115,6 +117,10 @@ OPTIONS_SCHEMA = probatio.Schema({
     probatio.Required(CONF_DHW_PRICE_PERCENT, default=DEFAULT_DHW_PRICE_PERCENT): probatio.Any(int, float),
     probatio.Required(CONF_DHW_INITIAL_HEAT_MINUTES, default=DEFAULT_DHW_INITIAL_HEAT_MINUTES): probatio.Any(int, float),
     probatio.Required(CONF_DHW_COAST_HOURS, default=DEFAULT_DHW_COAST_HOURS): probatio.Any(int, float),
+    probatio.Required(CONF_FLOOR_INDOOR_TEMPERATURE_ENTITIES): EntitySelector({
+        "domain": ["sensor", "climate"],
+        "multiple": True,
+    }),
 })
 
 
@@ -138,6 +144,17 @@ class HouseholdPriceOptionsFlow(OptionsFlow):
             ("Preheat target", policy.preheat_target),
         ):
             number(value, label, profile["minValue"], profile["maxValue"], profile["stepValue"])
+        room_entities = user_input.get(CONF_FLOOR_INDOOR_TEMPERATURE_ENTITIES)
+        if not isinstance(room_entities, list) or not room_entities:
+            raise PricingError(
+                "Select at least one occupied-room temperature entity for floor Shadow."
+            )
+        for entity_id in room_entities:
+            value, _, reason = read_room_temperature_source(
+                self.hass, entity_id, maximum_age=None
+            )
+            if value is None:
+                raise PricingError(reason or f"{entity_id} is not a usable temperature.")
 
     async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
         errors = {}

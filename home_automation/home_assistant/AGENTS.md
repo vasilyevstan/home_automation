@@ -60,6 +60,10 @@
   stay inside the observed -2°C/0°C schedule and +1°C remains a separately
   reported aggressive candidate. Require complete all-in price coverage, the
   comfort guard, useful heating conditions and DHW compressor priority.
+- Use only explicitly configured, fresh occupied-room temperature entities for
+  floor comfort decisions. Require every configured source and use the coldest
+  room. The Daikin `IndoorTemperature` reading is from an unheated garage and
+  is diagnostic only; never fall back to it when a room source is missing.
 - Do not infer household surplus from inverter generation, infer appliance kWh
   from aggregate import, or claim floor-heating savings without whole-unit
   energy. Fresh signed net-grid power is required before any solar dispatch.

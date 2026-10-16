@@ -150,35 +150,163 @@ class FloorHeatingShadowTests(base.HAComponentTests):
         self.assertEqual(external.proposed_offset, -5)
         self.assertIn("Shadow envelope", external.reason)
 
-    async def test_runtime_and_sensor_are_strictly_zero_write(self):
-        await self.refresh()
-        flags = {
-            name: False
-            for name in importlib.import_module(base.COMPONENT + ".controls").FLAGS
-        }
-        status = {
+    def test_room_temperature_source_converts_fahrenheit(self):
+        self.hass.states.async_set(
+            "sensor.office_temperature",
+            "68",
+            {"unit_of_measurement": "°F"},
+        )
+        value, updated, reason = self.module.read_room_temperature_source(
+            self.hass,
+            "sensor.office_temperature",
+            maximum_age=None,
+        )
+        self.assertAlmostEqual(value, 20)
+        self.assertIsNotNone(updated)
+        self.assertIsNone(reason)
+
+    def test_room_temperature_source_rejects_stale_measurement(self):
+        self.hass.states.async_set(
+            "sensor.office_temperature",
+            "21",
+            {"unit_of_measurement": "°C"},
+        )
+        state = self.hass.states.get("sensor.office_temperature")
+        self.assertIsNotNone(state)
+        value, updated, reason = self.module.read_room_temperature_source(
+            self.hass,
+            "sensor.office_temperature",
+            now=state.last_updated + timedelta(minutes=31),
+        )
+        self.assertIsNone(value)
+        self.assertEqual(updated, state.last_reported)
+        self.assertIn("stale", reason)
+
+    def _runtime_status(self):
+        return {
             "heating": {
-                "states": flags,
+                "states": {
+                    name: False
+                    for name in importlib.import_module(
+                        base.COMPONENT + ".controls"
+                    ).FLAGS
+                },
                 "operations": {
                     "OperationMode": "heating",
                     "Power": "on",
                     "LeavingWaterTemperatureOffsetHeating": 0,
                 },
                 "sensors": {
-                    "IndoorTemperature": 20.5,
+                    "IndoorTemperature": 12,
                     "OutdoorTemperature": 8,
                     "LeavingWaterTemperatureCurrent": 31,
                 },
             },
             "control_mode": "LWT control",
         }
+
+    def _runtime_entry(self, room_entities):
+        return SimpleNamespace(
+            entry_id=self.pricing_entry.entry_id,
+            options={"floor_indoor_temperature_entities": room_entities},
+        )
+
+    async def test_runtime_uses_coldest_room_and_exposes_numeric_sensor(self):
+        await self.refresh()
+        self.hass.states.async_set(
+            "climate.living_room",
+            "heat",
+            {"current_temperature": 22.4, "temperature_unit": "°C"},
+        )
+        self.hass.states.async_set(
+            "sensor.bedroom_temperature",
+            "21.7",
+            {"unit_of_measurement": "°C"},
+        )
         devices = SimpleNamespace(
-            get_daikin_status=AsyncMock(return_value=status),
+            get_daikin_status=AsyncMock(return_value=self._runtime_status()),
             control_daikin=AsyncMock(),
         )
+        entry = self._runtime_entry(
+            ["climate.living_room", "sensor.bedroom_temperature"]
+        )
+        shadow = self.module.FloorHeatingShadow(
+            self.hass, entry, self.coordinator, devices, None
+        )
+        await shadow.async_start()
+        try:
+            self.assertEqual(shadow.decision.indoor_temperature, 21.7)
+            self.assertEqual(
+                shadow.attributes["indoor_temperature_values_c"],
+                {
+                    "climate.living_room": 22.4,
+                    "sensor.bedroom_temperature": 21.7,
+                },
+            )
+            self.assertEqual(
+                shadow.attributes["daikin_indoor_temperature_c"], 12
+            )
+            self.assertEqual(
+                shadow.attributes["daikin_indoor_temperature_role"],
+                "garage_diagnostic_only",
+            )
+            room_sensor = self.sensor_module.FloorRoomTemperatureSensor(
+                shadow, entry.entry_id
+            )
+            self.assertTrue(room_sensor.available)
+            self.assertEqual(room_sensor.native_value, 21.7)
+            self.assertEqual(
+                room_sensor.extra_state_attributes["daikin_garage_temperature_c"],
+                12,
+            )
+            devices.control_daikin.assert_not_awaited()
+        finally:
+            await shadow.async_stop()
+
+    async def test_missing_room_source_is_unavailable_without_garage_fallback(self):
+        await self.refresh()
+        self.hass.states.async_set(
+            "climate.living_room",
+            "heat",
+            {"current_temperature": 22.4, "temperature_unit": "°C"},
+        )
+        devices = SimpleNamespace(
+            get_daikin_status=AsyncMock(return_value=self._runtime_status()),
+            control_daikin=AsyncMock(),
+        )
+        entry = self._runtime_entry(
+            ["climate.living_room", "sensor.missing_temperature"]
+        )
+        shadow = self.module.FloorHeatingShadow(
+            self.hass, entry, self.coordinator, devices, None
+        )
+        await shadow.async_start()
+        try:
+            self.assertEqual(shadow.decision.state, "unavailable")
+            self.assertIsNone(shadow.decision.indoor_temperature)
+            self.assertIn("missing", shadow.decision.reason)
+            self.assertEqual(
+                shadow.attributes["daikin_indoor_temperature_c"], 12
+            )
+            devices.control_daikin.assert_not_awaited()
+        finally:
+            await shadow.async_stop()
+
+    async def test_runtime_and_sensor_are_strictly_zero_write(self):
+        await self.refresh()
+        self.hass.states.async_set(
+            "sensor.room_temperature",
+            "20.5",
+            {"unit_of_measurement": "°C"},
+        )
+        devices = SimpleNamespace(
+            get_daikin_status=AsyncMock(return_value=self._runtime_status()),
+            control_daikin=AsyncMock(),
+        )
+        entry = self._runtime_entry(["sensor.room_temperature"])
         shadow = self.module.FloorHeatingShadow(
             self.hass,
-            self.pricing_entry,
+            entry,
             self.coordinator,
             devices,
             None,
@@ -191,7 +319,7 @@ class FloorHeatingShadowTests(base.HAComponentTests):
             self.assertEqual(shadow.attributes["native_minimum_offset_c"], -10)
             self.assertEqual(shadow.attributes["native_maximum_offset_c"], 10)
             sensor = self.sensor_module.FloorHeatingShadowSensor(
-                shadow, self.pricing_entry.entry_id
+                shadow, entry.entry_id
             )
             self.assertEqual(sensor.native_value, shadow.decision.state)
             self.assertEqual(

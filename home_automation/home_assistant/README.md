@@ -415,10 +415,20 @@ is unavailable, so reported price opportunity is not measured kWh or savings.
 ## Floor-heating Shadow
 
 Selecting a Daikin entry also creates a separate floor-heating Shadow sensor.
-It is permanently zero-write in this version: it never calls the guarded Daikin
+Configure one or more occupied-room `sensor` or `climate` temperature entities
+in the integration options. Every configured source must be available and no
+more than 30 minutes old; the evaluator uses the coldest room as its
+conservative comfort input. The Daikin `IndoorTemperature` value comes from an
+unheated garage in this installation and is exposed only as diagnostic context.
+There is no fallback from a missing room source to that garage reading.
+
+The separate `Floor heating room temperature` sensor publishes the resulting
+coldest fresh occupied-room value and its source details. Floor Shadow remains
+permanently zero-write in this version: it never calls the guarded Daikin
 writer, never changes the native schedule and never shares DHW qualification
-counters. It reads the same fresh Daikin observation and canonical published
-all-in prices, then records counterfactual LWT-offset decisions.
+counters. It combines the configured comfort observation with fresh Daikin
+outdoor/leaving-water data and canonical published all-in prices, then records
+counterfactual LWT-offset decisions.
 
 The verified Daikin surface supports a native **-10°C to +10°C** weather-curve
 offset. That capability is not a safe optimization envelope by itself. The
