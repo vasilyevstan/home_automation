@@ -591,6 +591,8 @@ class DhwOptimizerTests(base.HAComponentTests):
             )
             runtime = self.hass.data[base.DOMAIN]["pricing"]
             self.assertEqual(runtime["optimizer"].mode, self.const.DHW_MODE_SHADOW)
+            self.assertIsNotNone(runtime["floor_shadow"])
+            self.assertFalse(runtime["floor_shadow"].attributes["write_allowed"])
             self.devices.control_daikin.assert_not_awaited()
             self.assertTrue(
                 await integration.async_unload_entry(self.hass, self.pricing_entry)

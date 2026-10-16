@@ -30,6 +30,7 @@ COMPONENT_FILES = (
     "coordinator.py",
     "controls.py",
     "dhw_optimizer.py",
+    "floor_heating_shadow.py",
     "sensor.py",
     "select.py",
     "button.py",

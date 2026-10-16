@@ -54,6 +54,15 @@
   circuit standby, weather-dependent control, and configured/effective target
   mismatch suspend optimizer ownership. An uncertain write latches fault and
   needs an explicit fresh-read resume; do not replay or invert it.
+- Keep the floor-heating evaluator separate from DHW counters and strictly
+  zero-write until an explicit later pilot. The native LWT offset range is
+  -10°C to +10°C, but capability is not permission: primary Shadow candidates
+  stay inside the observed -2°C/0°C schedule and +1°C remains a separately
+  reported aggressive candidate. Require complete all-in price coverage, the
+  comfort guard, useful heating conditions and DHW compressor priority.
+- Do not infer household surplus from inverter generation, infer appliance kWh
+  from aggregate import, or claim floor-heating savings without whole-unit
+  energy. Fresh signed net-grid power is required before any solar dispatch.
 - Huawei control/read transactions must hold the device's `update_lock`, shared
   with its native polling coordinator, not only the API's own per-device lock.
 - HA must be the sole Huawei Modbus client during handover. Keep the old local
@@ -63,6 +72,7 @@
   checks and obtain fresh read-back. Never toggle a device or perform a
   same-value write as an installation/connectivity check.
 - Run the root `test_home_assistant_pricing.py` suite and the isolated real-HA
-  test commands in the README, including `test_dhw_optimizer.py`. Do not install
-  HA dependencies into the shared MCP environment. Use synthetic data; keep
-  live captures and private profiles out of commits and public logs.
+  test commands in the README, including `test_dhw_optimizer.py` and
+  `test_floor_heating_shadow.py`. Do not install HA dependencies into the shared
+  MCP environment. Use synthetic data; keep live captures and private profiles
+  out of commits and public logs.
