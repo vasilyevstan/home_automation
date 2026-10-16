@@ -13,6 +13,37 @@ get_prices:
             - today
             - tomorrow
 
+get_price_forecast:
+  fields:
+    config_entry:
+      required: true
+      selector:
+        config_entry:
+          integration: household_electricity_pricing
+    view:
+      default: current
+      selector:
+        select:
+          options:
+            - current
+            - archive
+    history_days:
+      default: 7
+      selector:
+        number:
+          min: 1
+          max: 90
+          step: 1
+          mode: box
+    horizon_days:
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 7
+          step: 1
+          mode: box
+
 quote_electricity_interval:
   fields:
     config_entry:

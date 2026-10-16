@@ -6,17 +6,25 @@ import probatio
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv, llm as ha_llm, service
 from homeassistant.helpers.event import async_track_utc_time_change
 from homeassistant.helpers.selector import ConfigEntrySelector
 from homeassistant.helpers.typing import ConfigType
 
-from .const import CONF_DAIKIN_ENTRY, CONF_SOLAR_ENTRY, DOMAIN, SERVICE_GET_PRICES
+from .const import (
+    CONF_DAIKIN_ENTRY,
+    CONF_SOLAR_ENTRY,
+    DOMAIN,
+    SERVICE_GET_PRICE_FORECAST,
+    SERVICE_GET_PRICES,
+)
 from .calculation_api import CALCULATION_FIELDS
 from .controls import EnergyDevices, HomeEnergyDeviceAPI
 from .coordinator import HouseholdPriceCoordinator
 from .dhw_optimizer import DhwOptimizer
 from .floor_heating_shadow import FloorHeatingShadow
+from .price_forecast import HouseholdPriceForecastCoordinator
 from .price_api import HouseholdPriceAPI
 
 
@@ -25,6 +33,16 @@ PLATFORMS = ["sensor", "select", "button"]
 GET_PRICES_SCHEMA = probatio.Schema({
     probatio.Required("config_entry"): ConfigEntrySelector({"integration": DOMAIN}),
     probatio.Optional("period", default="today"): probatio.In(("today", "tomorrow")),
+})
+GET_PRICE_FORECAST_SCHEMA = probatio.Schema({
+    probatio.Required("config_entry"): ConfigEntrySelector({"integration": DOMAIN}),
+    probatio.Optional("view", default="current"): probatio.In(("current", "archive")),
+    probatio.Optional("history_days", default=7): probatio.All(
+        int, probatio.Range(min=1, max=90)
+    ),
+    probatio.Optional("horizon_days", default=1): probatio.All(
+        int, probatio.Range(min=1, max=7)
+    ),
 })
 
 
@@ -37,6 +55,30 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     hass.services.async_register(
         DOMAIN, SERVICE_GET_PRICES, get_prices,
         schema=GET_PRICES_SCHEMA, supports_response=SupportsResponse.ONLY,
+    )
+
+    async def get_price_forecast(call: ServiceCall) -> dict:
+        entry = service.async_get_config_entry(
+            hass, DOMAIN, call.data["config_entry"]
+        )
+        runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        forecast = runtime.get("forecast")
+        if forecast is None:
+            raise ServiceValidationError(
+                "The household price forecast runtime is unavailable."
+            )
+        return await forecast.async_response(
+            call.data["view"],
+            call.data["history_days"],
+            call.data["horizon_days"],
+        )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_GET_PRICE_FORECAST,
+        get_price_forecast,
+        schema=GET_PRICE_FORECAST_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
     )
     for action, fields in CALCULATION_FIELDS.items():
         async def calculate(call: ServiceCall) -> dict:
@@ -60,6 +102,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = HouseholdPriceCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
+    forecast = HouseholdPriceForecastCoordinator(hass, entry, coordinator)
+    await forecast.async_load()
     devices = EnergyDevices(hass, entry.data)
     optimizer = (
         DhwOptimizer(hass, entry, coordinator, devices)
@@ -71,6 +115,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     runtime = {
         "coordinator": coordinator,
+        "forecast": forecast,
         "devices": devices,
         "optimizer": optimizer,
         "floor_shadow": floor_shadow,
@@ -100,6 +145,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+    forecast = runtime.get("forecast")
+    if forecast:
+        await forecast.async_shutdown()
     floor_shadow = runtime.get("floor_shadow")
     if floor_shadow:
         await floor_shadow.async_stop()
