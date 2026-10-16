@@ -268,6 +268,7 @@ class HomeAssistantBundleTests(unittest.TestCase):
                 self.assertIn(prefix + "LICENSE", names)
                 self.assertIn(prefix + "price_api.py", names)
                 self.assertIn(prefix + "dhw_optimizer.py", names)
+                self.assertIn(prefix + "floor_heating_shadow.py", names)
                 self.assertIn(prefix + "select.py", names)
                 self.assertIn(prefix + "button.py", names)
                 self.assertNotIn(prefix + "llm.py", names)

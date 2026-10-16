@@ -343,7 +343,7 @@ def published_intervals(coordinator: HouseholdPriceCoordinator) -> tuple[PriceIn
     return tuple(sorted(result, key=lambda item: item.start))
 
 
-def _quarter_start(now: datetime) -> datetime:
+def quarter_start(now: datetime) -> datetime:
     stamp = int(now.astimezone(UTC).timestamp())
     seconds = int(MARKET_INTERVAL.total_seconds())
     return datetime.fromtimestamp(stamp // seconds * seconds, UTC)
@@ -373,7 +373,7 @@ def select_price_window(
     bool,
 ]:
     prices = _price_map(intervals)
-    current = _quarter_start(now)
+    current = quarter_start(now)
     deadline_utc = deadline.astimezone(UTC)
     cursor = current
     while cursor < deadline_utc:
@@ -430,10 +430,11 @@ def select_price_window(
     return selected, comparison, current_price, True
 
 
-def _price_gate(
+def price_gate(
     current: Decimal | None,
     selected: PriceWindowChoice | None,
-    policy: DhwPolicy,
+    absolute_delta: Decimal,
+    relative_delta: Decimal,
 ) -> tuple[bool, Decimal | None, Decimal | None]:
     if current is None or selected is None:
         return False, None, None
@@ -441,7 +442,7 @@ def _price_gate(
     base = max(abs(selected.average), Decimal("0.05"))
     relative = delta / base
     return (
-        delta >= policy.price_delta and relative >= policy.price_percent,
+        delta >= absolute_delta and relative >= relative_delta,
         delta,
         relative,
     )
@@ -475,11 +476,17 @@ def plan_dhw(
         planned_window,
         comparison_window,
     )
-    gate, delta, relative = _price_gate(current_price, selected, policy)
-    preheat_gate, preheat_delta, preheat_relative = _price_gate(
+    gate, delta, relative = price_gate(
+        current_price,
+        selected,
+        policy.price_delta,
+        policy.price_percent,
+    )
+    preheat_gate, preheat_delta, preheat_relative = price_gate(
         comparison.average if comparison is not None else None,
         selected,
-        policy,
+        policy.price_delta,
+        policy.price_percent,
     )
     allow_write = mode in (DHW_MODE_SAFE, DHW_MODE_SOFT)
 

@@ -412,6 +412,41 @@ explicit resume and return-to-normal buttons. Return-to-normal pauses scheduling
 before requesting an ownership-aware 50°C restore. Whole-unit electrical energy
 is unavailable, so reported price opportunity is not measured kWh or savings.
 
+## Floor-heating Shadow
+
+Selecting a Daikin entry also creates a separate floor-heating Shadow sensor.
+It is permanently zero-write in this version: it never calls the guarded Daikin
+writer, never changes the native schedule and never shares DHW qualification
+counters. It reads the same fresh Daikin observation and canonical published
+all-in prices, then records counterfactual LWT-offset decisions.
+
+The verified Daikin surface supports a native **-10°C to +10°C** weather-curve
+offset. That capability is not a safe optimization envelope by itself. The
+first Shadow keeps its primary candidates inside the already observed native
+schedule:
+
+| Candidate | Initial meaning |
+| --- | --- |
+| -2°C | Coast during the paired expensive block when the room is above the comfort guard |
+| 0°C | Move the existing neutral period into the paired cheap block |
+| +1°C | Separately reported aggressive preheat candidate, only with room-temperature headroom and useful heating conditions |
+
+The evaluator requires a complete rolling 24-hour all-in price horizon. It
+pairs a two-hour cheap block with a later two-hour expensive block no more than
+eight hours away, and requires the same €0.05/kWh and 20% materiality gates as
+the DHW policy. It yields to safety/override states, non-LWT control, circuit
+standby, missing temperatures and offsets outside the initial Shadow envelope.
+At or below the 20°C indoor guard it proposes 0°C rather than a price-driven
+setback. At or above 21°C it suppresses the separate +1°C candidate.
+
+DHW comfort, readiness and preheat states have compressor priority. A
+conflicting floor preheat candidate is recorded as deferred rather than assumed
+to run concurrently. Fresh directional net-grid power and whole-heat-pump
+electrical energy are unavailable, so solar dispatch is disabled and the
+sensor reports price opportunity rather than measured kWh or euro savings.
+Promotion remains ineligible until at least 14 observed days, five complete
+candidate cycles, thermal-lag review and explicit room-comfort bounds exist.
+
 ## Validation
 
 The source adapter and bundle tests run in the existing project environment:
@@ -436,6 +471,10 @@ uv run --no-project --isolated --python 3.14 \
 uv run --no-project --isolated --python 3.14 \
   --with-requirements home_automation/home_assistant/tests/requirements.txt \
   python home_automation/home_assistant/tests/test_dhw_optimizer.py -v
+
+uv run --no-project --isolated --python 3.14 \
+  --with-requirements home_automation/home_assistant/tests/requirements.txt \
+  python home_automation/home_assistant/tests/test_floor_heating_shadow.py -v
 ```
 
 Tests build and load the real bundle, use synthetic rates and mocked market
