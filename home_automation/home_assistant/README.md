@@ -653,11 +653,14 @@ Four one-time commissioning buttons are exposed only in healthy Shadow state:
   cooling state only when the saved target has at least 1°C of no-cooling
   headroom. The writer prepares the exact target, fan and swing settings while
   the unit remains off, explicitly activates the saved HVAC mode, then runs the
-  exact off/restore path and returns it to its original off state.
+  exact off/restore path and returns it to its original off state. A bounded
+  10-second stabilization dwell separates each commissioning power transition
+  so the Sensibo cloud path is not driven by back-to-back on/off requests.
 
 Every commissioning write is journaled. An uncertain outcome faults without
-retry or rollback, just like a production breaker command. Passing every gate
-only exposes `Armed`; it never selects the mode automatically.
+retry or rollback, just like a production breaker command. The private journal
+also records the underlying service/read-back error for review. Passing every
+gate only exposes `Armed`; it never selects the mode automatically.
 
 ## Validation
 

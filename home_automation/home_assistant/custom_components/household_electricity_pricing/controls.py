@@ -310,12 +310,20 @@ class EnergyDevices:
                 )
                 raise
             except (HomeAssistantError, TimeoutError, OSError) as error:
-                LOGGER.error(
+                LOGGER.exception(
                     "Climate commissioning outcome is uncertain; read fresh "
                     "state before any retry or restoration."
                 )
                 try:
-                    await self.record("uncertain", record)
+                    await self.record(
+                        "uncertain",
+                        {
+                            **record,
+                            "error": (
+                                type(error).__name__ + ": " + str(error)
+                            ),
+                        },
+                    )
                 except OSError:
                     LOGGER.exception(
                         "Could not persist the uncertain climate outcome."
@@ -323,7 +331,8 @@ class EnergyDevices:
                 raise HomeAssistantError(
                     "The climate commissioning command may have applied. Read "
                     "fresh state before any retry or restoration; no automatic "
-                    "retry or rollback was performed."
+                    "retry or rollback was performed. Cause: "
+                    + str(error)
                 ) from error
 
     @staticmethod
@@ -509,19 +518,29 @@ class EnergyDevices:
                 )
                 raise
             except (HomeAssistantError, TimeoutError, OSError) as error:
-                LOGGER.error(
+                LOGGER.exception(
                     "Climate command outcome is uncertain; read fresh state before "
                     "any retry or restoration."
                 )
                 try:
-                    await self.record("uncertain", record)
+                    await self.record(
+                        "uncertain",
+                        {
+                            **record,
+                            "error": (
+                                type(error).__name__ + ": " + str(error)
+                            ),
+                        },
+                    )
                 except OSError:
                     LOGGER.exception(
                         "Could not persist the uncertain climate outcome."
                     )
                 raise HomeAssistantError(
                     "The climate command may have applied. Read fresh state before "
-                    "any retry or restoration; no automatic retry or rollback was performed."
+                    "any retry or restoration; no automatic retry or rollback "
+                    "was performed. Cause: "
+                    + str(error)
                 ) from error
 
     def solar_device(self):

@@ -522,6 +522,10 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
             [call.args[0] for call in self.devices.record.await_args_list],
             ["prepared", "uncertain"],
         )
+        self.assertIn(
+            "Synthetic missing acknowledgement",
+            self.devices.record.await_args_list[-1].args[1]["error"],
+        )
 
     async def test_control_api_is_separate_and_empty_without_explicit_bindings(self):
         api = self.controls.HomeEnergyDeviceAPI(self.hass, {})
