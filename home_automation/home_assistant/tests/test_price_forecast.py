@@ -169,6 +169,10 @@ class PriceForecastTests(base.HAComponentTests):
         self.assertEqual(
             second.response["archive"]["record_count"], 7 * 24
         )
+        future = await coordinator.async_response("archive", 8, 1, 1)
+        self.assertEqual(future["include_future_days"], 1)
+        self.assertEqual(future["stored_hours"], 24)
+        self.assertEqual(len(future["intervals"]), 24 * 4)
         self.now = datetime.fromisoformat(first.response["window_end"]) + timedelta(
             hours=1
         )
@@ -420,6 +424,20 @@ class PriceForecastTests(base.HAComponentTests):
             return_response=True,
         )
         self.assertEqual(current["expected_intervals"], 7 * 24 * 4)
+        future_archive = await self.hass.services.async_call(
+            base.DOMAIN,
+            "get_price_forecast",
+            {
+                "config_entry": "pricing",
+                "view": "archive",
+                "history_days": 8,
+                "horizon_days": 1,
+                "include_future_days": 1,
+            },
+            blocking=True,
+            return_response=True,
+        )
+        self.assertEqual(future_archive["stored_hours"], 24)
         self.now = datetime.fromisoformat(current["window_end"]) + timedelta(
             hours=1
         )

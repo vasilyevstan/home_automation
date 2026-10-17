@@ -36,6 +36,11 @@
 - Retain only the latest provider issuance per delivery hour and D-1 through
   D-7 horizon for 90 days. Keep raw hourly quantiles in storage and recompute
   quarter-hour all-in values with the tariff effective at delivery time.
+- Keep future archived delivery hours hidden by default. The explicit bounded
+  `include_future_days` archive option may expose them for publication
+  comparison, but charts must join exact quarter-hour timestamps and render
+  only pairs with a canonical published household price. Partial or missing
+  publication is unavailable, never zero.
 - Forecasts, p10-p90 bands and provider accuracy are advisory evidence. They
   cannot authorize heating writes, finalize bills, prove savings, or be exposed
   through an unauthenticated application endpoint. Keep the detailed payload in
