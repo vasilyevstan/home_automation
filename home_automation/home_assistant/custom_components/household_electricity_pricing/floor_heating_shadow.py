@@ -605,6 +605,9 @@ class FloorHeatingShadow:
             "planned_peak_average": None,
             "planned_peak_intervals": None,
             "confirmed_writes": 0,
+            "qualified_opportunity_count": 0,
+            "last_qualified_opportunity_plan_id": None,
+            "last_qualified_opportunity_at": None,
         }
 
     async def async_start(self) -> None:
@@ -881,8 +884,43 @@ class FloorHeatingShadow:
         ):
             self.state["candidate_cycle_contaminated"] = True
 
+    def _opportunity_plan_id(
+        self, decision: FloorHeatingDecision
+    ) -> str | None:
+        if decision.plan is None:
+            return None
+        return "|".join((
+            decision.plan.cheap_window.start.isoformat(),
+            decision.plan.cheap_window.end.isoformat(),
+            decision.plan.peak_window.start.isoformat(),
+            decision.plan.peak_window.end.isoformat(),
+        ))
+
+    def _record_optimization_opportunity(
+        self, now: datetime, decision: FloorHeatingDecision
+    ) -> None:
+        plan_id = self._opportunity_plan_id(decision)
+        if (
+            plan_id is None
+            or not decision.price_gate
+            or decision.price_delta is None
+            or decision.price_delta <= 0
+        ):
+            return
+        if plan_id == self.state.get("last_qualified_opportunity_plan_id"):
+            return
+        count = self.state.get("qualified_opportunity_count")
+        self.state["qualified_opportunity_count"] = (
+            count + 1
+            if isinstance(count, int) and not isinstance(count, bool)
+            else 1
+        )
+        self.state["last_qualified_opportunity_plan_id"] = plan_id
+        self.state["last_qualified_opportunity_at"] = now.isoformat()
+
     def _record(self, now: datetime, decision: FloorHeatingDecision) -> None:
         self._update_candidate_evidence(now, decision)
+        self._record_optimization_opportunity(now, decision)
         previous = self.decision
         if (
             previous is not None
@@ -975,6 +1013,90 @@ class FloorHeatingShadow:
                 )
             await self._save()
             self._notify_listeners()
+
+    @property
+    def optimization_value(self) -> Decimal | None:
+        decision = self.decision
+        if decision is None or decision.plan is None:
+            return None
+        return decision.price_delta
+
+    @property
+    def optimization_value_attributes(self) -> dict:
+        decision = self.decision
+        plan_id = self._opportunity_plan_id(decision) if decision else None
+        if decision is None or decision.plan is None:
+            return {
+                "metric": "price_opportunity_per_shifted_kwh",
+                "controller": "floor_heating",
+                "valuation_status": "unavailable",
+                "plan_id": None,
+                "measured_shifted_energy_kwh": None,
+                "estimated_savings_eur": None,
+                "realized_savings_eur": None,
+                "savings_unavailable_reason": (
+                    "No paired floor-heating price plan is currently available."
+                ),
+            }
+        if self.state["candidate_cycle_peak_end"] is not None:
+            plan_status = (
+                "candidate_contaminated"
+                if self.state["candidate_cycle_contaminated"]
+                else "candidate_in_progress"
+            )
+        else:
+            plan_status = decision.state
+        return {
+            "metric": "price_opportunity_per_shifted_kwh",
+            "controller": "floor_heating",
+            "valuation_status": "counterfactual",
+            "operating_mode": FLOOR_SHADOW_MODE,
+            "shadow_zero_writes": True,
+            "plan_id": plan_id,
+            "plan_status": plan_status,
+            "opportunity_qualified": decision.price_gate,
+            "opportunity_eur_per_kwh": (
+                format(decision.price_delta, "f")
+                if decision.price_delta is not None else None
+            ),
+            "opportunity_percent": (
+                format(decision.price_delta_percent * Decimal(100), "f")
+                if decision.price_delta_percent is not None else None
+            ),
+            "cheap_window_start": decision.plan.cheap_window.start.isoformat(),
+            "cheap_window_end": decision.plan.cheap_window.end.isoformat(),
+            "cheap_window_average_eur_kwh": format(
+                decision.plan.cheap_window.average, "f"
+            ),
+            "peak_window_start": decision.plan.peak_window.start.isoformat(),
+            "peak_window_end": decision.plan.peak_window.end.isoformat(),
+            "peak_window_average_eur_kwh": format(
+                decision.plan.peak_window.average, "f"
+            ),
+            "qualified_opportunities_recorded": self.state[
+                "qualified_opportunity_count"
+            ],
+            "last_qualified_opportunity_at": self.state[
+                "last_qualified_opportunity_at"
+            ],
+            "thermal_response_evidence_eligible": self.room_temperature_details[
+                "thermal_response_evidence_eligible"
+            ],
+            "candidate_cycle_in_progress": (
+                self.state["candidate_cycle_peak_end"] is not None
+            ),
+            "candidate_cycle_contaminated": self.state[
+                "candidate_cycle_contaminated"
+            ],
+            "confirmed_writes": self.state["confirmed_writes"],
+            "measured_shifted_energy_kwh": None,
+            "estimated_savings_eur": None,
+            "realized_savings_eur": None,
+            "savings_unavailable_reason": (
+                "Whole-heat-pump electrical energy attributable to this paired "
+                "cycle is not measured."
+            ),
+        }
 
     @property
     def attributes(self) -> dict:

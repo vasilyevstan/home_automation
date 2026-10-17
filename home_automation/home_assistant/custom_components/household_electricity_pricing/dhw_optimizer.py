@@ -716,6 +716,9 @@ class DhwOptimizer:
             "confirmed_writes": 0,
             "pilot_started_at": None,
             "deadline_checks": {},
+            "qualified_opportunity_count": 0,
+            "last_qualified_opportunity_plan_id": None,
+            "last_qualified_opportunity_at": None,
         }
 
     def _reset_policy_evidence(self) -> None:
@@ -745,6 +748,9 @@ class DhwOptimizer:
             "confirmed_writes": 0,
             "pilot_started_at": None,
             "deadline_checks": {},
+            "qualified_opportunity_count": 0,
+            "last_qualified_opportunity_plan_id": None,
+            "last_qualified_opportunity_at": None,
         })
 
     async def async_start(self) -> None:
@@ -1084,6 +1090,43 @@ class DhwOptimizer:
         )[-DECISION_HISTORY_LIMIT:]
         self.hass.bus.async_fire(EVENT_DHW_DECISION, record)
 
+    def _opportunity_plan_id(self, decision: DhwDecision) -> str | None:
+        if (
+            decision.deadline is None
+            or decision.selected_window is None
+            or decision.comparison_window is None
+        ):
+            return None
+        return "|".join((
+            decision.deadline.isoformat(),
+            decision.selected_window.start.isoformat(),
+            decision.selected_window.end.isoformat(),
+            decision.comparison_window.start.isoformat(),
+            decision.comparison_window.end.isoformat(),
+        ))
+
+    def _record_optimization_opportunity(
+        self, now: datetime, decision: DhwDecision
+    ) -> None:
+        plan_id = self._opportunity_plan_id(decision)
+        if (
+            plan_id is None
+            or not decision.preheat_price_gate
+            or decision.preheat_price_delta is None
+            or decision.preheat_price_delta <= 0
+        ):
+            return
+        if plan_id == self.state.get("last_qualified_opportunity_plan_id"):
+            return
+        count = self.state.get("qualified_opportunity_count")
+        self.state["qualified_opportunity_count"] = (
+            count + 1
+            if isinstance(count, int) and not isinstance(count, bool)
+            else 1
+        )
+        self.state["last_qualified_opportunity_plan_id"] = plan_id
+        self.state["last_qualified_opportunity_at"] = now.isoformat()
+
     async def async_evaluate(self, now: datetime | None = None) -> None:
         async with self.lock:
             observed_at = (now or dt_util.utcnow()).astimezone(UTC)
@@ -1169,6 +1212,7 @@ class DhwOptimizer:
                 ):
                     self.state["last_policy_target"] = decision.desired_target
                     self.state["last_policy_transition_at"] = observed_at.isoformat()
+                self._record_optimization_opportunity(observed_at, decision)
                 self._record_decision(observed_at, decision)
                 self.decision = decision
                 await self._apply_decision(observed_at, observation, decision)
@@ -1331,6 +1375,102 @@ class DhwOptimizer:
         await self._save()
         if evaluate:
             await self.async_evaluate()
+
+    @property
+    def optimization_value(self) -> Decimal | None:
+        decision = self.decision
+        if (
+            decision is None
+            or decision.selected_window is None
+            or decision.comparison_window is None
+        ):
+            return None
+        return decision.preheat_price_delta
+
+    @property
+    def optimization_value_attributes(self) -> dict:
+        decision = self.decision
+        plan_id = self._opportunity_plan_id(decision) if decision else None
+        if (
+            decision is None
+            or decision.selected_window is None
+            or decision.comparison_window is None
+        ):
+            return {
+                "metric": "price_opportunity_per_shifted_kwh",
+                "controller": "domestic_hot_water",
+                "valuation_status": "unavailable",
+                "plan_id": None,
+                "measured_shifted_energy_kwh": None,
+                "estimated_savings_eur": None,
+                "realized_savings_eur": None,
+                "savings_unavailable_reason": (
+                    "No anchored DHW price plan is currently available."
+                ),
+            }
+        now = dt_util.utcnow().astimezone(UTC)
+        completed_at = self.state.get("planned_window_completed_at")
+        if completed_at is not None:
+            plan_status = "observed_target_reached"
+        elif now < decision.selected_window.start:
+            plan_status = "planned"
+        elif now < decision.selected_window.end:
+            plan_status = "active"
+        else:
+            plan_status = "window_elapsed"
+        return {
+            "metric": "price_opportunity_per_shifted_kwh",
+            "controller": "domestic_hot_water",
+            "valuation_status": (
+                "counterfactual"
+                if self.mode == DHW_MODE_SHADOW
+                else "live_action_unattributed"
+            ),
+            "operating_mode": self.mode,
+            "shadow_zero_writes": self.mode == DHW_MODE_SHADOW,
+            "plan_id": plan_id,
+            "plan_status": plan_status,
+            "opportunity_qualified": decision.preheat_price_gate,
+            "opportunity_eur_per_kwh": (
+                format(decision.preheat_price_delta, "f")
+                if decision.preheat_price_delta is not None else None
+            ),
+            "opportunity_percent": (
+                format(decision.preheat_price_delta_percent * Decimal(100), "f")
+                if decision.preheat_price_delta_percent is not None else None
+            ),
+            "cheap_window_start": decision.selected_window.start.isoformat(),
+            "cheap_window_end": decision.selected_window.end.isoformat(),
+            "cheap_window_average_eur_kwh": format(
+                decision.selected_window.average, "f"
+            ),
+            "comparison_window_start": (
+                decision.comparison_window.start.isoformat()
+            ),
+            "comparison_window_end": decision.comparison_window.end.isoformat(),
+            "comparison_window_average_eur_kwh": format(
+                decision.comparison_window.average, "f"
+            ),
+            "readiness_deadline": (
+                decision.deadline.isoformat() if decision.deadline else None
+            ),
+            "qualified_opportunities_recorded": self.state[
+                "qualified_opportunity_count"
+            ],
+            "last_qualified_opportunity_at": self.state[
+                "last_qualified_opportunity_at"
+            ],
+            "observed_target_reached": completed_at is not None,
+            "observed_target_reached_at": completed_at,
+            "confirmed_writes": self.state["confirmed_writes"],
+            "measured_shifted_energy_kwh": None,
+            "estimated_savings_eur": None,
+            "realized_savings_eur": None,
+            "savings_unavailable_reason": (
+                "Whole-Daikin electrical energy attributable to this plan is "
+                "not measured."
+            ),
+        }
 
     @property
     def attributes(self) -> dict:

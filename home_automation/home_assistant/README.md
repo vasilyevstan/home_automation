@@ -477,6 +477,16 @@ explicit resume and return-to-normal buttons. Return-to-normal pauses scheduling
 before requesting an ownership-aware 50°C restore. Whole-unit electrical energy
 is unavailable, so reported price opportunity is not measured kWh or savings.
 
+The dedicated `Hot water price opportunity` sensor is Recorder-safe and keeps
+the current anchored plan's highest-cost comparable-block average minus its
+selected cheap-block average in EUR per shifted kWh. Its compact attributes
+identify the plan, windows, qualification gate, observed target completion and
+cumulative qualified-plan count. Shadow values are counterfactual. In any later
+write-capable mode, confirmed commands still do not establish euro savings:
+`measured_shifted_energy_kwh`, `estimated_savings_eur` and
+`realized_savings_eur` remain unavailable until attributable whole-Daikin
+electrical energy exists.
+
 ## Floor-heating Shadow
 
 Selecting a Daikin entry also creates a separate floor-heating Shadow sensor.
@@ -535,6 +545,14 @@ electrical energy are unavailable, so solar dispatch is disabled and the
 sensor reports price opportunity rather than measured kWh or euro savings.
 Promotion remains ineligible until at least 14 observed days, five complete
 candidate cycles, thermal-lag review and explicit room-comfort bounds exist.
+
+The dedicated `Floor heating price opportunity` sensor records the paired peak
+average minus cheap-block average in EUR per shifted kWh. Its compact attributes
+identify the anchored pair, candidate status, contamination state and
+qualified-plan count, while Recorder supplies the historical series. It does
+not turn aggregate household import into heat-pump energy. Estimated or realized
+euros remain unavailable until electrical energy can be attributed to the
+paired floor-heating action.
 
 ## Validation
 
