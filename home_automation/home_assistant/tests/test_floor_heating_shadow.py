@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 import importlib
 from types import SimpleNamespace
@@ -33,6 +33,23 @@ class FloorHeatingShadowTests(base.HAComponentTests):
         for index in range(72, 80):
             if index < len(values):
                 values[index] = "0.40"
+        return tuple(
+            self.module.PriceInterval(
+                start + index * timedelta(minutes=15),
+                start + (index + 1) * timedelta(minutes=15),
+                Decimal(value),
+            )
+            for index, value in enumerate(values)
+        )
+
+    def delivery_day_intervals(self, delivery_day: date):
+        start, end = self.module.market_bounds(delivery_day)
+        count = int((end - start) / timedelta(minutes=15))
+        values = ["0.20"] * count
+        for index in range(40, 48):
+            values[index] = "0.10"
+        for index in range(64, 72):
+            values[index] = "0.40"
         return tuple(
             self.module.PriceInterval(
                 start + index * timedelta(minutes=15),
@@ -150,6 +167,112 @@ class FloorHeatingShadowTests(base.HAComponentTests):
         self.assertEqual(external.proposed_offset, -5)
         self.assertIn("Shadow envelope", external.reason)
 
+    def test_complete_current_delivery_day_does_not_require_partial_tomorrow(self):
+        start = datetime.fromisoformat("2026-10-17T00:00:00+00:00")
+        decision = self.module.plan_floor_heating(
+            now=start,
+            policy=self.policy,
+            observation=self.observation(),
+            intervals=self.intervals(start, hours=21),
+        )
+        self.assertTrue(decision.data_complete)
+        self.assertIsNotNone(decision.plan)
+        self.assertEqual(
+            decision.plan.cheap_window.start,
+            start + timedelta(hours=12),
+        )
+        self.assertEqual(
+            decision.plan.peak_window.start,
+            start + timedelta(hours=18),
+        )
+
+    def test_delivery_day_completeness_is_dst_aware(self):
+        for delivery_day, expected_quarters in (
+            (date(2026, 3, 29), 92),
+            (date(2026, 10, 25), 100),
+        ):
+            with self.subTest(delivery_day=delivery_day):
+                prices = self.delivery_day_intervals(delivery_day)
+                self.assertEqual(len(prices), expected_quarters)
+                decision = self.module.plan_floor_heating(
+                    now=prices[0].start,
+                    policy=self.policy,
+                    observation=self.observation(),
+                    intervals=prices,
+                )
+                self.assertTrue(decision.data_complete)
+                self.assertIsNotNone(decision.plan)
+                self.assertEqual(
+                    decision.plan.cheap_window.start.astimezone(
+                        self.module.TALLINN
+                    ).date(),
+                    delivery_day,
+                )
+                self.assertEqual(
+                    decision.plan.peak_window.start.astimezone(
+                        self.module.TALLINN
+                    ).date(),
+                    delivery_day,
+                )
+
+    def test_external_hvac_contaminates_in_progress_candidate_evidence(self):
+        start = datetime.fromisoformat("2026-10-17T00:00:00+00:00")
+        prices = self.intervals(start)
+        initial = self.module.plan_floor_heating(
+            now=start,
+            policy=self.policy,
+            observation=self.observation(),
+            intervals=prices,
+        )
+        preheat = self.module.plan_floor_heating(
+            now=initial.plan.cheap_window.start,
+            policy=self.policy,
+            observation=self.observation(actual_offset=-2),
+            intervals=prices,
+            planned=initial.plan,
+        )
+        shadow = self.module.FloorHeatingShadow(
+            self.hass,
+            self._runtime_entry(["climate.bedroom"]),
+            self.coordinator,
+            SimpleNamespace(),
+            None,
+        )
+        shadow.room_temperature_details[
+            "thermal_response_evidence_eligible"
+        ] = True
+        shadow._update_candidate_evidence(
+            initial.plan.cheap_window.start,
+            preheat,
+        )
+        self.assertEqual(shadow.state["candidate_cycles"], 0)
+        self.assertIsNotNone(shadow.state["candidate_cycle_peak_end"])
+
+        influenced = self.module.plan_floor_heating(
+            now=initial.plan.cheap_window.start + timedelta(minutes=15),
+            policy=self.policy,
+            observation=self.observation(
+                actual_offset=-2,
+                external_influence_reason="Synthetic room HVAC influence.",
+            ),
+            intervals=prices,
+            planned=initial.plan,
+        )
+        shadow.room_temperature_details[
+            "thermal_response_evidence_eligible"
+        ] = False
+        shadow._update_candidate_evidence(
+            initial.plan.cheap_window.start + timedelta(minutes=15),
+            influenced,
+        )
+        shadow._update_candidate_evidence(
+            initial.plan.peak_window.end,
+            influenced,
+        )
+        self.assertEqual(shadow.state["candidate_cycles"], 0)
+        self.assertEqual(shadow.state["contaminated_candidate_cycles"], 1)
+        self.assertIsNone(shadow.state["candidate_cycle_peak_end"])
+
     def test_room_temperature_source_converts_fahrenheit(self):
         self.hass.states.async_set(
             "sensor.office_temperature",
@@ -215,7 +338,7 @@ class FloorHeatingShadowTests(base.HAComponentTests):
         await self.refresh()
         self.hass.states.async_set(
             "climate.living_room",
-            "heat",
+            "off",
             {"current_temperature": 22.4, "temperature_unit": "°C"},
         )
         self.hass.states.async_set(
@@ -250,6 +373,9 @@ class FloorHeatingShadowTests(base.HAComponentTests):
                 shadow.attributes["daikin_indoor_temperature_role"],
                 "garage_diagnostic_only",
             )
+            self.assertTrue(
+                shadow.attributes["thermal_response_evidence_eligible"]
+            )
             room_sensor = self.sensor_module.FloorRoomTemperatureSensor(
                 shadow, entry.entry_id
             )
@@ -259,6 +385,41 @@ class FloorHeatingShadowTests(base.HAComponentTests):
                 room_sensor.extra_state_attributes["daikin_garage_temperature_c"],
                 12,
             )
+            devices.control_daikin.assert_not_awaited()
+        finally:
+            await shadow.async_stop()
+
+    async def test_active_room_hvac_yields_without_discarding_temperature(self):
+        await self.refresh()
+        self.hass.states.async_set(
+            "climate.bedroom",
+            "cool",
+            {"current_temperature": 22.8, "temperature_unit": "°C"},
+        )
+        devices = SimpleNamespace(
+            get_daikin_status=AsyncMock(return_value=self._runtime_status()),
+            control_daikin=AsyncMock(),
+        )
+        entry = self._runtime_entry(["climate.bedroom"])
+        shadow = self.module.FloorHeatingShadow(
+            self.hass, entry, self.coordinator, devices, None
+        )
+        await shadow.async_start()
+        try:
+            self.assertEqual(shadow.decision.indoor_temperature, 22.8)
+            self.assertEqual(shadow.decision.state, "yield")
+            self.assertIn("external room control", shadow.decision.reason)
+            self.assertEqual(
+                shadow.attributes["active_room_hvac_entities"],
+                ["climate.bedroom"],
+            )
+            self.assertTrue(
+                shadow.attributes["external_room_hvac_influence"]
+            )
+            self.assertFalse(
+                shadow.attributes["thermal_response_evidence_eligible"]
+            )
+            self.assertEqual(shadow.state["candidate_cycles"], 0)
             devices.control_daikin.assert_not_awaited()
         finally:
             await shadow.async_stop()

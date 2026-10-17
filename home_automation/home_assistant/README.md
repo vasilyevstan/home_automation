@@ -431,10 +431,14 @@ This is a price opportunity per kWh, not a measured saving, because whole-Daikin
 electrical energy is unavailable.
 
 Comfort or missed-deadline recovery is latched until the measured tank reaches
-50°C. Ordinary 45/50°C cost-driven transitions use a 30-minute minimum dwell,
-while comfort, readiness, incomplete-data and lease-expiry exits bypass it.
-Each policy revision clears prior qualification evidence so changed Shadow
-behavior must earn a new observation period.
+50°C. Reaching 50°C after an anchored cheap window starts is also persisted as
+completion for that readiness plan, including completion during post-window
+recovery. A later 49°C reading therefore does not incorrectly re-enter recovery
+for a plan that already succeeded; comfort and readiness guards still apply.
+Ordinary 45/50°C cost-driven transitions use a 30-minute minimum dwell, while
+comfort, readiness, incomplete-data and lease-expiry exits bypass it. Each
+policy revision clears prior qualification evidence so changed Shadow behavior
+must earn a new observation period.
 
 The options flow validates every target against the selected Daikin's native
 range and step. On the verified BRP069A62 installation that range is 30–55°C in
@@ -491,6 +495,15 @@ counters. It combines the configured comfort observation with fresh Daikin
 outdoor/leaving-water data and canonical published all-in prices, then records
 counterfactual LWT-offset decisions.
 
+Configured climate entities remain valid comfort measurements when their
+setpoint changes while the unit is off. If any configured room HVAC is enabled
+for heating, cooling, drying or fan operation, Floor Shadow still uses its
+measured temperature for the 20°C comfort guard but otherwise yields the
+price-shift proposal. The period is marked as externally influenced and is not
+eligible as floor thermal-response evidence. Candidate-cycle evidence is
+credited only after the paired peak ends without room-HVAC, comfort, override,
+missing-input or DHW-priority contamination.
+
 The verified Daikin surface supports a native **-10°C to +10°C** weather-curve
 offset. That capability is not a safe optimization envelope by itself. The
 first Shadow keeps its primary candidates inside the already observed native
@@ -502,10 +515,15 @@ schedule:
 | 0°C | Move the existing neutral period into the paired cheap block |
 | +1°C | Separately reported aggressive preheat candidate, only with room-temperature headroom and useful heating conditions |
 
-The evaluator requires a complete rolling 24-hour all-in price horizon. It
-pairs a two-hour cheap block with a later two-hour expensive block no more than
-eight hours away, and requires the same €0.05/kWh and 20% materiality gates as
-the DHW policy. It yields to safety/override states, non-LWT control, circuit
+The evaluator requires complete canonical all-in coverage through the end of
+the current Tallinn delivery day. It may also use a later local day only when
+that whole 92/96/100-quarter day is published. Cheap and peak windows stay on
+the same complete local day, and an already anchored pair remains valid until
+its peak ends even if later delivery-day prices are not yet published. Missing
+quarters are never forecast or zero-filled. Within that evidence it pairs a
+two-hour cheap block with a later two-hour expensive block no more than eight
+hours away, and requires the same €0.05/kWh and 20% materiality gates as the
+DHW policy. It yields to safety/override states, non-LWT control, circuit
 standby, missing temperatures and offsets outside the initial Shadow envelope.
 At or below the 20°C indoor guard it proposes 0°C rather than a price-driven
 setback. At or above 21°C it suppresses the separate +1°C candidate.
