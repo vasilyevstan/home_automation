@@ -142,7 +142,6 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
             if call.service == "turn_off":
                 value = "off"
             elif call.service == "set_temperature":
-                value = call.data["hvac_mode"]
                 attributes["temperature"] = call.data["temperature"]
             elif call.service == "set_hvac_mode":
                 value = call.data["hvac_mode"]
@@ -435,8 +434,10 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
                 "set_fan_mode",
                 "set_swing_mode",
                 "set_swing_horizontal_mode",
+                "set_hvac_mode",
             ],
         )
+        self.assertNotIn("hvac_mode", self.climate_calls[1][1])
         self.assertEqual(
             [call.args[0] for call in self.devices.record.await_args_list],
             ["prepared", "verified", "prepared", "verified"],
@@ -460,8 +461,10 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
                 "set_fan_mode",
                 "set_swing_mode",
                 "set_swing_horizontal_mode",
+                "set_hvac_mode",
             ],
         )
+        self.assertNotIn("hvac_mode", self.climate_calls[0][1])
         self.assertEqual(
             [call.args[0] for call in self.devices.record.await_args_list],
             ["prepared", "verified"],
