@@ -648,7 +648,10 @@ Four one-time commissioning buttons are exposed only in healthy Shadow state:
 - Send a persistent and mobile test alert and require the HA notify service to
   accept it.
 - Exercise DHW and floor circuits one at a time, only with fresh safe state,
-  DHW above 45°C, room-temperature headroom and exact standby/on read-back.
+  DHW at or above 46°C, no active readiness lead-time window, room-temperature
+  headroom and exact standby/on read-back. The Shadow optimizer's broader 50°C
+  recovery latch still protects production decisions but does not replace these
+  stricter commissioning-specific preconditions.
 - Exercise the first allowlisted climate entity by briefly activating its saved
   cooling state only when the saved target has at least 1°C of no-cooling
   headroom. The writer prepares the exact target, fan and swing settings while
