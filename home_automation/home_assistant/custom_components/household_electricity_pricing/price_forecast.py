@@ -666,15 +666,23 @@ class HouseholdPriceForecastCoordinator(
         now: datetime,
         history_days: int,
         horizon_days: int,
+        include_future_days: int,
     ) -> dict:
-        start_bound = now.astimezone(UTC) - timedelta(days=history_days)
+        now_utc = now.astimezone(UTC)
+        start_bound = now_utc - timedelta(days=history_days)
+        end_bound = now_utc
+        if include_future_days:
+            _, end_bound = market_bounds(
+                now.astimezone(TALLINN).date()
+                + timedelta(days=include_future_days)
+            )
         points = []
         stored_hours = 0
         for record in sorted(self.archive.values(), key=lambda item: item["start"]):
             start = _instant(record["start"], "Stored forecast start")
             if (
                 record["horizon_days"] != horizon_days
-                or not start_bound <= start < now.astimezone(UTC)
+                or not start_bound <= start < end_bound
             ):
                 continue
             stored_hours += 1
@@ -735,6 +743,7 @@ class HouseholdPriceForecastCoordinator(
             "fixed_fees": "excluded",
             "history_days": history_days,
             "horizon_days": horizon_days,
+            "include_future_days": include_future_days,
             "as_of": now.astimezone(TALLINN).isoformat(),
             "stored_hours": stored_hours,
             "intervals": points,
@@ -756,6 +765,7 @@ class HouseholdPriceForecastCoordinator(
         view: str,
         history_days: int,
         horizon_days: int,
+        include_future_days: int = 0,
     ) -> dict:
         if view == "current":
             if self.data is None:
@@ -806,6 +816,7 @@ class HouseholdPriceForecastCoordinator(
                 dt_util.utcnow().astimezone(UTC),
                 history_days,
                 horizon_days,
+                include_future_days,
             )
         except PricingError as error:
             raise ServiceValidationError(str(error)) from error

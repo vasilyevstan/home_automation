@@ -43,6 +43,14 @@ get_price_forecast:
           max: 7
           step: 1
           mode: box
+    include_future_days:
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 7
+          step: 1
+          mode: box
 
 quote_electricity_interval:
   fields:

@@ -253,7 +253,15 @@ data:
   view: archive
   history_days: 7
   horizon_days: 1
+  include_future_days: 1
 ```
+
+`include_future_days` defaults to `0`, preserving the historical-only archive
+view. Set it to `1` to keep tomorrow's stored D-1 forecast accessible after
+canonical tomorrow prices publish. A comparison must join exact quarter-hour
+timestamps and show a point only when both the retained prediction and the
+canonical published household price exist; missing or partial publication is
+not zero.
 
 A future application can call the same action through HA's authenticated REST
 service API instead of introducing a separate unauthenticated server. Use a

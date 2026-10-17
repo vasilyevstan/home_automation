@@ -90,7 +90,7 @@
         },
         "view": {
           "name": "View",
-          "description": "Current seven-day outlook or retained historical forecast issuances."
+          "description": "Current seven-day outlook or retained forecast issuances."
         },
         "history_days": {
           "name": "Archive history (days)",
@@ -99,6 +99,10 @@
         "horizon_days": {
           "name": "Provider horizon day",
           "description": "Archive view only: select the D-1 through D-7 prediction horizon."
+        },
+        "include_future_days": {
+          "name": "Future delivery days",
+          "description": "Archive view only: also return stored forecasts through the end of the next 0 to 7 Tallinn delivery days. Use this to retain a prediction for comparison after official prices publish."
         }
       }
     },
