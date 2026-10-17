@@ -56,12 +56,14 @@ from .floor_heating_shadow import read_room_temperature_source
 LOGGER = logging.getLogger(__name__)
 STORE_VERSION = 1
 STORE_KEY_SUFFIX = "extreme_price_protection"
-POLICY_REVISION = 1
+POLICY_REVISION = 2
 DECISION_HISTORY_LIMIT = 64
 NOTIFICATION_ID = DOMAIN + "_extreme_price_protection"
 MOBILE_NOTIFY_SERVICE = "mobile_app_bananastan"
 LOAD_HOT_WATER = "daikin_hot_water"
 LOAD_FLOOR_HEATING = "daikin_floor_heating"
+COMMISSIONING_REPLAY_DAYS = 7
+COMMISSIONING_MIN_TANK_C = 46
 
 
 def _number(value: object) -> float | None:
@@ -743,6 +745,194 @@ def plan_extreme_price_protection(
     )
 
 
+def verify_commissioning_replay() -> dict:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def intervals(*values: str) -> tuple[PriceInterval, ...]:
+        return tuple(
+            PriceInterval(
+                start + index * MARKET_INTERVAL,
+                start + (index + 1) * MARKET_INTERVAL,
+                Decimal(value),
+            )
+            for index, value in enumerate(values)
+        )
+
+    active_climate = {
+        "entity_id": "climate.commissioning",
+        "available": True,
+        "fresh": True,
+        "state": "heat",
+    }
+
+    def plan(
+        values: tuple[str, ...],
+        *,
+        now: datetime = start,
+        **changes,
+    ) -> ProtectionDecision:
+        arguments = {
+            "now": now,
+            "mode": EXTREME_PRICE_MODE_SHADOW,
+            "intervals": intervals(*values),
+            "water_enabled": True,
+            "tank_temperature": 50,
+            "water_guard": None,
+            "readiness_active": False,
+            "heating_enabled": True,
+            "room_temperature": 22,
+            "heating_guard": None,
+            "climates": (active_climate,),
+        }
+        arguments.update(changes)
+        return plan_extreme_price_protection(**arguments)
+
+    scenarios = []
+
+    boundary = plan(("1.5", "1.8"))
+    boundary_actions = {
+        action.load_id: action.operation for action in boundary.actions
+    }
+    if (
+        boundary.state != "active"
+        or boundary.active_block is None
+        or boundary.active_block.maximum != Decimal("1.8")
+        or boundary_actions.get(LOAD_HOT_WATER) != "standby"
+        or boundary_actions.get(LOAD_FLOOR_HEATING) != "standby"
+        or boundary_actions.get("climate.commissioning") != "turn_off"
+    ):
+        raise HomeAssistantError(
+            "Deterministic hard-stop boundary replay failed."
+        )
+    scenarios.append("hard_stop_boundary")
+
+    below = plan(("1.499999",))
+    if below.state != "clear" or below.active_block is not None:
+        raise HomeAssistantError(
+            "Deterministic below-threshold replay failed."
+        )
+    scenarios.append("below_threshold")
+
+    critical = plan(("2.0",))
+    if (
+        critical.state != "critical"
+        or not critical.critical
+        or critical.active_block is None
+        or critical.active_block.threshold
+        != Decimal(str(EXTREME_PRICE_THRESHOLD_EUR_KWH))
+    ):
+        raise HomeAssistantError(
+            "Deterministic critical-severity replay failed."
+        )
+    scenarios.append("critical_severity")
+
+    warning = plan(("0.5",) * 8)
+    if (
+        warning.state != "warning"
+        or warning.warning_block is None
+        or warning.warning_block.duration != timedelta(hours=2)
+    ):
+        raise HomeAssistantError(
+            "Deterministic extended-warning replay failed."
+        )
+    scenarios.append("extended_warning")
+
+    scheduled = plan(
+        ("0.2", "1.5", "1.6"),
+        now=start,
+    )
+    if (
+        scheduled.state != "scheduled"
+        or scheduled.active_block is not None
+        or scheduled.next_hard_block is None
+        or scheduled.next_hard_block.start != start + MARKET_INTERVAL
+    ):
+        raise HomeAssistantError(
+            "Deterministic scheduled-block replay failed."
+        )
+    scenarios.append("scheduled_block")
+
+    comfort = plan(
+        ("1.5",),
+        tank_temperature=45,
+        room_temperature=EXTREME_PRICE_FLOOR_RESTORE_C,
+    )
+    comfort_actions = {
+        action.load_id: action.operation for action in comfort.actions
+    }
+    if (
+        comfort_actions.get(LOAD_HOT_WATER) != "keep_on"
+        or comfort_actions.get(LOAD_FLOOR_HEATING) != "keep_on"
+    ):
+        raise HomeAssistantError(
+            "Deterministic comfort-override replay failed."
+        )
+    scenarios.append("comfort_overrides")
+
+    restored = plan(
+        ("0.2",),
+        water_enabled=False,
+        heating_enabled=False,
+        climates=(
+            {
+                **active_climate,
+                "state": "off",
+            },
+        ),
+        owned_loads=(
+            LOAD_HOT_WATER,
+            LOAD_FLOOR_HEATING,
+            "climate.commissioning",
+        ),
+    )
+    if {
+        action.load_id
+        for action in restored.actions
+        if action.operation == "restore"
+    } != {
+        LOAD_HOT_WATER,
+        LOAD_FLOOR_HEATING,
+        "climate.commissioning",
+    }:
+        raise HomeAssistantError(
+            "Deterministic ownership restore replay failed."
+        )
+    scenarios.append("ownership_restore")
+
+    unavailable = plan(
+        ("1.5",),
+        water_enabled=None,
+        heating_enabled=None,
+        climates=(
+            {
+                "entity_id": "climate.commissioning",
+                "available": False,
+                "fresh": False,
+                "state": None,
+                "reason": "Synthetic unavailable state.",
+            },
+        ),
+    )
+    if (
+        not unavailable.partial
+        or any(
+            action.operation != "unavailable"
+            for action in unavailable.actions
+        )
+    ):
+        raise HomeAssistantError(
+            "Deterministic unavailable-input replay failed."
+        )
+    scenarios.append("unavailable_inputs")
+
+    return {
+        "verified": True,
+        "coverage_days": COMMISSIONING_REPLAY_DAYS,
+        "scenario_count": len(scenarios),
+        "scenarios": scenarios,
+    }
+
+
 class ExtremePriceProtection:
     """HA runtime for the independent catastrophic-price policy."""
 
@@ -806,9 +996,11 @@ class ExtremePriceProtection:
             "confirmed_restores": 0,
             "thermal_contamination_active": False,
             "replay_verified": False,
+            "replay_coverage_days": 0,
             "alert_delivery_verified": False,
             "daikin_exercises_verified": False,
             "climate_exercises_verified": False,
+            "commissioning_evidence": {},
         }
 
     async def async_start(self) -> None:
@@ -898,9 +1090,17 @@ class ExtremePriceProtection:
         await self.store.async_save({"mode": self.mode, **self.state})
 
     @property
-    def armed_ready(self) -> bool:
+    def observation_qualified(self) -> bool:
         return (
             len(self.state["shadow_days"]) >= 7
+            or self.state.get("replay_coverage_days", 0)
+            >= COMMISSIONING_REPLAY_DAYS
+        )
+
+    @property
+    def armed_ready(self) -> bool:
+        return (
+            self.observation_qualified
             and self.state["replay_verified"] is True
             and self.state["alert_delivery_verified"] is True
             and self.state["daikin_exercises_verified"] is True
@@ -1278,6 +1478,13 @@ class ExtremePriceProtection:
             self.state["ownership"] = ownership
         return ownership
 
+    def _commissioning_evidence(self) -> dict:
+        evidence = self.state.get("commissioning_evidence")
+        if not isinstance(evidence, dict):
+            evidence = {}
+            self.state["commissioning_evidence"] = evidence
+        return evidence
+
     def _reconcile_ownership(
         self,
         daikin: dict,
@@ -1628,6 +1835,302 @@ class ExtremePriceProtection:
             await self._save()
             self._notify_listeners()
 
+    def _require_commissioning_state(self) -> None:
+        if self.mode != EXTREME_PRICE_MODE_SHADOW:
+            raise HomeAssistantError(
+                "Extreme-price commissioning requires Shadow mode."
+            )
+        if self.state["fault"]:
+            raise HomeAssistantError(
+                "Resolve the extreme-price fault before commissioning."
+            )
+        if self._ownership():
+            raise HomeAssistantError(
+                "Commissioning is blocked while the breaker owns a load."
+            )
+
+    async def async_verify_commissioning_replay(self) -> None:
+        async with self.lock:
+            self._require_commissioning_state()
+            receipt = verify_commissioning_replay()
+            observed_at = dt_util.utcnow().astimezone(UTC)
+            self.state["replay_verified"] = True
+            self.state["replay_coverage_days"] = receipt["coverage_days"]
+            self._commissioning_evidence()["replay"] = {
+                **receipt,
+                "verified_at": observed_at.isoformat(),
+            }
+            await self._save()
+            self._notify_listeners()
+
+    async def async_verify_alert_delivery(self) -> None:
+        async with self.lock:
+            self._require_commissioning_state()
+            observed_at = dt_util.utcnow().astimezone(UTC)
+            await self._send_alert(
+                title="Extreme price protection commissioning",
+                message=(
+                    "Test alert accepted by Home Assistant. No device command "
+                    "was sent. This verifies the configured persistent and "
+                    "mobile notification service path."
+                ),
+                dedupe_key=None,
+            )
+            if self.state["last_alert_error"]:
+                raise HomeAssistantError(
+                    "The extreme-price mobile alert path failed: "
+                    + self.state["last_alert_error"]
+                )
+            self.state["alert_delivery_verified"] = True
+            self._commissioning_evidence()["alert_delivery"] = {
+                "verified": True,
+                "verified_at": observed_at.isoformat(),
+                "service": "notify." + MOBILE_NOTIFY_SERVICE,
+                "basis": "home_assistant_service_accepted",
+            }
+            await self._save()
+            self._notify_listeners()
+
+    async def async_exercise_daikin(self) -> None:
+        async with self.lock:
+            self._require_commissioning_state()
+            observed_at = dt_util.utcnow().astimezone(UTC)
+            status = await self.devices.get_daikin_status()
+            daikin = self._daikin_observation(status, observed_at)
+            climates = await self._climate_observations()
+            climate_guards = [
+                row["entity_id"]
+                for row in climates
+                if (
+                    not row.get("available")
+                    or not row.get("fresh")
+                    or row.get("state") != "off"
+                )
+            ]
+            if climate_guards:
+                raise HomeAssistantError(
+                    "All protected climate units must be fresh and off before "
+                    "the Daikin exercise: "
+                    + ", ".join(climate_guards)
+                    + "."
+                )
+            if (
+                daikin["water_guard"] is not None
+                or daikin["heating_guard"] is not None
+            ):
+                raise HomeAssistantError(
+                    "Daikin commissioning guards are not clear: "
+                    + "; ".join(
+                        item
+                        for item in (
+                            daikin["water_guard"],
+                            daikin["heating_guard"],
+                        )
+                        if item is not None
+                    )
+                )
+            if daikin["water_enabled"] is not True:
+                raise HomeAssistantError(
+                    "The DHW circuit must be on before commissioning."
+                )
+            if daikin["heating_enabled"] is not True:
+                raise HomeAssistantError(
+                    "The floor-heating circuit must be on before commissioning."
+                )
+            if (
+                daikin["tank_temperature"] is None
+                or daikin["tank_temperature"] < COMMISSIONING_MIN_TANK_C
+            ):
+                raise HomeAssistantError(
+                    "DHW must be at least "
+                    f"{COMMISSIONING_MIN_TANK_C:g}°C before the standby exercise."
+                )
+            if self._readiness_active(observed_at):
+                raise HomeAssistantError(
+                    "DHW readiness lead time is active; commissioning yielded."
+                )
+            if (
+                daikin["room_temperature"] is None
+                or daikin["room_temperature"]
+                <= EXTREME_PRICE_FLOOR_RESTORE_C
+            ):
+                raise HomeAssistantError(
+                    "The coldest occupied room lacks floor-standby headroom."
+                )
+
+            operations = []
+            attempted = False
+
+            async def exercise(
+                operation: str,
+                observation_key: str,
+            ) -> None:
+                nonlocal attempted
+                for value, expected in ((False, "standby"), (True, "on")):
+                    attempted = True
+                    result = await self.devices.control_daikin(
+                        {"operation": operation, "value": value},
+                        Context(),
+                    )
+                    if result.get("confirmed") != expected:
+                        raise HomeAssistantError(
+                            f"{operation} did not confirm {expected}."
+                        )
+                    fresh = self._daikin_observation(
+                        await self.devices.get_daikin_status(),
+                        dt_util.utcnow().astimezone(UTC),
+                    )
+                    if fresh[observation_key] is not value:
+                        raise HomeAssistantError(
+                            f"Fresh {operation} read-back did not remain "
+                            f"{expected}."
+                        )
+                    operations.append(
+                        {
+                            "operation": operation,
+                            "requested": value,
+                            "confirmed": expected,
+                        }
+                    )
+
+            try:
+                await exercise("hot_water_enabled", "water_enabled")
+                await exercise("heating_enabled", "heating_enabled")
+            except (HomeAssistantError, TimeoutError) as error:
+                if attempted:
+                    await self._fault(
+                        "Controlled Daikin commissioning failed after dispatch "
+                        "and may have changed a circuit. Inspect fresh state "
+                        f"before review. {error}"
+                    )
+                    await self._save()
+                    self._notify_listeners()
+                raise
+
+            self.state["daikin_exercises_verified"] = True
+            self._commissioning_evidence()["daikin"] = {
+                "verified": True,
+                "verified_at": dt_util.utcnow().astimezone(UTC).isoformat(),
+                "initial_tank_temperature_c": daikin["tank_temperature"],
+                "initial_room_temperature_c": daikin["room_temperature"],
+                "operations": operations,
+            }
+            await self._save()
+            self._notify_listeners()
+
+    async def async_exercise_climate(self) -> None:
+        async with self.lock:
+            self._require_commissioning_state()
+            if not self.climate_entities:
+                raise HomeAssistantError(
+                    "No protected climate entity is configured."
+                )
+            entity_id = self.climate_entities[0]
+            initial = await self.devices.get_climate_status(entity_id)
+            if not initial.get("available") or not initial.get("fresh"):
+                raise HomeAssistantError(
+                    initial.get("reason")
+                    or "Fresh climate state is unavailable."
+                )
+            if initial.get("state") != "off":
+                raise HomeAssistantError(
+                    f"{entity_id} must be off before the controlled exercise."
+                )
+            target = initial.get("temperature")
+            current = initial.get("current_temperature")
+            if target is None or current is None or target < current + 1:
+                raise HomeAssistantError(
+                    f"{entity_id} needs at least 1°C of saved cooling-target "
+                    "headroom before the controlled exercise."
+                )
+            attempted = False
+            try:
+                attempted = True
+                prepared = await self.devices.prepare_climate_commissioning(
+                    entity_id,
+                    initial,
+                    Context(),
+                )
+                active = prepared["confirmed"]
+                self.state["thermal_contamination_active"] = True
+                self._sync_floor_contamination()
+
+                stopped = await self.devices.control_climate(
+                    {
+                        "entity_id": entity_id,
+                        "operation": "turn_off",
+                        "expected": active,
+                    },
+                    Context(),
+                )
+                if not stopped.get("changed"):
+                    raise HomeAssistantError(
+                        "The controlled climate stop was not confirmed."
+                    )
+                off = stopped["confirmed"]
+
+                restored = await self.devices.control_climate(
+                    {
+                        "entity_id": entity_id,
+                        "operation": "restore",
+                        "expected": off,
+                        "restore_state": active,
+                    },
+                    Context(),
+                )
+                if not restored.get("changed"):
+                    raise HomeAssistantError(
+                        "The controlled climate restore was not confirmed."
+                    )
+
+                returned_off = await self.devices.control_climate(
+                    {
+                        "entity_id": entity_id,
+                        "operation": "turn_off",
+                        "expected": restored["confirmed"],
+                    },
+                    Context(),
+                )
+                if (
+                    not returned_off.get("changed")
+                    or returned_off["confirmed"].get("state") != "off"
+                ):
+                    raise HomeAssistantError(
+                        "The climate unit did not return to its initial off state."
+                    )
+            except (HomeAssistantError, TimeoutError) as error:
+                if attempted:
+                    await self._fault(
+                        "Controlled climate commissioning failed after dispatch "
+                        f"for {entity_id}. Inspect fresh cloud and physical "
+                        f"state before review. {error}"
+                    )
+                    await self._save()
+                    self._notify_listeners()
+                raise
+
+            self.state["thermal_contamination_active"] = False
+            self._sync_floor_contamination()
+            self.state["climate_exercises_verified"] = True
+            self._commissioning_evidence()["climate"] = {
+                "verified": True,
+                "verified_at": dt_util.utcnow().astimezone(UTC).isoformat(),
+                "entity_id": entity_id,
+                "initial_state": "off",
+                "exercise_sequence": [
+                    "commissioning_prepare",
+                    "turn_off",
+                    "restore",
+                    "turn_off",
+                ],
+                "final_state": "off",
+                "confirmation_basis": (
+                    "home_assistant_cloud_reported_state"
+                ),
+            }
+            await self._save()
+            self._notify_listeners()
+
     async def async_set_mode(self, mode: str) -> None:
         if mode not in EXTREME_PRICE_MODES:
             raise HomeAssistantError(
@@ -1635,8 +2138,9 @@ class ExtremePriceProtection:
             )
         if mode == EXTREME_PRICE_MODE_ARMED and not self.armed_ready:
             raise HomeAssistantError(
-                "Armed mode requires seven Shadow days, deterministic replay, "
-                "verified alert delivery, and controlled Daikin and climate exercises."
+                "Armed mode requires seven live Shadow days or seven-day replay "
+                "coverage, verified alert delivery, and controlled Daikin and "
+                "climate exercises."
             )
         self.mode = mode
         await self._save()
@@ -1697,8 +2201,18 @@ class ExtremePriceProtection:
                 "armed_ready": self.armed_ready,
                 "available_modes": list(self.available_modes),
                 "shadow_days": len(self.state["shadow_days"]),
+                "replay_coverage_days": self.state.get(
+                    "replay_coverage_days",
+                    0,
+                ),
+                "observation_qualified": self.observation_qualified,
                 "policy_revision": self.state["policy_revision"],
                 "climate_entities": list(self.climate_entities),
+                "commissioning_climate_entity": (
+                    self.climate_entities[0]
+                    if self.climate_entities
+                    else None
+                ),
                 "owned_loads": [
                     {
                         "load_id": load_id,
@@ -1721,7 +2235,14 @@ class ExtremePriceProtection:
                 ),
                 "savings_status": "unavailable_without_attributable_energy",
                 "promotion_requirements": {
+                    "observation_or_replay_coverage": (
+                        self.observation_qualified
+                    ),
                     "seven_shadow_days": len(self.state["shadow_days"]) >= 7,
+                    "replay_coverage_days": self.state.get(
+                        "replay_coverage_days",
+                        0,
+                    ),
                     "replay_verified": self.state["replay_verified"],
                     "alert_delivery_verified": self.state[
                         "alert_delivery_verified"
@@ -1733,6 +2254,7 @@ class ExtremePriceProtection:
                         "climate_exercises_verified"
                     ],
                 },
+                "commissioning_evidence": self._commissioning_evidence(),
                 "recent_decisions": self.state["decision_history"][-12:],
             }
         )
