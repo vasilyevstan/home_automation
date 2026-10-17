@@ -816,7 +816,15 @@ class ExtremePriceProtectionTests(base.HAComponentTests):
             control_daikin=AsyncMock(side_effect=control_daikin),
         )
         protection = self.runtime(devices)
-        await protection.async_exercise_daikin()
+        protection.optimizer.decision = SimpleNamespace(state="recovery")
+        self.assertTrue(protection._readiness_active(self.now))
+        with patch.object(
+            protection,
+            "_readiness_lead_time_active",
+            return_value=False,
+        ) as readiness_lead_time:
+            await protection.async_exercise_daikin()
+        readiness_lead_time.assert_called_once()
         self.assertTrue(protection.state["daikin_exercises_verified"])
         self.assertEqual(
             [

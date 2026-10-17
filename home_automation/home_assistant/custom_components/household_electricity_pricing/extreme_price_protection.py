@@ -1279,6 +1279,12 @@ class ExtremePriceProtection:
             result.append(await self.devices.get_climate_status(entity_id))
         return tuple(result)
 
+    def _readiness_lead_time_active(self, now: datetime) -> bool:
+        deadline = next_readiness(now, self.optimizer.policy)
+        return deadline - now.astimezone(TALLINN) <= timedelta(
+            minutes=self.optimizer.heating_minutes
+        )
+
     def _readiness_active(self, now: datetime) -> bool:
         optimizer_decision = getattr(self.optimizer, "decision", None)
         if (
@@ -1286,10 +1292,7 @@ class ExtremePriceProtection:
             and optimizer_decision.state in {"readiness", "recovery"}
         ):
             return True
-        deadline = next_readiness(now, self.optimizer.policy)
-        return deadline - now.astimezone(TALLINN) <= timedelta(
-            minutes=self.optimizer.heating_minutes
-        )
+        return self._readiness_lead_time_active(now)
 
     def _record(self, now: datetime, decision: ProtectionDecision) -> None:
         previous = self.decision
@@ -1946,7 +1949,7 @@ class ExtremePriceProtection:
                     "DHW must be at least "
                     f"{COMMISSIONING_MIN_TANK_C:g}°C before the standby exercise."
                 )
-            if self._readiness_active(observed_at):
+            if self._readiness_lead_time_active(observed_at):
                 raise HomeAssistantError(
                     "DHW readiness lead time is active; commissioning yielded."
                 )

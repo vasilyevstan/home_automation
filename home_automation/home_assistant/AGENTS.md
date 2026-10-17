@@ -112,8 +112,10 @@
   €1.50/kWh event is not a promotion prerequisite, and passing gates must never
   select Armed automatically.
 - Keep commissioning on the production guarded writer. Daikin exercises require
-  fresh safe state, DHW above 45°C, room headroom, and exact standby/on
-  read-back. Climate commissioning may briefly prepare one allowlisted unit only
+  fresh safe state, DHW at or above 46°C, no active readiness lead-time window,
+  room headroom, and exact standby/on read-back. Do not let the Shadow
+  optimizer's broader recovery latch replace those commissioning-specific
+  checks. Climate commissioning may briefly prepare one allowlisted unit only
   from fresh off state with at least 1°C no-cooling target headroom. Configure
   its exact target, fan and swing settings while it remains off, explicitly
   activate the saved HVAC mode, exercise exact off/restore, and return the unit
