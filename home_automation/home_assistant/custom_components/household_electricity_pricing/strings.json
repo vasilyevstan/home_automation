@@ -37,7 +37,7 @@
     "step": {
       "init": {
         "title": "Heating price optimizers",
-        "description": "Configure the deterministic Daikin target policy and select occupied-room temperature sources for floor Shadow. Saving options does not enable writes; both evaluators remain in Shadow until explicitly promoted. {error}",
+        "description": "Configure the deterministic Daikin target policy, floor Shadow room sources, and the explicit climate allowlist for extreme-price protection. Saving options does not enable writes; all new protection remains in Shadow until explicitly promoted. {error}",
         "data": {
           "dhw_morning_ready": "Morning readiness time (HH:MM, Europe/Tallinn)",
           "dhw_evening_ready": "Evening readiness time (HH:MM, Europe/Tallinn)",
@@ -50,7 +50,8 @@
           "dhw_price_delta_percent": "Minimum relative price advantage (%)",
           "dhw_initial_heat_minutes": "Initial conservative heating allowance (minutes)",
           "dhw_coast_horizon_hours": "Maximum preheat coast horizon (hours)",
-          "floor_indoor_temperature_entities": "Occupied-room temperatures for floor Shadow"
+          "floor_indoor_temperature_entities": "Occupied-room temperatures for floor Shadow",
+          "extreme_price_climate_entities": "Climate units covered by extreme-price protection"
         }
       }
     },
@@ -62,6 +63,9 @@
     "sensor": {
       "price_forecast": {
         "name": "Seven-day price forecast"
+      },
+      "extreme_price_protection": {
+        "name": "Extreme price protection"
       }
     }
   },

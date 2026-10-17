@@ -100,6 +100,28 @@
   spread itself as saved euros. Estimated or realized euros require measured
   electrical energy attributable to that exact action; confirmed writes alone
   are insufficient.
+- Keep extreme-price protection independent from both heating optimizers. It
+  consumes canonical published household all-in quarters only: forecasts may
+  warn but cannot authorize device control. Preserve the €1.50/kWh hard stop,
+  €2/kWh alert severity, €0.50/kWh-for-two-hours warning, two-hour maximum
+  lease, DHW 45°C/readiness exits and 20.5°C coldest-room floor restore guard.
+- Extreme-price installation and option saves default to Shadow. Do not expose
+  or accept Armed until seven Shadow days, deterministic replay, alert delivery
+  and controlled Daikin/climate exercises are all explicitly verified.
+- Treat every breaker write as a separate non-atomic operation. Persist exact
+  per-load ownership, prior state, block identity and lease; restore only a
+  load still matching breaker-owned standby/off state. Manual or external
+  changes cancel ownership. Uncertain stop/restore outcomes fault without
+  automatic retry, inversion or rollback.
+- Climate protection is limited to the explicit allowlist. Do not emit no-op IR
+  commands to units already off. Snapshot mode, target/unit, fan, vertical and
+  horizontal swing before stopping an active unit, validate current
+  capabilities before restore, and state clearly that HA/Sensibo cloud
+  read-back does not prove physical HVAC power or IR reception.
+- An active climate stop/recovery contaminates floor thermal-response evidence.
+  Never present Daikin circuit standby as whole-heat-pump zero power, present
+  the multi-load shutdown as atomic, or convert an avoided high-price quarter
+  into saved kWh/euros without attributable energy measurement.
 - Huawei control/read transactions must hold the device's `update_lock`, shared
   with its native polling coordinator, not only the API's own per-device lock.
 - HA must be the sole Huawei Modbus client during handover. Keep the old local
@@ -110,6 +132,7 @@
   same-value write as an installation/connectivity check.
 - Run the root `test_home_assistant_pricing.py` suite and the isolated real-HA
   test commands in the README, including `test_dhw_optimizer.py` and
-  `test_floor_heating_shadow.py` and `test_price_forecast.py`. Do not install HA
+  `test_floor_heating_shadow.py`, `test_extreme_price_protection.py`, and
+  `test_price_forecast.py`. Do not install HA
   dependencies into the shared MCP environment. Use synthetic data; keep live
   captures and private profiles out of commits and public logs.

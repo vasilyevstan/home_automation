@@ -7,6 +7,7 @@ from pathlib import Path
 import probatio
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.selector import ConfigEntrySelector, EntitySelector
@@ -20,7 +21,8 @@ from .const import (
     CONF_DHW_FLOOR_TARGET, CONF_DHW_INITIAL_HEAT_MINUTES, CONF_DHW_MAX_LEASE_HOURS,
     CONF_DHW_MORNING_READY, CONF_DHW_NORMAL_TARGET, CONF_DHW_PREHEAT_TARGET,
     CONF_DHW_PRICE_DELTA, CONF_DHW_PRICE_PERCENT, CONF_DHW_SOFT_TARGET,
-    CONF_ELERING_PATH, CONF_FLOOR_INDOOR_TEMPERATURE_ENTITIES,
+    CONF_ELERING_PATH, CONF_EXTREME_PRICE_CLIMATE_ENTITIES,
+    CONF_FLOOR_INDOOR_TEMPERATURE_ENTITIES,
     CONF_NORDPOOL_ENTRY, CONF_PROFILE_PATH, CONF_SOLAR_ENTRY,
     DEFAULT_DHW_COAST_HOURS, DEFAULT_DHW_EVENING_READY, DEFAULT_DHW_FLOOR_TARGET,
     DEFAULT_DHW_INITIAL_HEAT_MINUTES, DEFAULT_DHW_MAX_LEASE_HOURS,
@@ -121,6 +123,10 @@ OPTIONS_SCHEMA = probatio.Schema({
         "domain": ["sensor", "climate"],
         "multiple": True,
     }),
+    probatio.Optional(CONF_EXTREME_PRICE_CLIMATE_ENTITIES): EntitySelector({
+        "domain": "climate",
+        "multiple": True,
+    }),
 })
 
 
@@ -155,6 +161,27 @@ class HouseholdPriceOptionsFlow(OptionsFlow):
             )
             if value is None:
                 raise PricingError(reason or f"{entity_id} is not a usable temperature.")
+        climate_entities = user_input.get(CONF_EXTREME_PRICE_CLIMATE_ENTITIES)
+        if climate_entities is not None:
+            if not isinstance(climate_entities, list) or not climate_entities:
+                raise PricingError(
+                    "Select at least one climate entity for extreme-price protection."
+                )
+            if len(set(climate_entities)) != len(climate_entities):
+                raise PricingError(
+                    "Extreme-price climate entities must be unique."
+                )
+            for entity_id in climate_entities:
+                state = self.hass.states.get(entity_id)
+                if (
+                    not isinstance(entity_id, str)
+                    or not entity_id.startswith("climate.")
+                    or state is None
+                    or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE)
+                ):
+                    raise PricingError(
+                        f"{entity_id} is not an available climate entity."
+                    )
 
     async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
         errors = {}

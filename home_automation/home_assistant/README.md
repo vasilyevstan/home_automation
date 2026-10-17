@@ -22,6 +22,8 @@ integrations and must be checked against the installed HA version and hardware.
 It does not install them or change device settings during setup. There is no
 LLM-driven optimizer. An explicitly configured deterministic DHW optimizer is
 separate from the guarded MCP tools and always starts in zero-write shadow mode.
+An independent catastrophic-price controller also starts in Shadow and is not
+automatically armed by installation, options, restart, or elapsed time.
 
 ## Native MCP connection
 
@@ -185,6 +187,7 @@ The calculated integration exposes:
 | All-in import price | Variable cost of one additional billable imported kWh, including applicable VAT |
 | Net export earnings | Net earnings for one billable exported kWh after export deductions and taxable balancing fees; negative means exporting costs money |
 | Seven-day price forecast | Next available p50 all-in import estimate; attributes summarize freshness, coverage, uncertainty and retained evidence |
+| Extreme price protection | Independent catastrophic-price decision, per-load proposed actions, ownership/lease evidence, alerts and promotion state |
 
 Rates exclude unchanged monthly fixed fees. They preserve unrounded Decimal
 calculations; suggested display precision does not round the billing engine.
@@ -554,6 +557,88 @@ not turn aggregate household import into heat-pump energy. Estimated or realized
 euros remain unavailable until electrical energy can be attributed to the
 paired floor-heating action.
 
+## Extreme price protection
+
+Selecting a Daikin entry also creates a separate catastrophic-price controller.
+It does not change the DHW optimizer mode or make Floor Shadow write-capable.
+The controller uses only canonical published household all-in
+`import_eur_kwh` quarters; forecasts may remain advisory but never authorize a
+shutdown. Missing current publication is unavailable, not zero and not a reason
+to substitute a forecast.
+
+The fixed revision-1 policy is:
+
+| Setting | Value |
+| --- | --- |
+| Hard-stop boundary | €1.50/kWh canonical household all-in |
+| Additional critical alert | €2.00/kWh |
+| Extended-price warning | At least €0.50/kWh for 120 contiguous minutes |
+| Maximum automatic standby lease | 120 minutes |
+| DHW comfort exit | Tank at or below 45°C |
+| DHW readiness exit | Existing 07:00/21:00 readiness lead time |
+| Floor restore guard | Coldest fresh occupied room at or below 20.5°C |
+| Notifications | HA persistent notification plus `notify.mobile_app_bananastan` |
+
+Exact contiguous 15-minute blocks are identified by threshold, UTC start and
+UTC end. The €2 boundary changes alert severity only; it does not introduce a
+second control algorithm. The controller records one independent action for
+each covered load:
+
+- Daikin domestic-hot-water circuit: native standby/on.
+- Daikin space-heating circuit: native standby/on.
+- Explicitly allowlisted climate entities: off and exact prior-state restore.
+
+Configure the climate allowlist in integration options. For upgrades where the
+new option has not yet been saved, climate entities already configured as floor
+room sources are used as the migration fallback. The allowlist is explicit and
+no other climate entity can be controlled.
+
+Climate units already off produce no service call and no infrared command. For
+an active unit, the breaker snapshots the cloud-reported HVAC mode, target
+temperature and unit, fan mode, vertical swing, horizontal swing and entity
+identity before requesting `climate.turn_off`. Restoration occurs only while
+the same allowlisted entity remains in breaker-owned cloud-reported off state,
+and only after current capabilities still support every saved value. A manual
+or external state change cancels ownership rather than being overwritten.
+Sensibo/HA read-back confirms cloud state after an IR request; it does not
+independently prove physical AC power, flap position, compressor operation or
+IR reception.
+
+Daikin and climate writes are serialized, journaled as prepared/verified/
+uncertain, and confirmed separately. The combined shutdown is never atomic.
+No-op commands are suppressed. An uncertain stop or restore faults the
+controller, raises a critical alert and is never retried, inverted or rolled
+back automatically. Resume after review first requires fresh Daikin and climate
+state.
+
+Per-load ownership stores the prior state, published block identity and lease.
+Only a circuit confirmed as breaker-owned standby is re-enabled. Only a climate
+unit that was originally active and confirmed breaker-owned off is restored.
+Restoration priority is DHW, floor heating, then climate units. Block end,
+lease expiry, comfort/readiness exit, stale/missing price, mode change and
+restart with an expired lease all request ownership-aware restoration. A load
+that exits early is suppressed for the remainder of the same published block,
+so a two-hour lease or comfort restore cannot immediately re-trigger.
+
+If any room climate unit was active when protected, the stop/recovery interval
+is marked externally influenced in Floor Shadow and cannot count as clean
+thermal-response evidence. Standby requests do not prove zero whole-heat-pump
+consumption, and the controller reports no avoided kWh or realized euro saving
+without attributable electrical energy.
+
+The mode select initially exposes only:
+
+- `Off`: no warnings or new shutdown proposals; future owned restores remain
+  ownership-aware.
+- `Shadow (no writes)`: default; evaluate exact published blocks, proposed
+  per-load actions, warnings, comfort exits and partial-shutdown evidence while
+  sending no Daikin or climate command.
+
+`Armed` exists in the persisted policy but is hidden and rejected until all
+promotion gates are recorded: seven Shadow days, deterministic replay, mobile
+alert delivery, controlled Daikin circuit exercises and controlled climate
+exercises. Passing time alone never promotes it.
+
 ## Validation
 
 The source adapter and bundle tests run in the existing project environment:
@@ -582,6 +667,10 @@ uv run --no-project --isolated --python 3.14 \
 uv run --no-project --isolated --python 3.14 \
   --with-requirements home_automation/home_assistant/tests/requirements.txt \
   python home_automation/home_assistant/tests/test_floor_heating_shadow.py -v
+
+uv run --no-project --isolated --python 3.14 \
+  --with-requirements home_automation/home_assistant/tests/requirements.txt \
+  python home_automation/home_assistant/tests/test_extreme_price_protection.py -v
 
 uv run --no-project --isolated --python 3.14 \
   --with-requirements home_automation/home_assistant/tests/requirements.txt \
