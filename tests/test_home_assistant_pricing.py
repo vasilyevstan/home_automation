@@ -269,7 +269,7 @@ class HomeAssistantBundleTests(unittest.TestCase):
                 self.assertEqual(manifest["requirements"], [])
                 self.assertEqual(manifest["dependencies"], ["nordpool"])
                 self.assertEqual(manifest["domain"], "household_electricity_pricing")
-                self.assertEqual(manifest["version"], "0.8.0")
+                self.assertEqual(manifest["version"], "0.8.1")
                 names = archive.namelist()
                 self.assertTrue(all(name.startswith(prefix) for name in names))
                 self.assertFalse(any(

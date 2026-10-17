@@ -651,8 +651,9 @@ Four one-time commissioning buttons are exposed only in healthy Shadow state:
   DHW above 45°C, room-temperature headroom and exact standby/on read-back.
 - Exercise the first allowlisted climate entity by briefly activating its saved
   cooling state only when the saved target has at least 1°C of no-cooling
-  headroom, then run the exact off/restore path and return it to its original
-  off state.
+  headroom. The writer prepares the exact target, fan and swing settings while
+  the unit remains off, explicitly activates the saved HVAC mode, then runs the
+  exact off/restore path and returns it to its original off state.
 
 Every commissioning write is journaled. An uncertain outcome faults without
 retry or rollback, just like a production breaker command. Passing every gate

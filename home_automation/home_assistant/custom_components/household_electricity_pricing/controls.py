@@ -174,6 +174,48 @@ class EnergyDevices:
         async with self.climate_lock:
             return self._climate_status(entity_id)
 
+    async def _activate_climate(
+        self,
+        entity_id: str,
+        requested: dict,
+        context: Context | None,
+    ) -> None:
+        temperature = requested.get("temperature")
+        if temperature is not None:
+            await self._call_climate(
+                "set_temperature",
+                {
+                    "entity_id": entity_id,
+                    "temperature": temperature,
+                },
+                context,
+            )
+        for service, key in (
+            ("set_fan_mode", "fan_mode"),
+            ("set_swing_mode", "swing_mode"),
+            (
+                "set_swing_horizontal_mode",
+                "swing_horizontal_mode",
+            ),
+        ):
+            value = requested.get(key)
+            if value is not None:
+                await self._call_climate(
+                    service,
+                    {"entity_id": entity_id, key: value},
+                    context,
+                )
+        # Sensibo preserves setting changes while off; power on only after the
+        # exact saved cooling/restoration state has been prepared.
+        await self._call_climate(
+            "set_hvac_mode",
+            {
+                "entity_id": entity_id,
+                "hvac_mode": requested["state"],
+            },
+            context,
+        )
+
     async def prepare_climate_commissioning(
         self,
         entity_id: str,
@@ -232,30 +274,11 @@ class EnergyDevices:
             }
             await self.record("prepared", record)
             try:
-                await self._call_climate(
-                    "set_temperature",
-                    {
-                        "entity_id": entity_id,
-                        "hvac_mode": requested["state"],
-                        "temperature": target,
-                    },
+                await self._activate_climate(
+                    entity_id,
+                    requested,
                     context,
                 )
-                for service, key in (
-                    ("set_fan_mode", "fan_mode"),
-                    ("set_swing_mode", "swing_mode"),
-                    (
-                        "set_swing_horizontal_mode",
-                        "swing_horizontal_mode",
-                    ),
-                ):
-                    value = requested.get(key)
-                    if value is not None:
-                        await self._call_climate(
-                            service,
-                            {"entity_id": entity_id, key: value},
-                            context,
-                        )
                 for attempt in range(4):
                     confirmed = self._climate_status(entity_id)
                     if (
@@ -452,41 +475,11 @@ class EnergyDevices:
                         context,
                     )
                 else:
-                    temperature = requested.get("temperature")
-                    if temperature is None:
-                        await self._call_climate(
-                            "set_hvac_mode",
-                            {
-                                "entity_id": entity_id,
-                                "hvac_mode": requested["state"],
-                            },
-                            context,
-                        )
-                    else:
-                        await self._call_climate(
-                            "set_temperature",
-                            {
-                                "entity_id": entity_id,
-                                "hvac_mode": requested["state"],
-                                "temperature": temperature,
-                            },
-                            context,
-                        )
-                    for service, key in (
-                        ("set_fan_mode", "fan_mode"),
-                        ("set_swing_mode", "swing_mode"),
-                        (
-                            "set_swing_horizontal_mode",
-                            "swing_horizontal_mode",
-                        ),
-                    ):
-                        value = requested.get(key)
-                        if value is not None:
-                            await self._call_climate(
-                                service,
-                                {"entity_id": entity_id, key: value},
-                                context,
-                            )
+                    await self._activate_climate(
+                        entity_id,
+                        requested,
+                        context,
+                    )
                 for attempt in range(4):
                     confirmed = self._climate_status(entity_id)
                     matched = (
