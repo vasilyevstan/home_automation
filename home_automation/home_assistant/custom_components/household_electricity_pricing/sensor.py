@@ -263,5 +263,12 @@ class FloorRoomTemperatureSensor(SensorEntity):
             "source_values_c": details["indoor_temperature_values_c"],
             "oldest_source_update": details["indoor_temperature_oldest_update"],
             "source_error": details["indoor_temperature_source_error"],
+            "active_room_hvac_entities": details["active_room_hvac_entities"],
+            "external_room_hvac_influence": details[
+                "external_room_hvac_influence"
+            ],
+            "thermal_response_evidence_eligible": details[
+                "thermal_response_evidence_eligible"
+            ],
             "daikin_garage_temperature_c": details["daikin_indoor_temperature_c"],
         }

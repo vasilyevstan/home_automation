@@ -24,7 +24,12 @@ from homeassistant.helpers.event import (
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
-from ._vendor.home_automation.electricity_market.prices import MARKET_INTERVAL, TALLINN, UTC
+from ._vendor.home_automation.electricity_market.prices import (
+    MARKET_INTERVAL,
+    TALLINN,
+    UTC,
+    market_bounds,
+)
 from .const import (
     CONF_FLOOR_INDOOR_TEMPERATURE_ENTITIES,
     DOMAIN,
@@ -60,7 +65,7 @@ from .dhw_optimizer import (
 
 STORE_VERSION = 1
 STORE_KEY_SUFFIX = "floor_heating_shadow"
-POLICY_REVISION = 2
+POLICY_REVISION = 3
 DECISION_HISTORY_LIMIT = 96
 
 
@@ -189,6 +194,7 @@ class FloorHeatingObservation:
     enabled: bool | None
     override_reason: str | None
     unavailable_reason: str | None = None
+    external_influence_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -291,6 +297,21 @@ def _window(
     )
 
 
+def _coverage_complete(
+    prices: dict[datetime, PriceInterval],
+    start: datetime,
+    end: datetime,
+) -> bool:
+    cursor = quarter_start(start)
+    boundary = end.astimezone(UTC)
+    while cursor < boundary:
+        row = prices.get(cursor)
+        if row is None or row.end != cursor + MARKET_INTERVAL:
+            return False
+        cursor += MARKET_INTERVAL
+    return True
+
+
 def select_floor_shift_plan(
     now: datetime,
     intervals: Iterable[PriceInterval],
@@ -303,15 +324,32 @@ def select_floor_shift_plan(
     current = quarter_start(now)
     current_price = prices[current].price if current in prices else None
     horizon_end = current + policy.horizon
-    cursor = current
-    while cursor < horizon_end:
-        row = prices.get(cursor)
-        if row is None or row.end != cursor + MARKET_INTERVAL:
-            return None, current_price, False
-        cursor += MARKET_INTERVAL
+    if current_price is None:
+        return None, None, False
 
     if planned is not None and current < planned.peak_window.end:
-        return planned, current_price, True
+        interval_count = policy.window_minutes // 15
+        cheap = _window(prices, planned.cheap_window.start, interval_count)
+        peak = _window(prices, planned.peak_window.start, interval_count)
+        if (
+            cheap == planned.cheap_window
+            and peak == planned.peak_window
+        ):
+            return planned, current_price, True
+
+    current_day = current.astimezone(TALLINN).date()
+    _, current_day_end = market_bounds(current_day)
+    if not _coverage_complete(prices, current, current_day_end):
+        return None, current_price, False
+    published_ranges = [(current, current_day_end)]
+    next_day = current_day + timedelta(days=1)
+    while True:
+        day_start, day_end = market_bounds(next_day)
+        if day_start >= horizon_end:
+            break
+        if _coverage_complete(prices, day_start, day_end):
+            published_ranges.append((day_start, day_end))
+        next_day += timedelta(days=1)
 
     interval_count = policy.window_minutes // 15
     duration = interval_count * MARKET_INTERVAL
@@ -319,7 +357,10 @@ def select_floor_shift_plan(
     candidate_start = current
     while candidate_start + duration <= horizon_end:
         choice = _window(prices, candidate_start, interval_count)
-        if choice is not None:
+        if choice is not None and any(
+            choice.start >= range_start and choice.end <= range_end
+            for range_start, range_end in published_ranges
+        ):
             candidates.append(choice)
         candidate_start += MARKET_INTERVAL
 
@@ -330,6 +371,8 @@ def select_floor_shift_plan(
             for cheap in candidates
             if cheap.end <= peak.start
             and peak.start - cheap.end <= policy.maximum_shift
+            and cheap.start.astimezone(TALLINN).date()
+            == peak.start.astimezone(TALLINN).date()
         ]
         if not preceding:
             continue
@@ -416,10 +459,17 @@ def plan_floor_heating(
             "Indoor temperature is at the 20°C guard; no price-driven setback is proposed.",
             policy.neutral_offset,
         )
+    if observation.external_influence_reason is not None:
+        return decision(
+            "yield",
+            observation.external_influence_reason,
+            observation.actual_offset,
+        )
     if not complete or current_price is None:
         return decision(
             "unavailable",
-            "Complete published all-in prices are required for the 24-hour floor plan.",
+            "Complete published all-in prices are required through the current "
+            "Tallinn delivery day.",
             observation.actual_offset,
         )
     if plan is None:
@@ -520,6 +570,9 @@ class FloorHeatingShadow:
                 FLOOR_ROOM_TEMPERATURE_MAX_AGE_MINUTES
             ),
             "indoor_temperature_source_error": None,
+            "active_room_hvac_entities": [],
+            "external_room_hvac_influence": False,
+            "thermal_response_evidence_eligible": False,
             "daikin_indoor_temperature_c": None,
             "daikin_indoor_temperature_role": "garage_diagnostic_only",
         }
@@ -537,6 +590,10 @@ class FloorHeatingShadow:
             "policy_revision": POLICY_REVISION,
             "shadow_days": [],
             "candidate_cycles": 0,
+            "contaminated_candidate_cycles": 0,
+            "candidate_cycle_started_at": None,
+            "candidate_cycle_peak_end": None,
+            "candidate_cycle_contaminated": False,
             "comfort_blocks": 0,
             "decision_history": [],
             "planned_cheap_start": None,
@@ -619,10 +676,11 @@ class FloorHeatingShadow:
 
     def _room_temperature(
         self, observed_at: datetime
-    ) -> tuple[float | None, str | None]:
+    ) -> tuple[float | None, str | None, tuple[str, ...]]:
         values = {}
         updates = []
         errors = []
+        active_hvac_entities = []
         if not self.room_temperature_entities:
             errors.append(
                 "Configure at least one occupied-room temperature entity; "
@@ -640,6 +698,14 @@ class FloorHeatingShadow:
             values[entity_id] = round(value, 3)
             if updated is not None:
                 updates.append(updated)
+            if entity_id.startswith("climate."):
+                source_state = self.hass.states.get(entity_id)
+                if (
+                    source_state is not None
+                    and source_state.state
+                    not in ("off", STATE_UNKNOWN, STATE_UNAVAILABLE)
+                ):
+                    active_hvac_entities.append(entity_id)
         self.room_temperature_details.update({
             "indoor_temperature_entities": list(self.room_temperature_entities),
             "indoor_temperature_values_c": values,
@@ -647,10 +713,17 @@ class FloorHeatingShadow:
                 min(updates).isoformat() if updates else None
             ),
             "indoor_temperature_source_error": "; ".join(errors) or None,
+            "active_room_hvac_entities": active_hvac_entities,
+            "external_room_hvac_influence": bool(active_hvac_entities),
+            "thermal_response_evidence_eligible": (
+                bool(values)
+                and not errors
+                and not active_hvac_entities
+            ),
         })
         if errors:
-            return None, "; ".join(errors)
-        return min(values.values()), None
+            return None, "; ".join(errors), tuple(active_hvac_entities)
+        return min(values.values()), None, tuple(active_hvac_entities)
 
     def _observation(
         self, status: dict, observed_at: datetime
@@ -670,7 +743,9 @@ class FloorHeatingShadow:
         sensors = heating.get("sensors", {})
         daikin_indoor = _number(sensors.get("IndoorTemperature"))
         self.room_temperature_details["daikin_indoor_temperature_c"] = daikin_indoor
-        indoor, indoor_reason = self._room_temperature(observed_at)
+        indoor, indoor_reason, active_room_hvac = self._room_temperature(
+            observed_at
+        )
         outdoor = _number(sensors.get("OutdoorTemperature"))
         leaving = _number(
             sensors.get(
@@ -692,6 +767,13 @@ class FloorHeatingShadow:
             reason = "Daikin is not in heating operation mode."
         elif enabled is not True:
             reason = "The space-heating circuit is in standby or its state is unknown."
+        external_influence_reason = None
+        if active_room_hvac:
+            external_influence_reason = (
+                "Room-level HVAC is enabled for "
+                + ", ".join(active_room_hvac)
+                + "; floor Shadow yields to external room control."
+            )
         return FloorHeatingObservation(
             indoor,
             outdoor,
@@ -700,6 +782,7 @@ class FloorHeatingShadow:
             enabled,
             reason,
             indoor_reason,
+            external_influence_reason,
         )
 
     def _clear_plan(self) -> None:
@@ -757,7 +840,49 @@ class FloorHeatingShadow:
             self.state[prefix + "_average"] = format(window.average, "f")
             self.state[prefix + "_intervals"] = window.interval_count
 
+    def _update_candidate_evidence(
+        self,
+        now: datetime,
+        decision: FloorHeatingDecision,
+    ) -> None:
+        active_peak_end = _instant(self.state.get("candidate_cycle_peak_end"))
+        if active_peak_end is not None and now >= active_peak_end.astimezone(UTC):
+            if self.state["candidate_cycle_contaminated"]:
+                self.state["contaminated_candidate_cycles"] += 1
+            else:
+                self.state["candidate_cycles"] += 1
+            self.state["candidate_cycle_started_at"] = None
+            self.state["candidate_cycle_peak_end"] = None
+            self.state["candidate_cycle_contaminated"] = False
+            active_peak_end = None
+
+        evidence_eligible = self.room_temperature_details[
+            "thermal_response_evidence_eligible"
+        ]
+        if (
+            active_peak_end is None
+            and decision.state == "preheat"
+            and decision.plan is not None
+        ):
+            self.state["candidate_cycle_started_at"] = now.isoformat()
+            self.state["candidate_cycle_peak_end"] = (
+                decision.plan.peak_window.end.isoformat()
+            )
+            self.state["candidate_cycle_contaminated"] = not evidence_eligible
+            active_peak_end = decision.plan.peak_window.end
+
+        if (
+            active_peak_end is not None
+            and (
+                not evidence_eligible
+                or decision.state
+                in {"yield", "unavailable", "deferred", "comfort_guard"}
+            )
+        ):
+            self.state["candidate_cycle_contaminated"] = True
+
     def _record(self, now: datetime, decision: FloorHeatingDecision) -> None:
+        self._update_candidate_evidence(now, decision)
         previous = self.decision
         if (
             previous is not None
@@ -771,10 +896,6 @@ class FloorHeatingShadow:
             and previous.dhw_state == decision.dhw_state
         ):
             return
-        if decision.state == "preheat" and (
-            previous is None or previous.state != "preheat"
-        ):
-            self.state["candidate_cycles"] += 1
         if decision.state == "comfort_guard" and (
             previous is None or previous.state != "comfort_guard"
         ):
@@ -879,10 +1000,23 @@ class FloorHeatingShadow:
             "preheat_ceiling_c": self.policy.preheat_ceiling,
             "window_minutes": self.policy.window_minutes,
             "planning_horizon_hours": int(self.policy.horizon.total_seconds() // 3600),
+            "planning_basis": "complete_tallinn_delivery_days",
             "maximum_shift_hours": int(self.policy.maximum_shift.total_seconds() // 3600),
             "observed_days": len(self.state["shadow_days"]),
             "candidate_cycles": self.state["candidate_cycles"],
+            "contaminated_candidate_cycles": self.state[
+                "contaminated_candidate_cycles"
+            ],
+            "candidate_cycle_in_progress": (
+                self.state["candidate_cycle_peak_end"] is not None
+            ),
+            "candidate_cycle_contaminated": self.state[
+                "candidate_cycle_contaminated"
+            ],
             "comfort_blocks": self.state["comfort_blocks"],
+            "thermal_response_evidence_eligible": self.room_temperature_details[
+                "thermal_response_evidence_eligible"
+            ],
             "confirmed_writes": self.state["confirmed_writes"],
             "pilot_eligible": False,
             "pilot_eligibility_reason": (

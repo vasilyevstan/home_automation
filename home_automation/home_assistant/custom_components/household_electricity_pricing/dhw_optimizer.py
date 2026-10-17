@@ -58,7 +58,7 @@ STORE_KEY_SUFFIX = "dhw_optimizer"
 NOTIFICATION_ID = DOMAIN + "_dhw_optimizer_fault"
 DECISION_HISTORY_LIMIT = 96
 HEATING_DURATION_LIMIT = 20
-POLICY_REVISION = 2
+POLICY_REVISION = 3
 MINIMUM_TARGET_DWELL = timedelta(minutes=30)
 
 
@@ -461,6 +461,7 @@ def plan_dhw(
     comparison_window: PriceWindowChoice | None = None,
     recovery_latched: bool = False,
     recovery_reason: str | None = None,
+    preheat_completed: bool = False,
 ) -> DhwDecision:
     if now.utcoffset() is None:
         raise HomeAssistantError("DHW planning time must include a UTC offset.")
@@ -587,7 +588,11 @@ def plan_dhw(
             "all-in price advantage justifies 55°C preheating.",
             policy.preheat_target,
         )
-    if observation.tank_temperature < policy.normal_target and selected.end <= now_utc:
+    if (
+        observation.tank_temperature < policy.normal_target
+        and selected.end <= now_utc
+        and not preheat_completed
+    ):
         return decision(
             "recovery",
             "The selected cheap window ended before the tank reached the normal target.",
@@ -700,6 +705,7 @@ class DhwOptimizer:
             "planned_comparison_end": None,
             "planned_comparison_average": None,
             "planned_comparison_intervals": None,
+            "planned_window_completed_at": None,
             "shadow_days": [],
             "heating_durations": [],
             "cycle_started_at": None,
@@ -728,6 +734,7 @@ class DhwOptimizer:
             "planned_comparison_end": None,
             "planned_comparison_average": None,
             "planned_comparison_intervals": None,
+            "planned_window_completed_at": None,
             "shadow_days": [],
             "heating_durations": [],
             "cycle_started_at": None,
@@ -897,6 +904,7 @@ class DhwOptimizer:
             "planned_comparison_end",
             "planned_comparison_average",
             "planned_comparison_intervals",
+            "planned_window_completed_at",
         ):
             self.state[key] = None
 
@@ -945,6 +953,7 @@ class DhwOptimizer:
         comparison: PriceWindowChoice | None,
     ) -> None:
         self.state["planned_deadline"] = deadline.isoformat()
+        self.state["planned_window_completed_at"] = None
         for prefix, window in (
             ("planned_window", selected),
             ("planned_comparison", comparison or selected),
@@ -953,6 +962,22 @@ class DhwOptimizer:
             self.state[prefix + "_end"] = window.end.isoformat()
             self.state[prefix + "_average"] = format(window.average, "f")
             self.state[prefix + "_intervals"] = window.interval_count
+
+    def _update_preheat_completion(
+        self,
+        now: datetime,
+        observation: DhwObservation,
+        selected: PriceWindowChoice | None,
+    ) -> None:
+        if (
+            selected is None
+            or self.state.get("planned_window_completed_at") is not None
+            or now.astimezone(UTC) < selected.start.astimezone(UTC)
+            or observation.tank_temperature is None
+            or observation.tank_temperature < self.policy.normal_target
+        ):
+            return
+        self.state["planned_window_completed_at"] = now.astimezone(UTC).isoformat()
 
     def _update_learning(self, now: datetime, observation: DhwObservation) -> None:
         local_day = now.astimezone(TALLINN).date().isoformat()
@@ -1076,6 +1101,11 @@ class DhwOptimizer:
                 intervals = published_intervals(self.coordinator)
                 deadline = next_readiness(observed_at, self.policy)
                 planned_window, comparison_window = self._stored_price_plan(deadline)
+                self._update_preheat_completion(
+                    observed_at,
+                    observation,
+                    planned_window,
+                )
                 decision = plan_dhw(
                     now=observed_at,
                     mode=self.mode,
@@ -1088,6 +1118,9 @@ class DhwOptimizer:
                     comparison_window=comparison_window,
                     recovery_latched=self.state["recovery_latched"] is True,
                     recovery_reason=self.state.get("recovery_reason"),
+                    preheat_completed=(
+                        self.state.get("planned_window_completed_at") is not None
+                    ),
                 )
                 if (
                     planned_window is None
@@ -1099,6 +1132,11 @@ class DhwOptimizer:
                         decision.deadline,
                         decision.selected_window,
                         decision.comparison_window,
+                    )
+                    self._update_preheat_completion(
+                        observed_at,
+                        observation,
+                        decision.selected_window,
                     )
                 if (
                     decision.state == "recovery"
@@ -1336,6 +1374,12 @@ class DhwOptimizer:
             "recovery_latched": self.state["recovery_latched"],
             "recovery_reason": self.state["recovery_reason"],
             "price_window_anchored": self.state["planned_window_start"] is not None,
+            "price_window_completed": (
+                self.state["planned_window_completed_at"] is not None
+            ),
+            "price_window_completed_at": self.state[
+                "planned_window_completed_at"
+            ],
             "minimum_target_dwell_minutes": int(
                 MINIMUM_TARGET_DWELL.total_seconds() // 60
             ),

@@ -223,6 +223,83 @@ class DhwOptimizerTests(base.HAComponentTests):
         self.assertNotEqual(after_window.state, "preheat")
         self.assertEqual(after_window.selected_window, initial.selected_window)
 
+    def test_completed_preheat_does_not_reenter_post_window_recovery(self):
+        start = datetime.fromisoformat("2026-10-15T00:00:00+00:00")
+        policy = self.module.DhwPolicy.from_options({"dhw_initial_heat_minutes": 60})
+        prices = self.intervals(
+            start,
+            ["0.40"] * 4 + ["0.10"] * 4 + ["0.40"] * 12,
+        )
+        selected = self.module.PriceWindowChoice(
+            start=start + timedelta(hours=1),
+            end=start + timedelta(hours=2),
+            average=Decimal("0.10"),
+            interval_count=4,
+        )
+        comparison = self.module.PriceWindowChoice(
+            start=start + timedelta(hours=2),
+            end=start + timedelta(hours=3),
+            average=Decimal("0.40"),
+            interval_count=4,
+        )
+        now = start + timedelta(hours=2, minutes=15)
+
+        incomplete = self.module.plan_dhw(
+            now=now,
+            mode=self.const.DHW_MODE_SHADOW,
+            policy=policy,
+            observation=self.observation(tank_temperature=49),
+            intervals=prices,
+            heating_minutes=60,
+            lease_expires=None,
+            planned_window=selected,
+            comparison_window=comparison,
+        )
+        self.assertEqual(incomplete.state, "recovery")
+
+        completed = self.module.plan_dhw(
+            now=now,
+            mode=self.const.DHW_MODE_SHADOW,
+            policy=policy,
+            observation=self.observation(tank_temperature=49),
+            intervals=prices,
+            heating_minutes=60,
+            lease_expires=None,
+            planned_window=selected,
+            comparison_window=comparison,
+            preheat_completed=True,
+        )
+        self.assertEqual(completed.state, "coast")
+        self.assertEqual(completed.desired_target, 45)
+
+    def test_preheat_completion_persists_only_for_the_anchored_deadline(self):
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        deadline = datetime.fromisoformat("2026-10-15T18:00:00+00:00")
+        selected = self.module.PriceWindowChoice(
+            start=deadline - timedelta(hours=4),
+            end=deadline - timedelta(hours=3),
+            average=Decimal("0.10"),
+            interval_count=4,
+        )
+        optimizer._store_price_plan(deadline, selected, selected)
+        optimizer._update_preheat_completion(
+            selected.start + timedelta(minutes=30),
+            self.observation(tank_temperature=50),
+            selected,
+        )
+        completed_at = optimizer.state["planned_window_completed_at"]
+        self.assertIsNotNone(completed_at)
+        optimizer._stored_price_plan(deadline)
+        self.assertEqual(
+            optimizer.state["planned_window_completed_at"],
+            completed_at,
+        )
+
+        optimizer._stored_price_plan(deadline + timedelta(hours=10))
+        self.assertIsNone(optimizer.state["planned_window_completed_at"])
+
     def test_incomplete_prices_and_comfort_floor_override_shifting(self):
         now = datetime.fromisoformat("2026-10-15T00:00:00+00:00")
         incomplete = self.intervals(now, ["0.40"] * 3)

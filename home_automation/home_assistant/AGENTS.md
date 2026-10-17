@@ -64,8 +64,10 @@
   Anchor one cheap and comparison block per readiness cycle; require a material
   all-in-price advantage before 55°C preheat. Missing data and comfort/readiness
   recovery override optimization. Keep recovery latched through measured 50°C,
-  use minimum dwell for ordinary price-driven transitions, and reset promotion
-  evidence whenever a policy revision changes those behaviors.
+  persist successful 50°C completion for the anchored plan so later sensor
+  rounding cannot restart post-window recovery, use minimum dwell for ordinary
+  price-driven transitions, and reset promotion evidence whenever a policy
+  revision changes those behaviors.
 - Treat 30°C as explicitly promoted soft standby, not a comfort or hygiene
   setting. Keep the circuit enabled, never actively cool, never use boost, and
   never hide the HA-outage residual risk. Native DHW standby/off remains out of
@@ -78,12 +80,18 @@
   zero-write until an explicit later pilot. The native LWT offset range is
   -10°C to +10°C, but capability is not permission: primary Shadow candidates
   stay inside the observed -2°C/0°C schedule and +1°C remains a separately
-  reported aggressive candidate. Require complete all-in price coverage, the
+  reported aggressive candidate. Plan only from complete Tallinn delivery days
+  with DST-aware 92/96/100-quarter boundaries; preserve a validated anchored
+  pair until its peak ends. Require complete candidate-day all-in prices, the
   comfort guard, useful heating conditions and DHW compressor priority.
 - Use only explicitly configured, fresh occupied-room temperature entities for
   floor comfort decisions. Require every configured source and use the coldest
   room. The Daikin `IndoorTemperature` reading is from an unheated garage and
   is diagnostic only; never fall back to it when a room source is missing.
+  Continue using a climate entity's measured temperature for comfort while its
+  HVAC is active, but yield price shifting and exclude that period from floor
+  thermal-response evidence. A setpoint change while the HVAC remains off does
+  not by itself invalidate the temperature.
 - Do not infer household surplus from inverter generation, infer appliance kWh
   from aggregate import, or claim floor-heating savings without whole-unit
   energy. Fresh signed net-grid power is required before any solar dispatch.
