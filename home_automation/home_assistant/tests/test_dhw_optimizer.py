@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 import importlib
 import inspect
+import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -468,6 +469,45 @@ class DhwOptimizerTests(base.HAComponentTests):
             self.assertEqual(optimizer.attributes["recent_override_events"], 0)
         finally:
             await optimizer.async_stop()
+
+    def test_price_opportunity_records_one_plan_without_claiming_savings(self):
+        sensor_module = importlib.import_module(base.COMPONENT + ".sensor")
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        now = datetime.fromisoformat("2026-10-15T00:00:00+00:00")
+        decision = self.module.plan_dhw(
+            now=now,
+            mode=self.const.DHW_MODE_SHADOW,
+            policy=self.module.DhwPolicy.from_options(
+                {"dhw_initial_heat_minutes": 60}
+            ),
+            observation=self.observation(),
+            intervals=self.intervals(
+                now, ["0.40"] * 4 + ["0.10"] * 4 + ["0.30"] * 8
+            ),
+            heating_minutes=60,
+            lease_expires=None,
+        )
+        optimizer._record_optimization_opportunity(now, decision)
+        optimizer._record_optimization_opportunity(
+            now + timedelta(minutes=15), decision
+        )
+        optimizer.decision = decision
+
+        sensor = sensor_module.DhwOptimizationOpportunitySensor(
+            optimizer, self.pricing_entry.entry_id
+        )
+        self.assertTrue(sensor.available)
+        self.assertEqual(sensor.native_value, Decimal("0.30"))
+        self.assertEqual(sensor.native_unit_of_measurement, "EUR/kWh")
+        attributes = sensor.extra_state_attributes
+        self.assertEqual(attributes["valuation_status"], "counterfactual")
+        self.assertEqual(attributes["qualified_opportunities_recorded"], 1)
+        self.assertIsNone(attributes["measured_shifted_energy_kwh"])
+        self.assertIsNone(attributes["estimated_savings_eur"])
+        self.assertIsNone(attributes["realized_savings_eur"])
+        self.assertLess(len(json.dumps(attributes)), 2048)
 
     async def test_confirmed_target_write_sets_ownership_and_lease(self):
         optimizer = self.module.DhwOptimizer(

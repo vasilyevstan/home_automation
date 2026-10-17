@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 import importlib
+import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock
@@ -488,6 +489,49 @@ class FloorHeatingShadowTests(base.HAComponentTests):
             )
         finally:
             await shadow.async_stop()
+
+    def test_price_opportunity_records_one_pair_without_claiming_savings(self):
+        entry = self._runtime_entry([])
+        shadow = self.module.FloorHeatingShadow(
+            self.hass,
+            entry,
+            self.coordinator,
+            SimpleNamespace(),
+            None,
+        )
+        delivery_day = date(2026, 10, 17)
+        start, _end = self.module.market_bounds(delivery_day)
+        decision = self.module.plan_floor_heating(
+            now=start,
+            policy=self.policy,
+            observation=self.observation(),
+            intervals=self.delivery_day_intervals(delivery_day),
+        )
+        self.assertTrue(decision.price_gate)
+        shadow.room_temperature_details[
+            "thermal_response_evidence_eligible"
+        ] = True
+        shadow._record_optimization_opportunity(start, decision)
+        shadow._record_optimization_opportunity(
+            start + timedelta(minutes=15), decision
+        )
+        shadow.decision = decision
+
+        sensor = (
+            self.sensor_module.FloorHeatingOptimizationOpportunitySensor(
+                shadow, entry.entry_id
+            )
+        )
+        self.assertTrue(sensor.available)
+        self.assertEqual(sensor.native_value, Decimal("0.30"))
+        self.assertEqual(sensor.native_unit_of_measurement, "EUR/kWh")
+        attributes = sensor.extra_state_attributes
+        self.assertEqual(attributes["valuation_status"], "counterfactual")
+        self.assertEqual(attributes["qualified_opportunities_recorded"], 1)
+        self.assertIsNone(attributes["measured_shifted_energy_kwh"])
+        self.assertIsNone(attributes["estimated_savings_eur"])
+        self.assertIsNone(attributes["realized_savings_eur"])
+        self.assertLess(len(json.dumps(attributes)), 2048)
 
 
 if __name__ == "__main__":

@@ -95,6 +95,11 @@
 - Do not infer household surplus from inverter generation, infer appliance kWh
   from aggregate import, or claim floor-heating savings without whole-unit
   energy. Fresh signed net-grid power is required before any solar dispatch.
+- Record DHW and floor price opportunities in dedicated compact Recorder
+  sensors as EUR per shifted kWh, deduplicated by anchored plan. Never label the
+  spread itself as saved euros. Estimated or realized euros require measured
+  electrical energy attributable to that exact action; confirmed writes alone
+  are insufficient.
 - Huawei control/read transactions must hold the device's `update_lock`, shared
   with its native polling coordinator, not only the API's own per-device lock.
 - HA must be the sole Huawei Modbus client during handover. Keep the old local
