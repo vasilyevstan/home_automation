@@ -566,7 +566,7 @@ The controller uses only canonical published household all-in
 shutdown. Missing current publication is unavailable, not zero and not a reason
 to substitute a forecast.
 
-The fixed revision-1 policy is:
+The fixed revision-2 policy is:
 
 | Setting | Value |
 | --- | --- |
@@ -635,9 +635,28 @@ The mode select initially exposes only:
   sending no Daikin or climate command.
 
 `Armed` exists in the persisted policy but is hidden and rejected until all
-promotion gates are recorded: seven Shadow days, deterministic replay, mobile
-alert delivery, controlled Daikin circuit exercises and controlled climate
-exercises. Passing time alone never promotes it.
+promotion gates are recorded. The observation gate can be satisfied by either
+seven live Shadow days or a deterministic seven-day commissioning replay; a
+naturally occurring €1.50/kWh quarter is not required. Alert delivery, both
+Daikin circuit standby/on exercises, and one exact climate off/restore exercise
+must also succeed through the production guarded writer.
+
+Four one-time commissioning buttons are exposed only in healthy Shadow state:
+
+- Verify the deterministic boundary, warning, comfort, unavailable-input,
+  scheduled-block and ownership-restore replay.
+- Send a persistent and mobile test alert and require the HA notify service to
+  accept it.
+- Exercise DHW and floor circuits one at a time, only with fresh safe state,
+  DHW above 45°C, room-temperature headroom and exact standby/on read-back.
+- Exercise the first allowlisted climate entity by briefly activating its saved
+  cooling state only when the saved target has at least 1°C of no-cooling
+  headroom, then run the exact off/restore path and return it to its original
+  off state.
+
+Every commissioning write is journaled. An uncertain outcome faults without
+retry or rollback, just like a production breaker command. Passing every gate
+only exposes `Armed`; it never selects the mode automatically.
 
 ## Validation
 

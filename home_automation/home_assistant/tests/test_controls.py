@@ -355,12 +355,18 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
                 await self.devices.control_daikin({"operation": "hot_water_target", "value": 51}, None)
         self.assertEqual(self.writes, [("water_heater", "set_temperature")])
 
-    def set_climate_state(self, state="heat"):
+    def set_climate_state(
+        self,
+        state="heat",
+        *,
+        temperature=22,
+        current_temperature=20.5,
+    ):
         self.hass.states.async_set(
             "climate.bedroom",
             state,
             {
-                "temperature": 22,
+                "temperature": temperature,
                 "temperature_unit": "°C",
                 "fan_mode": "auto",
                 "fan_modes": ["auto", "high"],
@@ -372,7 +378,7 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
                 "min_temp": 16,
                 "max_temp": 30,
                 "target_temp_step": 1,
-                "current_temperature": 22.5,
+                "current_temperature": current_temperature,
             },
         )
 
@@ -435,6 +441,47 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
             [call.args[0] for call in self.devices.record.await_args_list],
             ["prepared", "verified", "prepared", "verified"],
         )
+
+    async def test_climate_commissioning_preparation_is_safe_and_confirmed(self):
+        self.set_climate_state("off")
+        original = await self.devices.get_climate_status("climate.bedroom")
+        prepared = await self.devices.prepare_climate_commissioning(
+            "climate.bedroom",
+            original,
+            None,
+        )
+        self.assertTrue(prepared["changed"])
+        self.assertEqual(prepared["confirmed"]["state"], "cool")
+        self.assertEqual(prepared["confirmed"]["temperature"], 22)
+        self.assertEqual(
+            [service for service, _data in self.climate_calls],
+            [
+                "set_temperature",
+                "set_fan_mode",
+                "set_swing_mode",
+                "set_swing_horizontal_mode",
+            ],
+        )
+        self.assertEqual(
+            [call.args[0] for call in self.devices.record.await_args_list],
+            ["prepared", "verified"],
+        )
+
+    async def test_climate_commissioning_requires_cooling_headroom(self):
+        self.set_climate_state(
+            "off",
+            temperature=22,
+            current_temperature=22,
+        )
+        original = await self.devices.get_climate_status("climate.bedroom")
+        with self.assertRaisesRegex(HomeAssistantError, "headroom"):
+            await self.devices.prepare_climate_commissioning(
+                "climate.bedroom",
+                original,
+                None,
+            )
+        self.assertEqual(self.climate_calls, [])
+        self.devices.record.assert_not_awaited()
 
     async def test_climate_external_change_blocks_control_before_dispatch(self):
         self.set_climate_state()

@@ -276,6 +276,14 @@ class ExtremePriceProtectionTests(base.HAComponentTests):
         self.assertEqual(decision.active_block.threshold, Decimal("1.5"))
         self.assertEqual(decision.state, "critical")
 
+    def test_deterministic_commissioning_replay_covers_rare_event_paths(self):
+        receipt = self.module.verify_commissioning_replay()
+        self.assertTrue(receipt["verified"])
+        self.assertEqual(receipt["coverage_days"], 7)
+        self.assertEqual(receipt["scenario_count"], 8)
+        self.assertIn("hard_stop_boundary", receipt["scenarios"])
+        self.assertIn("ownership_restore", receipt["scenarios"])
+
     def runtime_status(self, *, water="on", heating="on"):
         flags = {
             name: False
@@ -324,6 +332,7 @@ class ExtremePriceProtectionTests(base.HAComponentTests):
             "fresh": True,
             "reason": None,
             "state": state,
+            "current_temperature": 20,
             "temperature": 22,
             "temperature_unit": "°C",
             "fan_mode": "auto",
@@ -718,6 +727,161 @@ class ExtremePriceProtectionTests(base.HAComponentTests):
         self.assertEqual(
             devices.control_daikin.await_args_list[0].args[0],
             {"operation": "hot_water_enabled", "value": True},
+        )
+
+    async def test_commissioning_replay_can_replace_uneventful_live_days(self):
+        protection = self.runtime(SimpleNamespace())
+        await protection.async_verify_commissioning_replay()
+        self.assertTrue(protection.state["replay_verified"])
+        self.assertEqual(protection.state["replay_coverage_days"], 7)
+        self.assertTrue(protection.observation_qualified)
+        self.assertFalse(protection.armed_ready)
+        protection.state.update(
+            alert_delivery_verified=True,
+            daikin_exercises_verified=True,
+            climate_exercises_verified=True,
+        )
+        self.assertTrue(protection.armed_ready)
+        self.assertIn(
+            self.const.EXTREME_PRICE_MODE_ARMED,
+            protection.available_modes,
+        )
+        with patch.object(
+            protection,
+            "async_evaluate",
+            new=AsyncMock(),
+        ):
+            await protection.async_set_mode(
+                self.const.EXTREME_PRICE_MODE_ARMED
+            )
+        self.assertEqual(
+            protection.mode,
+            self.const.EXTREME_PRICE_MODE_ARMED,
+        )
+
+    async def test_alert_commissioning_records_service_acceptance(self):
+        protection = self.runtime(SimpleNamespace())
+        delivered = []
+
+        async def notify(call):
+            delivered.append(dict(call.data))
+
+        self.hass.services.async_register(
+            "notify",
+            self.module.MOBILE_NOTIFY_SERVICE,
+            notify,
+        )
+        await protection.async_verify_alert_delivery()
+        self.assertTrue(protection.state["alert_delivery_verified"])
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(
+            protection.state["commissioning_evidence"][
+                "alert_delivery"
+            ]["basis"],
+            "home_assistant_service_accepted",
+        )
+
+    async def test_daikin_commissioning_exercises_each_circuit_and_restores(self):
+        status = self.runtime_status()
+        self.hass.states.async_set(
+            "climate.bedroom",
+            "off",
+            {
+                "current_temperature": 22,
+                "temperature_unit": "°C",
+            },
+        )
+
+        async def control_daikin(request, _context):
+            operation = request["operation"]
+            value = request["value"]
+            if operation == "hot_water_enabled":
+                status["hot_water"]["operations"]["Power"] = (
+                    "on" if value else "standby"
+                )
+            else:
+                status["heating"]["operations"]["Power"] = (
+                    "on" if value else "standby"
+                )
+            return {
+                "changed": True,
+                "confirmed": "on" if value else "standby",
+            }
+
+        devices = SimpleNamespace(
+            get_daikin_status=AsyncMock(side_effect=lambda: status),
+            get_climate_status=AsyncMock(
+                return_value=self.climate_snapshot("off")
+            ),
+            control_daikin=AsyncMock(side_effect=control_daikin),
+        )
+        protection = self.runtime(devices)
+        await protection.async_exercise_daikin()
+        self.assertTrue(protection.state["daikin_exercises_verified"])
+        self.assertEqual(
+            [
+                (call.args[0]["operation"], call.args[0]["value"])
+                for call in devices.control_daikin.await_args_list
+            ],
+            [
+                ("hot_water_enabled", False),
+                ("hot_water_enabled", True),
+                ("heating_enabled", False),
+                ("heating_enabled", True),
+            ],
+        )
+        self.assertEqual(
+            status["hot_water"]["operations"]["Power"],
+            "on",
+        )
+        self.assertEqual(
+            status["heating"]["operations"]["Power"],
+            "on",
+        )
+
+    async def test_climate_commissioning_exercises_restore_and_returns_off(self):
+        active = self.climate_snapshot("cool")
+        off = self.climate_snapshot("off")
+
+        async def control_climate(request, _context):
+            if request["operation"] == "restore":
+                return {
+                    "changed": True,
+                    "confirmed": request["restore_state"],
+                }
+            return {"changed": True, "confirmed": off}
+
+        devices = SimpleNamespace(
+            get_climate_status=AsyncMock(return_value=off),
+            prepare_climate_commissioning=AsyncMock(
+                return_value={
+                    "changed": True,
+                    "previous": off,
+                    "confirmed": active,
+                }
+            ),
+            control_climate=AsyncMock(side_effect=control_climate),
+        )
+        floor = SimpleNamespace(set_external_influence=Mock())
+        protection = self.runtime(devices, floor=floor)
+        await protection.async_exercise_climate()
+        self.assertTrue(protection.state["climate_exercises_verified"])
+        self.assertFalse(
+            protection.state["thermal_contamination_active"]
+        )
+        self.assertEqual(devices.control_climate.await_count, 3)
+        self.assertEqual(
+            [
+                call.args[0]["operation"]
+                for call in devices.control_climate.await_args_list
+            ],
+            ["turn_off", "restore", "turn_off"],
+        )
+        self.assertEqual(
+            protection.state["commissioning_evidence"]["climate"][
+                "final_state"
+            ],
+            "off",
         )
 
     async def test_armed_mode_is_not_exposed_before_promotion_gates(self):

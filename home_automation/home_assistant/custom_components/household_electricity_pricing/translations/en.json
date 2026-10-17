@@ -37,7 +37,7 @@
     "step": {
       "init": {
         "title": "Heating price optimizers",
-        "description": "Configure the deterministic Daikin target policy, floor Shadow room sources, and the explicit climate allowlist for extreme-price protection. Saving options does not enable writes; all new protection remains in Shadow until explicitly promoted. {error}",
+        "description": "Configure the deterministic Daikin target policy, floor Shadow room sources, and the explicit climate allowlist for extreme-price protection. Saving options does not enable writes; protection remains in Shadow until replay or observation, alert delivery, and guarded device commissioning are verified and Armed is explicitly selected. {error}",
         "data": {
           "dhw_morning_ready": "Morning readiness time (HH:MM, Europe/Tallinn)",
           "dhw_evening_ready": "Evening readiness time (HH:MM, Europe/Tallinn)",

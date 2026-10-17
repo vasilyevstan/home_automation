@@ -146,6 +146,9 @@ class EnergyDevices:
                 )
             ),
             "state": state.state if available else None,
+            "current_temperature": finite(
+                attributes.get("current_temperature")
+            ),
             "temperature": finite(attributes.get("temperature")),
             "temperature_unit": attributes.get("temperature_unit"),
             "fan_mode": attributes.get("fan_mode"),
@@ -170,6 +173,135 @@ class EnergyDevices:
     async def get_climate_status(self, entity_id: str) -> dict:
         async with self.climate_lock:
             return self._climate_status(entity_id)
+
+    async def prepare_climate_commissioning(
+        self,
+        entity_id: str,
+        expected: dict,
+        context: Context | None,
+    ) -> dict:
+        if not isinstance(expected, dict):
+            raise HomeAssistantError(
+                "Climate commissioning needs an expected off-state snapshot."
+            )
+        async with self.climate_lock, asyncio.timeout(30):
+            previous = self._climate_status(entity_id)
+            if not previous.get("available") or not previous.get("fresh"):
+                raise HomeAssistantError(
+                    previous.get("reason")
+                    or "Fresh climate state is unavailable; no command was sent."
+                )
+            if not self._climate_state_matches(previous, expected):
+                raise HomeAssistantError(
+                    "The climate state changed; read it again before commissioning."
+                )
+            if previous.get("state") != "off":
+                raise HomeAssistantError(
+                    "Climate commissioning preparation requires the unit to be off."
+                )
+            if "cool" not in previous.get("hvac_modes", ()):
+                raise HomeAssistantError(
+                    "Climate commissioning requires a supported cooling mode."
+                )
+            target = previous.get("temperature")
+            current = previous.get("current_temperature")
+            if target is None or current is None or target < current + 1:
+                raise HomeAssistantError(
+                    "The saved cooling target needs at least 1°C headroom so "
+                    "commissioning does not request compressor cooling."
+                )
+            requested = {**previous, "state": "cool"}
+            self._validate_climate_restore(previous, requested)
+            record = {
+                "request_id": str(uuid4()),
+                "device": "climate:" + entity_id,
+                "operation": "commissioning_prepare",
+                "previous": previous,
+                "requested": {
+                    key: requested.get(key)
+                    for key in (
+                        "state",
+                        "temperature",
+                        "temperature_unit",
+                        "fan_mode",
+                        "swing_mode",
+                        "swing_horizontal_mode",
+                    )
+                },
+                "confirmation_basis": "home_assistant_cloud_reported_state",
+            }
+            await self.record("prepared", record)
+            try:
+                await self._call_climate(
+                    "set_temperature",
+                    {
+                        "entity_id": entity_id,
+                        "hvac_mode": requested["state"],
+                        "temperature": target,
+                    },
+                    context,
+                )
+                for service, key in (
+                    ("set_fan_mode", "fan_mode"),
+                    ("set_swing_mode", "swing_mode"),
+                    (
+                        "set_swing_horizontal_mode",
+                        "swing_horizontal_mode",
+                    ),
+                ):
+                    value = requested.get(key)
+                    if value is not None:
+                        await self._call_climate(
+                            service,
+                            {"entity_id": entity_id, key: value},
+                            context,
+                        )
+                for attempt in range(4):
+                    confirmed = self._climate_status(entity_id)
+                    if (
+                        confirmed.get("fresh")
+                        and self._climate_state_matches(
+                            confirmed,
+                            requested,
+                        )
+                    ):
+                        await self.record(
+                            "verified",
+                            {**record, "confirmed": confirmed},
+                        )
+                        return {
+                            "changed": True,
+                            "previous": previous,
+                            "confirmed": confirmed,
+                        }
+                    if attempt < 3:
+                        await asyncio.sleep(1)
+                raise HomeAssistantError(
+                    "Fresh cloud-reported climate state did not confirm "
+                    "commissioning preparation."
+                )
+            except asyncio.CancelledError:
+                LOGGER.error(
+                    "Climate commissioning was cancelled after dispatch began; "
+                    "its prepared journal record remains uncertain."
+                )
+                raise
+            except (HomeAssistantError, TimeoutError, OSError) as error:
+                LOGGER.error(
+                    "Climate commissioning outcome is uncertain; read fresh "
+                    "state before any retry or restoration."
+                )
+                try:
+                    await self.record("uncertain", record)
+                except OSError:
+                    LOGGER.exception(
+                        "Could not persist the uncertain climate outcome."
+                    )
+                raise HomeAssistantError(
+                    "The climate commissioning command may have applied. Read "
+                    "fresh state before any retry or restoration; no automatic "
+                    "retry or rollback was performed."
+                ) from error
 
     @staticmethod
     def _climate_state_matches(current: dict, expected: dict) -> bool:

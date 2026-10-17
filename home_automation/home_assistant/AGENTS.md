@@ -106,8 +106,17 @@
   €2/kWh alert severity, €0.50/kWh-for-two-hours warning, two-hour maximum
   lease, DHW 45°C/readiness exits and 20.5°C coldest-room floor restore guard.
 - Extreme-price installation and option saves default to Shadow. Do not expose
-  or accept Armed until seven Shadow days, deterministic replay, alert delivery
-  and controlled Daikin/climate exercises are all explicitly verified.
+  or accept Armed until observation is qualified by seven live Shadow days or
+  the deterministic seven-day commissioning replay, and alert delivery plus
+  controlled Daikin/climate exercises are explicitly verified. A natural
+  €1.50/kWh event is not a promotion prerequisite, and passing gates must never
+  select Armed automatically.
+- Keep commissioning on the production guarded writer. Daikin exercises require
+  fresh safe state, DHW above 45°C, room headroom, and exact standby/on
+  read-back. Climate commissioning may briefly prepare one allowlisted unit only
+  from fresh off state with at least 1°C no-cooling target headroom, must exercise
+  exact off/restore, and must return the unit to off. Journal every dispatched
+  step; any uncertain result faults without retry or rollback.
 - Treat every breaker write as a separate non-atomic operation. Persist exact
   per-load ownership, prior state, block identity and lease; restore only a
   load still matching breaker-owned standby/off state. Manual or external
