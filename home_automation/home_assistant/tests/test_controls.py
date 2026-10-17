@@ -106,9 +106,9 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
                 ws_connection=SimpleNamespace(request=AsyncMock(side_effect=resource)),
                 climate_control=SimpleNamespace(unit=SimpleNamespace(operation_config={
                     "LeavingWaterTemperatureOffsetHeating": self.offset_profile,
-                    "Power": {"settable": True},
+                    "Power": ["on", "standby"],
                 })),
-                hot_water_tank=SimpleNamespace(unit=SimpleNamespace(operation_config={"Power": {"settable": True}})),
+                hot_water_tank=SimpleNamespace(unit=SimpleNamespace(operation_config={"Power": ["on", "standby"]})),
             ),
         )
         self.devices.daikin_api = Mock(return_value=(SimpleNamespace(entry_id="daikin"), self.daikin))
@@ -278,6 +278,17 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(operation=operation, value=value), self.assertRaises(HomeAssistantError):
                 await self.devices.control_daikin({"operation": operation, "value": value}, None)
+        self.assertEqual(self.writes, [])
+
+    async def test_daikin_power_capability_requires_advertised_value_list(self):
+        self.daikin.device.hot_water_tank.unit.operation_config["Power"] = {
+            "settable": True
+        }
+        with self.assertRaisesRegex(HomeAssistantError, "not settable"):
+            await self.devices.control_daikin(
+                {"operation": "hot_water_enabled", "value": False},
+                None,
+            )
         self.assertEqual(self.writes, [])
 
     async def test_daikin_requires_all_known_inactive_flags(self):

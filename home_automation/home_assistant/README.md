@@ -651,7 +651,8 @@ Four one-time commissioning buttons are exposed only in healthy Shadow state:
   DHW at or above 46°C, no active readiness lead-time window, room-temperature
   headroom and exact standby/on read-back. The Shadow optimizer's broader 50°C
   recovery latch still protects production decisions but does not replace these
-  stricter commissioning-specific preconditions.
+  stricter commissioning-specific preconditions. Validate native circuit power
+  writes against PyAltherma's advertised `["on", "standby"]` operation list.
 - Exercise the first allowlisted climate entity by briefly activating its saved
   cooling state only when the saved target has at least 1°C of no-cooling
   headroom. The writer prepares the exact target, fan and swing settings while

@@ -798,7 +798,7 @@ class EnergyDevices:
                 selected = water if operation == "hot_water_enabled" else heating
                 controller = api.device.hot_water_tank if operation == "hot_water_enabled" else api.device.climate_control
                 profile = controller.unit.operation_config.get(native_key)
-                if not profile or profile.get("settable") is not True:
+                if not isinstance(profile, list) or requested not in profile:
                     raise HomeAssistantError("The native circuit enable operation is not settable.")
                 if operation == "hot_water_enabled":
                     target = self.entity(entry.entry_id, "water_heater")

@@ -115,7 +115,9 @@
   fresh safe state, DHW at or above 46°C, no active readiness lead-time window,
   room headroom, and exact standby/on read-back. Do not let the Shadow
   optimizer's broader recovery latch replace those commissioning-specific
-  checks. Climate commissioning may briefly prepare one allowlisted unit only
+  checks. PyAltherma advertises circuit `Power` as an allowed-value list, not a
+  numeric-style `settable` profile; validate `on`/`standby` membership before a
+  write. Climate commissioning may briefly prepare one allowlisted unit only
   from fresh off state with at least 1°C no-cooling target headroom. Configure
   its exact target, fan and swing settings while it remains off, explicitly
   activate the saved HVAC mode, exercise exact off/restore, and return the unit
