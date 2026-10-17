@@ -77,6 +77,24 @@ class ExtremePriceProtectionTests(base.HAComponentTests):
         )
         self.assertIn("1.5|", exact.active_block.identity)
 
+    def test_future_hard_stop_block_is_published_before_it_starts(self):
+        start = datetime.fromisoformat("2026-10-17T00:00:00+00:00")
+        decision = self.plan(
+            values=["0.2", "1.5", "1.8"],
+            now=start,
+        )
+        self.assertEqual(decision.state, "scheduled")
+        self.assertIsNone(decision.active_block)
+        self.assertEqual(
+            decision.next_hard_block.start,
+            start + timedelta(minutes=15),
+        )
+        self.assertEqual(
+            decision.attributes()["next_hard_block_end"],
+            (start + timedelta(minutes=45)).isoformat(),
+        )
+        self.assertIn("scheduled", decision.reason)
+
     def test_warning_requires_two_contiguous_hours(self):
         short = self.plan(values=["0.5"] * 7 + ["0.1"])
         self.assertIsNone(short.warning_block)

@@ -147,6 +147,7 @@ class ProtectionDecision:
     data_complete: bool
     actions: tuple[ProtectionAction, ...]
     partial: bool
+    next_hard_block: PriceBlock | None = None
 
     def attributes(self) -> dict:
         result = {
@@ -177,6 +178,20 @@ class ProtectionDecision:
             )
         else:
             result.update(self.active_block.attributes("active_block"))
+        if self.next_hard_block is None:
+            result.update(
+                {
+                    "next_hard_block_id": None,
+                    "next_hard_block_start": None,
+                    "next_hard_block_end": None,
+                    "next_hard_block_maximum_eur_kwh": None,
+                    "next_hard_block_duration_minutes": None,
+                }
+            )
+        else:
+            result.update(
+                self.next_hard_block.attributes("next_hard_block")
+            )
         if self.warning_block is None:
             result.update(
                 {
@@ -291,6 +306,10 @@ def plan_extreme_price_protection(
     warning_threshold = Decimal(str(EXTREME_PRICE_WARNING_EUR_KWH))
     hard_blocks = contiguous_price_blocks(prices, hard_threshold)
     warning_blocks = contiguous_price_blocks(prices, warning_threshold)
+    next_hard = next(
+        (block for block in hard_blocks if block.end > now),
+        None,
+    )
     active = _active_block(now, hard_blocks)
     warning = _next_warning_block(
         now,
@@ -317,6 +336,7 @@ def plan_extreme_price_protection(
             current is not None,
             (),
             False,
+            next_hard,
         )
 
     actions = []
@@ -348,6 +368,12 @@ def plan_extreme_price_protection(
                 f"€{EXTREME_PRICE_WARNING_EUR_KWH:g}/kWh lasts at least "
                 f"{EXTREME_PRICE_WARNING_MINUTES // 60} hours."
             )
+        elif next_hard is not None:
+            state = "scheduled"
+            reason = (
+                "A published catastrophic-price block is scheduled; "
+                "no shutdown is proposed before it begins."
+            )
         else:
             state = "clear"
             reason = (
@@ -364,6 +390,7 @@ def plan_extreme_price_protection(
             current is not None,
             tuple(actions),
             current is None and bool(owned),
+            next_hard,
         )
 
     block_id = active.identity
@@ -712,6 +739,7 @@ def plan_extreme_price_protection(
         True,
         tuple(actions),
         partial,
+        next_hard,
     )
 
 
@@ -1069,6 +1097,7 @@ class ExtremePriceProtection:
             and previous.state == decision.state
             and previous.reason == decision.reason
             and previous.active_block == decision.active_block
+            and previous.next_hard_block == decision.next_hard_block
             and previous.warning_block == decision.warning_block
             and previous.actions == decision.actions
         ):
@@ -1086,6 +1115,11 @@ class ExtremePriceProtection:
             "active_block_id": (
                 decision.active_block.identity
                 if decision.active_block is not None
+                else None
+            ),
+            "next_hard_block_id": (
+                decision.next_hard_block.identity
+                if decision.next_hard_block is not None
                 else None
             ),
             "partial_shutdown": decision.partial,
