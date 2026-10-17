@@ -64,6 +64,7 @@ LOAD_HOT_WATER = "daikin_hot_water"
 LOAD_FLOOR_HEATING = "daikin_floor_heating"
 COMMISSIONING_REPLAY_DAYS = 7
 COMMISSIONING_MIN_TANK_C = 46
+CLIMATE_COMMISSIONING_DWELL_SECONDS = 10
 
 
 def _number(value: object) -> float | None:
@@ -2054,6 +2055,7 @@ class ExtremePriceProtection:
                 active = prepared["confirmed"]
                 self.state["thermal_contamination_active"] = True
                 self._sync_floor_contamination()
+                await asyncio.sleep(CLIMATE_COMMISSIONING_DWELL_SECONDS)
 
                 stopped = await self.devices.control_climate(
                     {
@@ -2068,6 +2070,7 @@ class ExtremePriceProtection:
                         "The controlled climate stop was not confirmed."
                     )
                 off = stopped["confirmed"]
+                await asyncio.sleep(CLIMATE_COMMISSIONING_DWELL_SECONDS)
 
                 restored = await self.devices.control_climate(
                     {
@@ -2082,6 +2085,7 @@ class ExtremePriceProtection:
                     raise HomeAssistantError(
                         "The controlled climate restore was not confirmed."
                     )
+                await asyncio.sleep(CLIMATE_COMMISSIONING_DWELL_SECONDS)
 
                 returned_off = await self.devices.control_climate(
                     {
@@ -2119,10 +2123,16 @@ class ExtremePriceProtection:
                 "initial_state": "off",
                 "exercise_sequence": [
                     "commissioning_prepare",
+                    "stabilization_dwell",
                     "turn_off",
+                    "stabilization_dwell",
                     "restore",
+                    "stabilization_dwell",
                     "turn_off",
                 ],
+                "stabilization_dwell_seconds": (
+                    CLIMATE_COMMISSIONING_DWELL_SECONDS
+                ),
                 "final_state": "off",
                 "confirmation_basis": (
                     "home_assistant_cloud_reported_state"

@@ -117,8 +117,9 @@
   from fresh off state with at least 1°C no-cooling target headroom. Configure
   its exact target, fan and swing settings while it remains off, explicitly
   activate the saved HVAC mode, exercise exact off/restore, and return the unit
-  to off. Journal every dispatched step; any uncertain result faults without
-  retry or rollback.
+  to off. Keep the bounded stabilization dwell between commissioning power
+  transitions. Journal every dispatched step and the underlying failure cause;
+  any uncertain result faults without retry or rollback.
 - Treat every breaker write as a separate non-atomic operation. Persist exact
   per-load ownership, prior state, block identity and lease; restore only a
   load still matching breaker-owned standby/off state. Manual or external

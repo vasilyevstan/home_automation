@@ -864,10 +864,25 @@ class ExtremePriceProtectionTests(base.HAComponentTests):
         )
         floor = SimpleNamespace(set_external_influence=Mock())
         protection = self.runtime(devices, floor=floor)
-        await protection.async_exercise_climate()
+        with patch.object(
+            self.module.asyncio,
+            "sleep",
+            new=AsyncMock(),
+        ) as sleep:
+            await protection.async_exercise_climate()
         self.assertTrue(protection.state["climate_exercises_verified"])
         self.assertFalse(
             protection.state["thermal_contamination_active"]
+        )
+        self.assertEqual(sleep.await_count, 3)
+        self.assertTrue(
+            all(
+                call.args
+                == (
+                    self.module.CLIMATE_COMMISSIONING_DWELL_SECONDS,
+                )
+                for call in sleep.await_args_list
+            )
         )
         self.assertEqual(devices.control_climate.await_count, 3)
         self.assertEqual(
@@ -882,6 +897,12 @@ class ExtremePriceProtectionTests(base.HAComponentTests):
                 "final_state"
             ],
             "off",
+        )
+        self.assertEqual(
+            protection.state["commissioning_evidence"]["climate"][
+                "stabilization_dwell_seconds"
+            ],
+            self.module.CLIMATE_COMMISSIONING_DWELL_SECONDS,
         )
 
     async def test_armed_mode_is_not_exposed_before_promotion_gates(self):
