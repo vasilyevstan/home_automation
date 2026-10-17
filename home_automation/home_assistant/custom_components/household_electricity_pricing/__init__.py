@@ -14,6 +14,8 @@ from homeassistant.helpers.typing import ConfigType
 
 from .const import (
     CONF_DAIKIN_ENTRY,
+    CONF_EXTREME_PRICE_CLIMATE_ENTITIES,
+    CONF_FLOOR_INDOOR_TEMPERATURE_ENTITIES,
     CONF_SOLAR_ENTRY,
     DOMAIN,
     SERVICE_GET_PRICE_FORECAST,
@@ -23,6 +25,7 @@ from .calculation_api import CALCULATION_FIELDS
 from .controls import EnergyDevices, HomeEnergyDeviceAPI
 from .coordinator import HouseholdPriceCoordinator
 from .dhw_optimizer import DhwOptimizer
+from .extreme_price_protection import ExtremePriceProtection
 from .floor_heating_shadow import FloorHeatingShadow
 from .price_forecast import HouseholdPriceForecastCoordinator
 from .price_api import HouseholdPriceAPI
@@ -108,7 +111,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.runtime_data = coordinator
     forecast = HouseholdPriceForecastCoordinator(hass, entry, coordinator)
     await forecast.async_load()
-    devices = EnergyDevices(hass, entry.data)
+    configured_climates = entry.options.get(
+        CONF_EXTREME_PRICE_CLIMATE_ENTITIES
+    )
+    if not configured_climates:
+        configured_climates = [
+            entity_id
+            for entity_id in entry.options.get(
+                CONF_FLOOR_INDOOR_TEMPERATURE_ENTITIES,
+                (),
+            )
+            if isinstance(entity_id, str)
+            and entity_id.startswith("climate.")
+        ]
+    devices = EnergyDevices(
+        hass,
+        {
+            **entry.data,
+            CONF_EXTREME_PRICE_CLIMATE_ENTITIES: configured_climates,
+        },
+    )
     optimizer = (
         DhwOptimizer(hass, entry, coordinator, devices)
         if entry.data.get(CONF_DAIKIN_ENTRY) else None
@@ -117,12 +139,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         FloorHeatingShadow(hass, entry, coordinator, devices, optimizer)
         if optimizer else None
     )
+    extreme_protection = (
+        ExtremePriceProtection(
+            hass,
+            entry,
+            coordinator,
+            devices,
+            optimizer,
+            floor_shadow,
+        )
+        if optimizer else None
+    )
     runtime = {
         "coordinator": coordinator,
         "forecast": forecast,
         "devices": devices,
         "optimizer": optimizer,
         "floor_shadow": floor_shadow,
+        "extreme_protection": extreme_protection,
         "platforms": PLATFORMS if optimizer else ["sensor"],
     }
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = runtime
@@ -130,6 +164,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await optimizer.async_start()
     if floor_shadow:
         await floor_shadow.async_start()
+    if extreme_protection:
+        await extreme_protection.async_start()
     await hass.config_entries.async_forward_entry_setups(entry, runtime["platforms"])
     entry.async_on_unload(ha_llm.async_register_api(hass, HouseholdPriceAPI(hass, coordinator)))
     if entry.data.get(CONF_SOLAR_ENTRY) or entry.data.get(CONF_DAIKIN_ENTRY):
@@ -152,6 +188,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     forecast = runtime.get("forecast")
     if forecast:
         await forecast.async_shutdown()
+    extreme_protection = runtime.get("extreme_protection")
+    if extreme_protection:
+        await extreme_protection.async_stop()
     floor_shadow = runtime.get("floor_shadow")
     if floor_shadow:
         await floor_shadow.async_stop()

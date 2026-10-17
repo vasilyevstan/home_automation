@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import json
 import logging
+import math
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -16,12 +17,20 @@ import aiohttp
 import probatio
 
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.core import HomeAssistant
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.core import Context, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry, llm
 from homeassistant.helpers.llm import LLMContext, ToolAnnotations, ToolInput, ToolResult
+from homeassistant.util import dt as dt_util
 
-from .const import CONF_DAIKIN_ENTRY, CONF_SOLAR_ENTRY, CONTROL_API_ID, DOMAIN
+from .const import (
+    CONF_DAIKIN_ENTRY,
+    CONF_EXTREME_PRICE_CLIMATE_ENTITIES,
+    CONF_SOLAR_ENTRY,
+    CONTROL_API_ID,
+    DOMAIN,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -58,8 +67,15 @@ class EnergyDevices:
         self.hass = hass
         self.solar_entry = options.get(CONF_SOLAR_ENTRY)
         self.daikin_entry = options.get(CONF_DAIKIN_ENTRY)
+        climate_entities = options.get(CONF_EXTREME_PRICE_CLIMATE_ENTITIES, ())
+        self.climate_entities = frozenset(
+            item
+            for item in climate_entities
+            if isinstance(item, str) and item.startswith("climate.")
+        )
         self.solar_lock = asyncio.Lock()
         self.daikin_lock = asyncio.Lock()
+        self.climate_lock = asyncio.Lock()
         self.journal = Path(hass.config.path(".storage/home_energy_control.jsonl"))
 
     def entry(self, identifier, domain):
@@ -73,6 +89,315 @@ class EnergyDevices:
             append_record, self.journal,
             {**record, "event": event, "observed_at": datetime.now(timezone.utc).isoformat()},
         )
+
+    def _climate_identity(self, entity_id: str) -> dict:
+        registry = entity_registry.async_get(self.hass)
+        try:
+            registry_entry = registry.async_get(entity_id)
+        except AttributeError:
+            registry_entry = None
+        return {
+            "entity_id": entity_id,
+            "platform": (
+                registry_entry.platform if registry_entry is not None else None
+            ),
+            "unique_id": (
+                registry_entry.unique_id if registry_entry is not None else None
+            ),
+        }
+
+    def _climate_status(self, entity_id: str) -> dict:
+        if entity_id not in self.climate_entities:
+            raise HomeAssistantError(
+                "The climate entity is not in the explicit extreme-price allowlist."
+            )
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return {
+                "entity_id": entity_id,
+                "identity": self._climate_identity(entity_id),
+                "available": False,
+                "fresh": False,
+                "reason": "The climate entity is missing.",
+            }
+        observed_at = getattr(state, "last_reported", None) or state.last_updated
+        age = dt_util.utcnow() - observed_at.astimezone(timezone.utc)
+        available = state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE)
+        attributes = state.attributes
+
+        def finite(value):
+            if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+                return None
+            result = float(value)
+            return result if math.isfinite(result) else None
+
+        return {
+            "entity_id": entity_id,
+            "identity": self._climate_identity(entity_id),
+            "available": available,
+            "fresh": available and age <= timedelta(minutes=30),
+            "reason": (
+                None
+                if available and age <= timedelta(minutes=30)
+                else (
+                    "The climate entity is unavailable."
+                    if not available
+                    else "The climate entity state is stale."
+                )
+            ),
+            "state": state.state if available else None,
+            "temperature": finite(attributes.get("temperature")),
+            "temperature_unit": attributes.get("temperature_unit"),
+            "fan_mode": attributes.get("fan_mode"),
+            "swing_mode": attributes.get("swing_mode"),
+            "swing_horizontal_mode": attributes.get("swing_horizontal_mode"),
+            "hvac_modes": list(attributes.get("hvac_modes") or ()),
+            "fan_modes": list(attributes.get("fan_modes") or ()),
+            "swing_modes": list(attributes.get("swing_modes") or ()),
+            "swing_horizontal_modes": list(
+                attributes.get("swing_horizontal_modes") or ()
+            ),
+            "minimum_temperature": finite(attributes.get("min_temp")),
+            "maximum_temperature": finite(attributes.get("max_temp")),
+            "target_temperature_step": finite(
+                attributes.get("target_temp_step")
+            ),
+            "observed_at": observed_at.isoformat(),
+            "confirmation_basis": "home_assistant_cloud_reported_state",
+            "physical_hvac_state_verified": False,
+        }
+
+    async def get_climate_status(self, entity_id: str) -> dict:
+        async with self.climate_lock:
+            return self._climate_status(entity_id)
+
+    @staticmethod
+    def _climate_state_matches(current: dict, expected: dict) -> bool:
+        if current.get("identity") != expected.get("identity"):
+            return False
+        for key in (
+            "state",
+            "temperature",
+            "temperature_unit",
+            "fan_mode",
+            "swing_mode",
+            "swing_horizontal_mode",
+        ):
+            if current.get(key) != expected.get(key):
+                return False
+        return True
+
+    def _validate_climate_restore(self, current: dict, requested: dict) -> None:
+        mode = requested.get("state")
+        if not isinstance(mode, str) or mode == "off":
+            raise HomeAssistantError(
+                "A climate restore needs the exact prior active HVAC mode."
+            )
+        if mode not in current.get("hvac_modes", ()):
+            raise HomeAssistantError(
+                "The prior climate HVAC mode is no longer supported."
+            )
+        if requested.get("temperature_unit") != current.get("temperature_unit"):
+            raise HomeAssistantError(
+                "The climate temperature unit changed; restoration is blocked."
+            )
+        temperature = requested.get("temperature")
+        if temperature is not None:
+            minimum = current.get("minimum_temperature")
+            maximum = current.get("maximum_temperature")
+            step = current.get("target_temperature_step") or 1
+            if minimum is None or maximum is None:
+                raise HomeAssistantError(
+                    "The climate target-temperature capability is unavailable."
+                )
+            number(
+                temperature,
+                "Climate target temperature",
+                minimum,
+                maximum,
+                step,
+            )
+        for key, capability_key, label in (
+            ("fan_mode", "fan_modes", "fan mode"),
+            ("swing_mode", "swing_modes", "swing mode"),
+            (
+                "swing_horizontal_mode",
+                "swing_horizontal_modes",
+                "horizontal swing mode",
+            ),
+        ):
+            value = requested.get(key)
+            if value is not None and value not in current.get(capability_key, ()):
+                raise HomeAssistantError(
+                    f"The prior climate {label} is no longer supported."
+                )
+
+    async def _call_climate(
+        self,
+        service: str,
+        data: dict,
+        context: Context | None,
+    ) -> None:
+        await self.hass.services.async_call(
+            "climate",
+            service,
+            data,
+            blocking=True,
+            context=context,
+        )
+
+    async def control_climate(
+        self,
+        args: dict,
+        context: Context | None,
+    ) -> dict:
+        entity_id = args.get("entity_id")
+        operation = args.get("operation")
+        expected = args.get("expected")
+        if (
+            not isinstance(entity_id, str)
+            or operation not in ("turn_off", "restore")
+            or not isinstance(expected, dict)
+        ):
+            raise HomeAssistantError(
+                "Climate control needs an allowlisted entity, operation and expected state."
+            )
+        async with self.climate_lock, asyncio.timeout(30):
+            previous = self._climate_status(entity_id)
+            if not previous.get("available") or not previous.get("fresh"):
+                raise HomeAssistantError(
+                    previous.get("reason")
+                    or "Fresh climate state is unavailable; no command was sent."
+                )
+            if not self._climate_state_matches(previous, expected):
+                raise HomeAssistantError(
+                    "The climate state changed; read it again before requesting control."
+                )
+            if operation == "turn_off" and previous.get("state") == "off":
+                return {
+                    "changed": False,
+                    "previous": previous,
+                    "confirmed": previous,
+                }
+            requested = args.get("restore_state")
+            if operation == "restore":
+                if previous.get("state") != "off" or not isinstance(requested, dict):
+                    raise HomeAssistantError(
+                        "Climate restoration requires breaker-owned off state and a prior snapshot."
+                    )
+                if previous.get("identity") != requested.get("identity"):
+                    raise HomeAssistantError(
+                        "The climate entity identity changed; restoration is blocked."
+                    )
+                self._validate_climate_restore(previous, requested)
+            record = {
+                "request_id": str(uuid4()),
+                "device": "climate:" + entity_id,
+                "previous": previous,
+                "requested": (
+                    {"state": "off"}
+                    if operation == "turn_off"
+                    else {
+                        key: requested.get(key)
+                        for key in (
+                            "state",
+                            "temperature",
+                            "temperature_unit",
+                            "fan_mode",
+                            "swing_mode",
+                            "swing_horizontal_mode",
+                        )
+                    }
+                ),
+                "confirmation_basis": "home_assistant_cloud_reported_state",
+            }
+            await self.record("prepared", record)
+            try:
+                if operation == "turn_off":
+                    await self._call_climate(
+                        "turn_off",
+                        {"entity_id": entity_id},
+                        context,
+                    )
+                else:
+                    temperature = requested.get("temperature")
+                    if temperature is None:
+                        await self._call_climate(
+                            "set_hvac_mode",
+                            {
+                                "entity_id": entity_id,
+                                "hvac_mode": requested["state"],
+                            },
+                            context,
+                        )
+                    else:
+                        await self._call_climate(
+                            "set_temperature",
+                            {
+                                "entity_id": entity_id,
+                                "hvac_mode": requested["state"],
+                                "temperature": temperature,
+                            },
+                            context,
+                        )
+                    for service, key in (
+                        ("set_fan_mode", "fan_mode"),
+                        ("set_swing_mode", "swing_mode"),
+                        (
+                            "set_swing_horizontal_mode",
+                            "swing_horizontal_mode",
+                        ),
+                    ):
+                        value = requested.get(key)
+                        if value is not None:
+                            await self._call_climate(
+                                service,
+                                {"entity_id": entity_id, key: value},
+                                context,
+                            )
+                for attempt in range(4):
+                    confirmed = self._climate_status(entity_id)
+                    matched = (
+                        confirmed.get("state") == "off"
+                        if operation == "turn_off"
+                        else self._climate_state_matches(confirmed, requested)
+                    )
+                    if confirmed.get("fresh") and matched:
+                        await self.record(
+                            "verified",
+                            {**record, "confirmed": confirmed},
+                        )
+                        return {
+                            "changed": True,
+                            "previous": previous,
+                            "confirmed": confirmed,
+                        }
+                    if attempt < 3:
+                        await asyncio.sleep(1)
+                raise HomeAssistantError(
+                    "Fresh cloud-reported climate state did not confirm the request."
+                )
+            except asyncio.CancelledError:
+                LOGGER.error(
+                    "Climate request cancelled after dispatch began; its prepared "
+                    "journal record remains uncertain."
+                )
+                raise
+            except (HomeAssistantError, TimeoutError, OSError) as error:
+                LOGGER.error(
+                    "Climate command outcome is uncertain; read fresh state before "
+                    "any retry or restoration."
+                )
+                try:
+                    await self.record("uncertain", record)
+                except OSError:
+                    LOGGER.exception(
+                        "Could not persist the uncertain climate outcome."
+                    )
+                raise HomeAssistantError(
+                    "The climate command may have applied. Read fresh state before "
+                    "any retry or restoration; no automatic retry or rollback was performed."
+                ) from error
 
     def solar_device(self):
         entry = self.entry(self.solar_entry, "huawei_solar")

@@ -26,6 +26,7 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
         self.controls = importlib.import_module(base.COMPONENT + ".controls")
         self.devices = self.controls.EnergyDevices(self.hass, {})
         self.devices.record = AsyncMock()
+        self.devices.climate_entities = frozenset({"climate.bedroom"})
         self.solar_state = {
             "mode": 0, "active": 1000, "command": 40125,
             "percent": 100.0, "watts": 8000, "maximum": 8000,
@@ -131,6 +132,39 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
             ("water_heater", "set_operation_mode"), ("switch", "turn_on"), ("switch", "turn_off"),
         ):
             self.hass.services.async_register(domain, service, write)
+        self.climate_calls = []
+
+        async def climate_write(call):
+            self.climate_calls.append((call.service, dict(call.data)))
+            state = self.hass.states.get(call.data["entity_id"])
+            attributes = dict(state.attributes)
+            value = state.state
+            if call.service == "turn_off":
+                value = "off"
+            elif call.service == "set_temperature":
+                value = call.data["hvac_mode"]
+                attributes["temperature"] = call.data["temperature"]
+            elif call.service == "set_hvac_mode":
+                value = call.data["hvac_mode"]
+            elif call.service == "set_fan_mode":
+                attributes["fan_mode"] = call.data["fan_mode"]
+            elif call.service == "set_swing_mode":
+                attributes["swing_mode"] = call.data["swing_mode"]
+            elif call.service == "set_swing_horizontal_mode":
+                attributes["swing_horizontal_mode"] = call.data[
+                    "swing_horizontal_mode"
+                ]
+            self.hass.states.async_set(call.data["entity_id"], value, attributes)
+
+        for service in (
+            "turn_off",
+            "set_temperature",
+            "set_hvac_mode",
+            "set_fan_mode",
+            "set_swing_mode",
+            "set_swing_horizontal_mode",
+        ):
+            self.hass.services.async_register("climate", service, climate_write)
 
     async def asyncTearDown(self):
         await base.HAComponentTests.asyncTearDown(self)
@@ -320,6 +354,125 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(HomeAssistantError, "may have applied"):
                 await self.devices.control_daikin({"operation": "hot_water_target", "value": 51}, None)
         self.assertEqual(self.writes, [("water_heater", "set_temperature")])
+
+    def set_climate_state(self, state="heat"):
+        self.hass.states.async_set(
+            "climate.bedroom",
+            state,
+            {
+                "temperature": 22,
+                "temperature_unit": "°C",
+                "fan_mode": "auto",
+                "fan_modes": ["auto", "high"],
+                "swing_mode": "stopped",
+                "swing_modes": ["stopped", "rangeFull"],
+                "swing_horizontal_mode": "stopped",
+                "swing_horizontal_modes": ["stopped", "rangeFull"],
+                "hvac_modes": ["off", "heat", "cool", "dry", "fan_only"],
+                "min_temp": 16,
+                "max_temp": 30,
+                "target_temp_step": 1,
+                "current_temperature": 22.5,
+            },
+        )
+
+    async def test_climate_noop_off_emits_no_ir_command_or_journal(self):
+        self.set_climate_state("off")
+        current = await self.devices.get_climate_status("climate.bedroom")
+        result = await self.devices.control_climate(
+            {
+                "entity_id": "climate.bedroom",
+                "operation": "turn_off",
+                "expected": current,
+            },
+            None,
+        )
+        self.assertFalse(result["changed"])
+        self.assertEqual(self.climate_calls, [])
+        self.devices.record.assert_not_awaited()
+
+    async def test_climate_turn_off_and_exact_restore_are_cloud_confirmed(self):
+        self.set_climate_state()
+        original = await self.devices.get_climate_status("climate.bedroom")
+        stopped = await self.devices.control_climate(
+            {
+                "entity_id": "climate.bedroom",
+                "operation": "turn_off",
+                "expected": original,
+            },
+            None,
+        )
+        self.assertTrue(stopped["changed"])
+        self.assertEqual(stopped["confirmed"]["state"], "off")
+        off = await self.devices.get_climate_status("climate.bedroom")
+        restored = await self.devices.control_climate(
+            {
+                "entity_id": "climate.bedroom",
+                "operation": "restore",
+                "expected": off,
+                "restore_state": original,
+            },
+            None,
+        )
+        self.assertTrue(restored["changed"])
+        self.assertEqual(restored["confirmed"]["state"], "heat")
+        self.assertEqual(restored["confirmed"]["temperature"], 22)
+        self.assertEqual(restored["confirmed"]["fan_mode"], "auto")
+        self.assertEqual(
+            restored["confirmed"]["swing_horizontal_mode"], "stopped"
+        )
+        self.assertEqual(
+            [service for service, _data in self.climate_calls],
+            [
+                "turn_off",
+                "set_temperature",
+                "set_fan_mode",
+                "set_swing_mode",
+                "set_swing_horizontal_mode",
+            ],
+        )
+        self.assertEqual(
+            [call.args[0] for call in self.devices.record.await_args_list],
+            ["prepared", "verified", "prepared", "verified"],
+        )
+
+    async def test_climate_external_change_blocks_control_before_dispatch(self):
+        self.set_climate_state()
+        expected = await self.devices.get_climate_status("climate.bedroom")
+        self.set_climate_state("cool")
+        with self.assertRaisesRegex(HomeAssistantError, "changed"):
+            await self.devices.control_climate(
+                {
+                    "entity_id": "climate.bedroom",
+                    "operation": "turn_off",
+                    "expected": expected,
+                },
+                None,
+            )
+        self.assertEqual(self.climate_calls, [])
+
+    async def test_climate_service_failure_is_uncertain_and_not_retried(self):
+        self.set_climate_state()
+        expected = await self.devices.get_climate_status("climate.bedroom")
+
+        async def failed(_call):
+            raise HomeAssistantError("Synthetic missing acknowledgement")
+
+        self.hass.services.async_register("climate", "turn_off", failed)
+        with self.assertRaisesRegex(HomeAssistantError, "may have applied"):
+            await self.devices.control_climate(
+                {
+                    "entity_id": "climate.bedroom",
+                    "operation": "turn_off",
+                    "expected": expected,
+                },
+                None,
+            )
+        self.assertEqual(
+            [call.args[0] for call in self.devices.record.await_args_list],
+            ["prepared", "uncertain"],
+        )
+
     async def test_control_api_is_separate_and_empty_without_explicit_bindings(self):
         api = self.controls.HomeEnergyDeviceAPI(self.hass, {})
         self.assertEqual((await api.async_get_api_instance(None)).tools, [])

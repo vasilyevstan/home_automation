@@ -67,6 +67,16 @@ async def async_setup_entry(
                 floor_shadow, entry.entry_id
             )
         )
+    extreme_protection = hass.data.get(DOMAIN, {}).get(
+        entry.entry_id, {}
+    ).get("extreme_protection")
+    if extreme_protection:
+        entities.append(
+            ExtremePriceProtectionSensor(
+                extreme_protection,
+                entry.entry_id,
+            )
+        )
     async_add_entities(entities)
 
 
@@ -326,3 +336,35 @@ class FloorRoomTemperatureSensor(SensorEntity):
             ],
             "daikin_garage_temperature_c": details["daikin_indoor_temperature_c"],
         }
+
+
+class ExtremePriceProtectionSensor(SensorEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Extreme price protection"
+    _attr_icon = "mdi:flash-alert"
+
+    def __init__(self, protection, entry_id: str) -> None:
+        self.protection = protection
+        self._attr_unique_id = entry_id + "_extreme_price_protection"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)},
+            name=NAME,
+            manufacturer="home_automation",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            self.protection.async_add_listener(self.async_write_ha_state)
+        )
+
+    @property
+    def native_value(self) -> str:
+        return (
+            self.protection.decision.state
+            if self.protection.decision is not None
+            else "starting"
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return self.protection.attributes

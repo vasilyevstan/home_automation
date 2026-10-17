@@ -586,6 +586,7 @@ class FloorHeatingShadow:
         self.decision: FloorHeatingDecision | None = None
         self.listeners: list[Callable[[], None]] = []
         self.unsubscribers: list[Callable[[], None]] = []
+        self.external_influences: dict[str, str] = {}
         self.state = {
             "policy_revision": POLICY_REVISION,
             "shadow_days": [],
@@ -664,6 +665,19 @@ class FloorHeatingShadow:
             listener()
 
     @callback
+    def set_external_influence(
+        self,
+        source: str,
+        active: bool,
+        reason: str,
+    ) -> None:
+        if active:
+            self.external_influences[source] = reason
+        else:
+            self.external_influences.pop(source, None)
+        self._schedule_evaluation()
+
+    @callback
     def _schedule_evaluation(self) -> None:
         self.hass.async_create_task(self.async_evaluate())
 
@@ -717,11 +731,17 @@ class FloorHeatingShadow:
             ),
             "indoor_temperature_source_error": "; ".join(errors) or None,
             "active_room_hvac_entities": active_hvac_entities,
-            "external_room_hvac_influence": bool(active_hvac_entities),
+            "external_room_hvac_influence": bool(
+                active_hvac_entities or self.external_influences
+            ),
+            "external_influence_reasons": list(
+                self.external_influences.values()
+            ),
             "thermal_response_evidence_eligible": (
                 bool(values)
                 and not errors
                 and not active_hvac_entities
+                and not self.external_influences
             ),
         })
         if errors:
@@ -776,6 +796,10 @@ class FloorHeatingShadow:
                 "Room-level HVAC is enabled for "
                 + ", ".join(active_room_hvac)
                 + "; floor Shadow yields to external room control."
+            )
+        elif self.external_influences:
+            external_influence_reason = "; ".join(
+                self.external_influences.values()
             )
         return FloorHeatingObservation(
             indoor,

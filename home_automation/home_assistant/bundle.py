@@ -31,6 +31,7 @@ COMPONENT_FILES = (
     "coordinator.py",
     "controls.py",
     "dhw_optimizer.py",
+    "extreme_price_protection.py",
     "floor_heating_shadow.py",
     "price_forecast.py",
     "sensor.py",

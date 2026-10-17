@@ -12,11 +12,21 @@ from .const import DOMAIN, NAME
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
-    optimizer = hass.data[DOMAIN][entry.entry_id]["optimizer"]
-    async_add_entities([
+    runtime = hass.data[DOMAIN][entry.entry_id]
+    optimizer = runtime["optimizer"]
+    entities = [
         DhwOptimizerResumeButton(optimizer, entry.entry_id),
         DhwOptimizerNormalButton(optimizer, entry.entry_id),
-    ])
+    ]
+    protection = runtime.get("extreme_protection")
+    if protection is not None:
+        entities.append(
+            ExtremePriceProtectionResumeButton(
+                protection,
+                entry.entry_id,
+            )
+        )
+    async_add_entities(entities)
 
 
 class DhwOptimizerButton(ButtonEntity):
@@ -50,3 +60,27 @@ class DhwOptimizerNormalButton(DhwOptimizerButton):
 
     async def async_press(self) -> None:
         await self.optimizer.async_return_to_normal()
+
+
+class ExtremePriceProtectionResumeButton(ButtonEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Resume extreme price protection after review"
+    _attr_icon = "mdi:shield-refresh"
+
+    def __init__(self, protection, entry_id: str) -> None:
+        self.protection = protection
+        self._attr_unique_id = (
+            entry_id + "_extreme_price_protection_resume"
+        )
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)},
+            name=NAME,
+            manufacturer="home_automation",
+        )
+
+    @property
+    def available(self) -> bool:
+        return bool(self.protection.state.get("fault"))
+
+    async def async_press(self) -> None:
+        await self.protection.async_resume_after_review()

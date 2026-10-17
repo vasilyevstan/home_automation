@@ -239,6 +239,10 @@ class HomeAssistantBundleTests(unittest.TestCase):
         self.assertEqual(set(strings["config"]), {"step", "error", "abort"})
         self.assertEqual(set(strings["options"]), {"step", "error"})
         self.assertIn("dhw_preheat_target", strings["options"]["step"]["init"]["data"])
+        self.assertIn(
+            "extreme_price_climate_entities",
+            strings["options"]["step"]["init"]["data"],
+        )
         forms = (component / "services.yaml").read_text()
         for action in strings["services"]:
             self.assertIn(action + ":", forms)
@@ -265,6 +269,7 @@ class HomeAssistantBundleTests(unittest.TestCase):
                 self.assertEqual(manifest["requirements"], [])
                 self.assertEqual(manifest["dependencies"], ["nordpool"])
                 self.assertEqual(manifest["domain"], "household_electricity_pricing")
+                self.assertEqual(manifest["version"], "0.7.0")
                 names = archive.namelist()
                 self.assertTrue(all(name.startswith(prefix) for name in names))
                 self.assertFalse(any(
@@ -275,6 +280,7 @@ class HomeAssistantBundleTests(unittest.TestCase):
                 self.assertIn(prefix + "price_api.py", names)
                 self.assertIn(prefix + "dhw_optimizer.py", names)
                 self.assertIn(prefix + "floor_heating_shadow.py", names)
+                self.assertIn(prefix + "extreme_price_protection.py", names)
                 self.assertIn(prefix + "price_forecast.py", names)
                 self.assertIn(
                     prefix

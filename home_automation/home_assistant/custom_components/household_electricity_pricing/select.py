@@ -6,7 +6,14 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DHW_MODES, DOMAIN, NAME
+from .const import (
+    DHW_MODES,
+    DOMAIN,
+    EXTREME_PRICE_MODE_ARMED,
+    EXTREME_PRICE_MODE_OFF,
+    EXTREME_PRICE_MODE_SHADOW,
+    NAME,
+)
 
 
 MODE_LABELS = {
@@ -16,13 +23,32 @@ MODE_LABELS = {
     "soft_standby": "Soft standby (30°C)",
 }
 LABEL_MODES = {label: mode for mode, label in MODE_LABELS.items()}
+EXTREME_MODE_LABELS = {
+    EXTREME_PRICE_MODE_OFF: "Off",
+    EXTREME_PRICE_MODE_SHADOW: "Shadow (no writes)",
+    EXTREME_PRICE_MODE_ARMED: "Armed",
+}
+EXTREME_LABEL_MODES = {
+    label: mode for mode, label in EXTREME_MODE_LABELS.items()
+}
 
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
-    optimizer = hass.data[DOMAIN][entry.entry_id]["optimizer"]
-    async_add_entities([DhwOptimizerModeSelect(optimizer, entry.entry_id)])
+    runtime = hass.data[DOMAIN][entry.entry_id]
+    entities = [
+        DhwOptimizerModeSelect(runtime["optimizer"], entry.entry_id)
+    ]
+    protection = runtime.get("extreme_protection")
+    if protection is not None:
+        entities.append(
+            ExtremePriceProtectionModeSelect(
+                protection,
+                entry.entry_id,
+            )
+        )
+    async_add_entities(entities)
 
 
 class DhwOptimizerModeSelect(SelectEntity):
@@ -49,3 +75,41 @@ class DhwOptimizerModeSelect(SelectEntity):
 
     async def async_select_option(self, option: str) -> None:
         await self.optimizer.async_set_mode(LABEL_MODES[option])
+
+
+class ExtremePriceProtectionModeSelect(SelectEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Extreme price protection mode"
+    _attr_icon = "mdi:shield-lightning"
+
+    def __init__(self, protection, entry_id: str) -> None:
+        self.protection = protection
+        self._attr_unique_id = (
+            entry_id + "_extreme_price_protection_mode"
+        )
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)},
+            name=NAME,
+            manufacturer="home_automation",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            self.protection.async_add_listener(self.async_write_ha_state)
+        )
+
+    @property
+    def options(self) -> list[str]:
+        return [
+            EXTREME_MODE_LABELS[mode]
+            for mode in self.protection.available_modes
+        ]
+
+    @property
+    def current_option(self) -> str:
+        return EXTREME_MODE_LABELS[self.protection.mode]
+
+    async def async_select_option(self, option: str) -> None:
+        await self.protection.async_set_mode(
+            EXTREME_LABEL_MODES[option]
+        )
