@@ -62,8 +62,12 @@
   range/step validation, complete published-price requirement, sign-safe
   absolute/relative price gate, four-hour lease, and ownership-aware restore.
   Anchor one cheap and comparison block per readiness cycle; require a material
-  all-in-price advantage before 55°C preheat. Missing data and comfort/readiness
-  recovery override optimization. Keep recovery latched through measured 50°C,
+  all-in-price advantage before price-driven 55°C preheat. The separately
+  selected readiness pilot may request 55°C only inside the final conservative
+  heating allowance while measured tank temperature is below 50°C, must restore
+  50°C immediately when readiness is measured, and must never use 45°C coast or
+  30°C soft standby. Missing data and comfort/readiness recovery override
+  optimization. Keep recovery latched through measured 50°C,
   persist successful 50°C completion for the anchored plan so later sensor
   rounding cannot restart post-window recovery, use minimum dwell for ordinary
   price-driven transitions, and reset promotion evidence whenever a policy

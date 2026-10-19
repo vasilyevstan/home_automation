@@ -42,6 +42,7 @@ from .const import (
     DEFAULT_DHW_PRICE_PERCENT,
     DEFAULT_DHW_SOFT_TARGET,
     DHW_MODE_PAUSED,
+    DHW_MODE_READINESS,
     DHW_MODE_SAFE,
     DHW_MODE_SHADOW,
     DHW_MODE_SOFT,
@@ -58,9 +59,18 @@ STORE_KEY_SUFFIX = "dhw_optimizer"
 NOTIFICATION_ID = DOMAIN + "_dhw_optimizer_fault"
 DECISION_HISTORY_LIMIT = 96
 HEATING_DURATION_LIMIT = 20
-POLICY_REVISION = 4
+POLICY_REVISION = 5
 MINIMUM_TARGET_DWELL = timedelta(minutes=30)
 RECENT_DECISIONS_ATTRIBUTE_LIMIT = 4
+READINESS_SUCCESS = "success"
+READINESS_CONSUMED = "consumed"
+READINESS_CONTAMINATED = "draw_contaminated"
+READINESS_FAILURE = "failure"
+READINESS_UNAVAILABLE = "unavailable"
+READINESS_USABLE = frozenset(
+    (READINESS_SUCCESS, READINESS_CONSUMED, READINESS_FAILURE)
+)
+READINESS_DELIVERED = frozenset((READINESS_SUCCESS, READINESS_CONSUMED))
 
 
 def _number(value: object, label: str) -> float:
@@ -490,7 +500,7 @@ def plan_dhw(
         policy.price_delta,
         policy.price_percent,
     )
-    allow_write = mode in (DHW_MODE_SAFE, DHW_MODE_SOFT)
+    allow_write = mode in (DHW_MODE_READINESS, DHW_MODE_SAFE, DHW_MODE_SOFT)
 
     def decision(
         state: str,
@@ -534,6 +544,22 @@ def plan_dhw(
             None,
             write=False,
         )
+    remaining = deadline.astimezone(UTC) - now.astimezone(UTC)
+    if remaining <= timedelta(minutes=heating_minutes):
+        if observation.tank_temperature < policy.normal_target:
+            return decision(
+                "readiness_charge",
+                "The readiness deadline is inside the conservative heating allowance; "
+                "request 55°C only until the measured tank reaches 50°C.",
+                policy.preheat_target,
+                urgent=True,
+            )
+        return decision(
+            "readiness",
+            "Measured readiness is satisfied; hold the normal 50°C target.",
+            policy.normal_target,
+            urgent=True,
+        )
     if (
         recovery_latched
         and observation.tank_temperature < policy.normal_target
@@ -552,11 +578,11 @@ def plan_dhw(
             policy.normal_target,
             urgent=True,
         )
-    remaining = deadline.astimezone(UTC) - now.astimezone(UTC)
-    if remaining <= timedelta(minutes=heating_minutes):
+    if mode == DHW_MODE_READINESS:
         return decision(
-            "readiness",
-            "The next readiness deadline is inside the conservative heating allowance.",
+            "readiness_pilot",
+            "The readiness-only pilot keeps the normal target outside the final "
+            "readiness allowance; price coasting and soft standby remain disabled.",
             policy.normal_target,
             urgent=True,
         )
@@ -709,6 +735,7 @@ class DhwOptimizer:
             "planned_comparison_intervals": None,
             "planned_window_completed_at": None,
             "shadow_days": [],
+            "readiness_pilot_days": [],
             "heating_durations": [],
             "cycle_started_at": None,
             "cycle_start_temperature": None,
@@ -716,39 +743,19 @@ class DhwOptimizer:
             "last_observed_at": None,
             "decision_history": [],
             "confirmed_writes": 0,
+            "readiness_pilot_started_at": None,
+            "readiness_pilot_confirmed_writes": 0,
             "pilot_started_at": None,
+            "safe_pilot_confirmed_writes": 0,
             "deadline_checks": {},
+            "readiness_window_peaks": {},
+            "readiness_rapid_draws": {},
             "qualified_opportunity_count": 0,
             "last_qualified_opportunity_plan_id": None,
             "last_qualified_opportunity_at": None,
         }
 
-    def _reset_policy_evidence(
-        self,
-        *,
-        preserve_qualification: bool = False,
-    ) -> None:
-        preserved = (
-            {
-                key: self.state[key]
-                for key in (
-                    "shadow_days",
-                    "heating_durations",
-                    "cycle_started_at",
-                    "cycle_start_temperature",
-                    "last_temperature",
-                    "last_observed_at",
-                    "confirmed_writes",
-                    "pilot_started_at",
-                    "deadline_checks",
-                    "qualified_opportunity_count",
-                    "last_qualified_opportunity_plan_id",
-                    "last_qualified_opportunity_at",
-                )
-            }
-            if preserve_qualification
-            else {}
-        )
+    def _reset_policy_evidence(self) -> None:
         self.state.update({
             "policy_revision": POLICY_REVISION,
             "last_policy_target": None,
@@ -766,6 +773,7 @@ class DhwOptimizer:
             "planned_comparison_intervals": None,
             "planned_window_completed_at": None,
             "shadow_days": [],
+            "readiness_pilot_days": [],
             "heating_durations": [],
             "cycle_started_at": None,
             "cycle_start_temperature": None,
@@ -773,13 +781,17 @@ class DhwOptimizer:
             "last_observed_at": None,
             "decision_history": [],
             "confirmed_writes": 0,
+            "readiness_pilot_started_at": None,
+            "readiness_pilot_confirmed_writes": 0,
             "pilot_started_at": None,
+            "safe_pilot_confirmed_writes": 0,
             "deadline_checks": {},
+            "readiness_window_peaks": {},
+            "readiness_rapid_draws": {},
             "qualified_opportunity_count": 0,
             "last_qualified_opportunity_plan_id": None,
             "last_qualified_opportunity_at": None,
         })
-        self.state.update(preserved)
 
     async def async_start(self) -> None:
         stored = await self.store.async_load()
@@ -792,9 +804,20 @@ class DhwOptimizer:
                 if key in stored:
                     self.state[key] = stored[key]
             if stored_revision != POLICY_REVISION:
-                self._reset_policy_evidence(
-                    preserve_qualification=stored_revision == 3,
+                write_capable_mode = self.mode in (
+                    DHW_MODE_READINESS,
+                    DHW_MODE_SAFE,
+                    DHW_MODE_SOFT,
                 )
+                self._reset_policy_evidence()
+                if write_capable_mode:
+                    self.mode = DHW_MODE_PAUSED
+                    if self.state["fault"] is None:
+                        self.state["fault"] = (
+                            "The DHW policy changed while automatic writes were "
+                            "enabled. The optimizer was paused; inspect fresh device "
+                            "state before resuming or selecting a write-capable mode."
+                        )
         self.unsubscribers.append(self.coordinator.async_add_listener(self._schedule_evaluation))
         self.unsubscribers.append(
             async_track_time_interval(
@@ -850,11 +873,19 @@ class DhwOptimizer:
     @property
     def shadow_ready(self) -> bool:
         checks = self.state["deadline_checks"]
+        usable_checks = [
+            value for value in checks.values() if value in READINESS_USABLE
+        ]
+        qualification_days = set(self.state["shadow_days"]) | set(
+            self.state["readiness_pilot_days"]
+        )
         return (
-            len(self.state["shadow_days"]) >= 7
+            len(qualification_days) >= 7
             and len(self.state["heating_durations"]) >= 5
-            and len(checks) >= 10
-            and all(checks.values())
+            and len(usable_checks) >= 10
+            and all(value in READINESS_DELIVERED for value in usable_checks)
+            and self.state["readiness_pilot_started_at"] is not None
+            and self.state["readiness_pilot_confirmed_writes"] >= 2
             and not self.state["fault"]
             and not self.state["manual_override"]
         )
@@ -866,10 +897,14 @@ class DhwOptimizer:
         return (
             started is not None
             and dt_util.utcnow() - started.astimezone(UTC) >= timedelta(days=7)
-            and self.state["confirmed_writes"] >= 10
+            and self.state["safe_pilot_confirmed_writes"] >= 10
             and not self.state["fault"]
-            and bool(checks)
-            and all(checks.values())
+            and any(value in READINESS_USABLE for value in checks.values())
+            and all(
+                value in READINESS_DELIVERED
+                for value in checks.values()
+                if value in READINESS_USABLE
+            )
         )
 
     @property
@@ -1028,14 +1063,119 @@ class DhwOptimizer:
         local_day = now.astimezone(TALLINN).date().isoformat()
         if self.mode == DHW_MODE_SHADOW and local_day not in self.state["shadow_days"]:
             self.state["shadow_days"] = (self.state["shadow_days"] + [local_day])[-30:]
-        if observation.override_reason is not None:
-            return
+        if (
+            self.mode == DHW_MODE_READINESS
+            and local_day not in self.state["readiness_pilot_days"]
+        ):
+            self.state["readiness_pilot_days"] = (
+                self.state["readiness_pilot_days"] + [local_day]
+            )[-30:]
         temperature = observation.tank_temperature
         target = observation.target_temperature
-        if temperature is None or target is None:
+        local = now.astimezone(TALLINN)
+        last_temperature = _raw_number(self.state.get("last_temperature"))
+        last_observed = _instant(self.state.get("last_observed_at"))
+        checks = dict(self.state["deadline_checks"])
+        peaks = dict(self.state["readiness_window_peaks"])
+        rapid_draws = dict(self.state["readiness_rapid_draws"])
+        for ready in self.policy.readiness_times:
+            ready_at = datetime.combine(local.date(), ready, tzinfo=TALLINN)
+            key = ready_at.isoformat()
+            final_start = ready_at - timedelta(minutes=self.heating_minutes)
+            check_end = ready_at + timedelta(minutes=15)
+            if temperature is not None and final_start <= local < check_end:
+                peak_record = peaks.get(key)
+                previous_peak = (
+                    _raw_number(peak_record.get("temperature"))
+                    if isinstance(peak_record, dict)
+                    else None
+                )
+                peak_at = (
+                    _instant(peak_record.get("observed_at"))
+                    if isinstance(peak_record, dict)
+                    else None
+                )
+                if previous_peak is None or temperature >= previous_peak:
+                    previous_peak = temperature
+                    peak_at = now
+                    peaks[key] = {
+                        "temperature": temperature,
+                        "observed_at": now.isoformat(),
+                    }
+                since_peak = (
+                    now - peak_at.astimezone(UTC)
+                    if peak_at is not None
+                    else None
+                )
+                if (
+                    last_temperature is not None
+                    and last_observed is not None
+                    and timedelta(0)
+                    <= now - last_observed.astimezone(UTC)
+                    <= timedelta(minutes=15)
+                    and since_peak is not None
+                    and timedelta(0) <= since_peak <= timedelta(minutes=15)
+                    and previous_peak - temperature >= 3
+                ):
+                    rapid_draws[key] = now.isoformat()
+            if ready_at <= local < check_end and key not in checks:
+                peak_record = peaks.get(key)
+                peak = (
+                    _raw_number(peak_record.get("temperature"))
+                    if isinstance(peak_record, dict)
+                    else None
+                )
+                if (
+                    observation.override_reason is not None
+                    or temperature is None
+                    or target is None
+                ):
+                    outcome = READINESS_UNAVAILABLE
+                elif temperature >= self.policy.normal_target:
+                    outcome = READINESS_SUCCESS
+                elif key in rapid_draws and (
+                    peak is not None and peak >= self.policy.normal_target
+                ):
+                    outcome = READINESS_CONSUMED
+                elif key in rapid_draws:
+                    outcome = READINESS_CONTAMINATED
+                else:
+                    outcome = READINESS_FAILURE
+                checks[key] = outcome
+                checks = dict(list(checks.items())[-30:])
+                if (
+                    temperature is not None
+                    and temperature < self.policy.normal_target
+                    and outcome != READINESS_UNAVAILABLE
+                ):
+                    self.state["recovery_latched"] = True
+                    if outcome == READINESS_CONSUMED:
+                        self.state["recovery_reason"] = (
+                            f"The {ready.strftime('%H:%M')} readiness target was "
+                            "measured before a rapid draw; hold 50°C while recovering."
+                        )
+                    elif outcome == READINESS_CONTAMINATED:
+                        self.state["recovery_reason"] = (
+                            f"A rapid draw obscured the {ready.strftime('%H:%M')} "
+                            "readiness check; hold 50°C while recovering."
+                        )
+                    else:
+                        self.state["recovery_reason"] = (
+                            f"The {ready.strftime('%H:%M')} readiness deadline was "
+                            f"missed at {temperature:g}°C; hold 50°C until recovery completes."
+                        )
+        self.state["deadline_checks"] = checks
+        self.state["readiness_window_peaks"] = dict(list(peaks.items())[-30:])
+        self.state["readiness_rapid_draws"] = dict(
+            list(rapid_draws.items())[-30:]
+        )
+        if (
+            observation.override_reason is not None
+            or temperature is None
+            or target is None
+        ):
             return
         cycle_start = _instant(self.state.get("cycle_started_at"))
-        last_temperature = _raw_number(self.state.get("last_temperature"))
         if (
             cycle_start is None
             and temperature <= self.policy.floor_target
@@ -1060,22 +1200,6 @@ class DhwOptimizer:
                 self.state["cycle_start_temperature"] = None
         self.state["last_temperature"] = temperature
         self.state["last_observed_at"] = now.isoformat()
-        local = now.astimezone(TALLINN)
-        for ready in self.policy.readiness_times:
-            ready_at = datetime.combine(local.date(), ready, tzinfo=TALLINN)
-            if ready_at <= local < ready_at + timedelta(minutes=15):
-                key = ready_at.isoformat()
-                if key not in self.state["deadline_checks"]:
-                    ready_met = temperature >= self.policy.normal_target
-                    checks = dict(self.state["deadline_checks"])
-                    checks[key] = ready_met
-                    self.state["deadline_checks"] = dict(list(checks.items())[-30:])
-                    if not ready_met:
-                        self.state["recovery_latched"] = True
-                        self.state["recovery_reason"] = (
-                            f"The {ready.strftime('%H:%M')} readiness deadline was "
-                            f"missed at {temperature:g}°C; hold 50°C until recovery completes."
-                        )
 
     def _record_decision(self, now: datetime, decision: DhwDecision) -> None:
         previous = self.decision
@@ -1338,7 +1462,14 @@ class DhwOptimizer:
             return
         self.state["last_owned_target"] = target
         self.state["last_write_at"] = now.isoformat()
-        self.state["confirmed_writes"] += int(result.get("changed") is True)
+        changed = int(result.get("changed") is True)
+        self.state["confirmed_writes"] += changed
+        if self.mode == DHW_MODE_READINESS:
+            if self.state["readiness_pilot_started_at"] is None:
+                self.state["readiness_pilot_started_at"] = now.isoformat()
+            self.state["readiness_pilot_confirmed_writes"] += changed
+        if self.mode == DHW_MODE_SAFE:
+            self.state["safe_pilot_confirmed_writes"] += changed
         if target == self.policy.soft_target:
             self.state["lease_expires"] = (now + self.policy.max_lease).isoformat()
         else:
@@ -1353,8 +1484,10 @@ class DhwOptimizer:
             raise HomeAssistantError("Unknown DHW optimizer mode.")
         if mode == DHW_MODE_SAFE and not self.shadow_ready:
             raise HomeAssistantError(
-                "Shadow promotion requires seven observed days, five usable heating "
-                "cycles, and at least ten successful readiness checks with no failure."
+                "Safe target shift requires seven observed Shadow/readiness-pilot "
+                "days, five usable heating cycles, ten delivered readiness checks "
+                "with no genuine failure, and at least two confirmed readiness-pilot "
+                "writes."
             )
         if mode == DHW_MODE_SOFT and not self.soft_ready:
             raise HomeAssistantError(
@@ -1366,10 +1499,18 @@ class DhwOptimizer:
             self.state["last_policy_target"] = None
             self.state["last_policy_transition_at"] = None
         if mode in (DHW_MODE_PAUSED, DHW_MODE_SHADOW) and previous in (
+            DHW_MODE_READINESS,
             DHW_MODE_SAFE,
             DHW_MODE_SOFT,
         ):
             await self.async_return_to_normal(evaluate=False, pause=False)
+        if (
+            mode == DHW_MODE_READINESS
+            and self.state["readiness_pilot_started_at"] is None
+        ):
+            self.state["readiness_pilot_started_at"] = (
+                dt_util.utcnow().astimezone(UTC).isoformat()
+            )
         if mode != DHW_MODE_SOFT:
             self.state["lease_expires"] = None
         await self._save()
@@ -1486,7 +1627,7 @@ class DhwOptimizer:
             "controller": "domestic_hot_water",
             "valuation_status": (
                 "counterfactual"
-                if self.mode == DHW_MODE_SHADOW
+                if self.mode in (DHW_MODE_SHADOW, DHW_MODE_READINESS)
                 else "live_action_unattributed"
             ),
             "operating_mode": self.mode,
@@ -1550,25 +1691,49 @@ class DhwOptimizer:
             ]
         )
         deadline_checks = self.state["deadline_checks"]
+        qualification_days = set(self.state["shadow_days"]) | set(
+            self.state["readiness_pilot_days"]
+        )
         pilot_started = _instant(self.state.get("pilot_started_at"))
         result.update({
             "shadow_zero_writes": self.mode == DHW_MODE_SHADOW,
             "shadow_days": len(self.state["shadow_days"]),
+            "readiness_pilot_days": len(self.state["readiness_pilot_days"]),
+            "qualification_days": len(qualification_days),
             "usable_heating_cycles": len(self.state["heating_durations"]),
             "heating_duration_minutes": self.heating_minutes,
             "shadow_ready": self.shadow_ready,
             "soft_standby_ready": self.soft_ready,
             "confirmed_writes": self.state["confirmed_writes"],
+            "readiness_pilot_confirmed_writes": self.state[
+                "readiness_pilot_confirmed_writes"
+            ],
+            "safe_pilot_confirmed_writes": self.state[
+                "safe_pilot_confirmed_writes"
+            ],
             "pilot_days": (
                 max(0, (dt_util.utcnow() - pilot_started.astimezone(UTC)).days)
                 if pilot_started else 0
             ),
             "readiness_checks": len(deadline_checks),
+            "readiness_usable_checks": sum(
+                value in READINESS_USABLE for value in deadline_checks.values()
+            ),
             "readiness_successes": sum(
-                value is True for value in deadline_checks.values()
+                value == READINESS_SUCCESS for value in deadline_checks.values()
+            ),
+            "readiness_consumed_after_delivery": sum(
+                value == READINESS_CONSUMED for value in deadline_checks.values()
+            ),
+            "readiness_draw_contaminated": sum(
+                value == READINESS_CONTAMINATED
+                for value in deadline_checks.values()
             ),
             "readiness_failures": sum(
-                value is False for value in deadline_checks.values()
+                value == READINESS_FAILURE for value in deadline_checks.values()
+            ),
+            "readiness_unavailable": sum(
+                value == READINESS_UNAVAILABLE for value in deadline_checks.values()
             ),
             "recent_recovery_events": sum(
                 record.get("state") == "recovery"

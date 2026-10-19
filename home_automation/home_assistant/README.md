@@ -497,7 +497,7 @@ Selecting a Daikin entry also creates a deterministic HA-native DHW optimizer.
 It consumes the coordinator's published all-in `import_eur_kwh` quarters; it
 does not call MCP, duplicate tariff rules, use wholesale-only prices, substitute
 forecasts, or depend on Copilot or another process. Missing coverage through the
-next readiness deadline fails safe to the normal target.
+next readiness deadline disables price shifting and holds the normal target.
 
 The default policy is:
 
@@ -507,7 +507,7 @@ The default policy is:
 | Soft-standby target | 30°C |
 | Comfort threshold / safe coast target | 45°C |
 | Normal target | 50°C |
-| Cheap-period preheat target | 55°C |
+| Cheap-period / final-readiness charge target | 55°C |
 | Maximum 30°C lease | 4 hours |
 | Price gate | Current all-in price at least €0.05/kWh and 20% above the selected cheap-window average |
 | Initial heating allowance | 90 minutes |
@@ -517,9 +517,17 @@ For each readiness cycle, the optimizer anchors one cheapest contiguous
 all-in-price block instead of selecting a new trailing block every quarter.
 It compares that block with the highest-cost feasible block of the same
 duration. The 55°C target is proposed only when that preheat opportunity passes
-the same €0.05/kWh and 20% gates; flat or low-value price shapes stay at 50°C.
+the same €0.05/kWh and 20% gates; flat or low-value price shapes stay at 50°C
+outside the final readiness allowance.
 This is a price opportunity per kWh, not a measured saving, because whole-Daikin
 electrical energy is unavailable.
+
+The bounded readiness pilot is deliberately separate from price shifting.
+Outside the final conservative heating allowance it holds 50°C and cannot use
+45°C coast or 30°C soft standby. Inside that allowance, it requests 55°C only
+while measured tank temperature remains below 50°C, then immediately restores
+the 50°C target. The higher target is a temporary request to overcome native
+target-50 hysteresis; it does not change the measured readiness requirement.
 
 Comfort or missed-deadline recovery is latched until the measured tank reaches
 50°C. Reaching 50°C after an anchored cheap window starts is also persisted as
@@ -530,9 +538,17 @@ Ordinary 45/50°C cost-driven transitions use a 30-minute minimum dwell, while
 comfort, readiness, incomplete-data and lease-expiry exits bypass it. Each
 policy revision that changes scheduling values or qualification semantics clears
 prior evidence so changed Shadow behavior must earn a new observation period.
-Revision 4 changes arbitration and write safety without changing the DHW
-schedule, so it preserves revision-3 day, cycle and readiness evidence while
-clearing the anchored plan and current decision.
+Revision 5 adds the final-readiness 55→50°C behavior and therefore clears
+revision-4 day, cycle, readiness and write evidence. If a policy upgrade finds
+a persisted write-capable mode, it pauses and faults for explicit review rather
+than continuing under evidence earned by the previous policy.
+
+Deadline evidence distinguishes a measured success, measured readiness later
+consumed by a rapid draw, a rapid-draw-contaminated check that cannot prove
+delivery, a genuine miss, and unavailable/overridden evidence. Measured success
+and measured-then-consumed outcomes count as delivered. Contaminated and
+unavailable checks are excluded rather than silently passed or failed; a genuine
+miss blocks promotion.
 
 The options flow validates every target against the selected Daikin's native
 range and step. On the verified BRP069A62 installation that range is 30–55°C in
@@ -542,11 +558,14 @@ The runtime mode select provides:
 
 - `shadow`: default; calculate and record the same 55/45/50°C decisions the safe
   pilot would make, but send no device commands.
-- `safe_target_shift`: after at least seven observed days, five usable heat
-  cycles and ten successful readiness checks with no failed check, permit
+- `readiness_pilot`: permit guarded 55→50°C target changes only inside the
+  final readiness allowance; hold 50°C at all other times.
+- `safe_target_shift`: after at least seven combined Shadow/readiness-pilot
+  observation days, five usable heat cycles, ten delivered usable readiness
+  checks with no genuine miss, and two confirmed readiness-pilot writes, permit
   guarded 55°C preheat, 45°C coast, and latched 50°C recovery targets.
 - `soft_standby`: after a validated seven-day safe pilot and ten confirmed
-  writes, permit the 30°C target under a persisted four-hour lease.
+  safe-pilot writes, permit the 30°C target under a persisted four-hour lease.
 - `paused`: issue no automatic targets.
 
 The 30°C target is soft standby, not active cooling and not the comfort floor.
