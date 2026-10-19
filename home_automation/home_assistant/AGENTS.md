@@ -94,7 +94,10 @@
   not by itself invalidate the temperature.
 - Do not infer household surplus from inverter generation, infer appliance kWh
   from aggregate import, or claim floor-heating savings without whole-unit
-  energy. Fresh signed net-grid power is required before any solar dispatch.
+  energy. Fresh signed net-grid power remains required for surplus-following,
+  zero-export, solar-heating or savings claims. The only exception is the
+  bounded open-loop Huawei generation-cap controller below, which acts from
+  exact negative export economics and must not claim measured export response.
 - Record DHW and floor price opportunities in dedicated compact Recorder
   sensors as EUR per shifted kWh, deduplicated by anchored plan. Never label the
   spread itself as saved euros. Estimated or realized euros require measured
@@ -140,6 +143,57 @@
   into saved kWh/euros without attributable energy measurement.
 - Huawei control/read transactions must hold the device's `update_lock`, shared
   with its native polling coordinator, not only the API's own per-device lock.
+  Native Huawei service/entity writes do not share that lock: after
+  authentication and prepared-audit persistence, repeat the exact
+  identity/Pmax/configured/active/active-power read immediately before dispatch
+  and reject any change. Document that the residual read-to-write race remains.
+- Huawei writes fail closed unless the selected entry has elevated parameter
+  configuration and a usable native configuration coordinator. Keep the read
+  tool for read-only entries but do not advertise `SolarLimitWrite`. Every
+  expected request and audit record must bind config-entry ID, serial and Pmax;
+  reject any mismatch. Include one fresh AC active-power read with native cap
+  capabilities.
+- Separate pre-dispatch failures from post-dispatch uncertainty. Lock,
+  authentication, expected-state and read failures must say no command was sent.
+  Once dispatch begins, do not replay, invert or roll back at controller level.
+  Do not claim the underlying transport has no internal retries. Preserve an
+  exact verified device outcome when only final JSONL audit persistence fails,
+  and expose that audit failure separately.
+- Keep solar curtailment independent from Daikin and available for solar-only
+  configs. Default to Shadow. Armed remains unavailable until deterministic
+  replay, elevated write capability, bound identity/Pmax, mode-preserving cap
+  calculation and two stable unrestricted observations are complete; passing
+  gates never selects Armed automatically.
+- Solar policy revision 1 uses exact current `export_earnings_eur_kwh`: Shadow
+  opportunity is below zero, while Armed entry is at or below -€0.010/kWh.
+  Require a known contiguous negative block with at least 30 minutes remaining,
+  matching configured/active unrestricted 100% or Pmax, fresh AC active power
+  of at least 5,000 W twice at least 30 seconds apart, and a 60-second dwell.
+  Preserve the current percentage/watt mode and apply at most a native-step
+  4,000 W-equivalent cap. Never change inverter mode automatically.
+- Persist versioned solar state before and after dispatch through an
+  acknowledged private atomic file write; HA Store alone is not a durable-write
+  acknowledgement because ordinary write/serialization failures may be
+  swallowed. Bind ownership to
+  pricing entry, inverter serial and Pmax, with a maximum two-hour/block-end
+  lease and one dispatched acquisition attempt per contiguous block. Low PV after
+  acquisition does not restore. Restore the exact original on non-negative,
+  stale/invalid or profile-changed prices, lease/block end, mode change or
+  graceful unload, but only while exact expected target and ownership remain.
+- On solar startup, exact target retains ownership for reconciliation, exact
+  original clears it, and any other limit is an external/manual override with
+  no write. Persisted pending phases and post-dispatch failures latch uncertain
+  fault until explicit resume. Defer reconciliation while the selected Huawei
+  entry is transiently not loaded or setting up; only a read failure after load
+  faults. Pre-dispatch failures may requalify. Manual or external changes cancel
+  ownership and suppress the rest of that block.
+- During the bounded coordinator quarter-refresh transition, retain an exact
+  owned cap only under its persisted block/profile/lease. Rollover alone must
+  not restore, suppress, or consume the block; refreshed data decides whether
+  ownership continues.
+- Solar sensors may report the exact cost per avoided exported kWh and elapsed
+  eligible/owned minutes. Without fresh signed grid power they must never report
+  curtailed kWh, zero-export performance, or estimated/realized euro savings.
 - HA must be the sole Huawei Modbus client during handover. Keep the old local
   solar MCP disconnected as rollback; cloud history is independent. Generation
   caps, export limits, and household load are not interchangeable.
@@ -149,6 +203,6 @@
 - Run the root `test_home_assistant_pricing.py` suite and the isolated real-HA
   test commands in the README, including `test_dhw_optimizer.py` and
   `test_floor_heating_shadow.py`, `test_extreme_price_protection.py`, and
-  `test_price_forecast.py`. Do not install HA
+  `test_solar_curtailment.py` and `test_price_forecast.py`. Do not install HA
   dependencies into the shared MCP environment. Use synthetic data; keep live
   captures and private profiles out of commits and public logs.

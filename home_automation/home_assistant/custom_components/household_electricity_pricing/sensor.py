@@ -77,6 +77,16 @@ async def async_setup_entry(
                 entry.entry_id,
             )
         )
+    solar_curtailment = hass.data.get(DOMAIN, {}).get(
+        entry.entry_id, {}
+    ).get("solar_curtailment")
+    if solar_curtailment:
+        entities.append(
+            SolarCurtailmentSensor(
+                solar_curtailment,
+                entry.entry_id,
+            )
+        )
     async_add_entities(entities)
 
 
@@ -368,3 +378,37 @@ class ExtremePriceProtectionSensor(SensorEntity):
     @property
     def extra_state_attributes(self) -> dict:
         return self.protection.attributes
+
+
+class SolarCurtailmentSensor(SensorEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Solar curtailment"
+    _attr_icon = "mdi:solar-power-variant"
+
+    def __init__(self, controller, entry_id: str) -> None:
+        self.controller = controller
+        self._attr_unique_id = entry_id + "_solar_curtailment"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)},
+            name=NAME,
+            manufacturer="home_automation",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            self.controller.async_add_listener(
+                self.async_write_ha_state
+            )
+        )
+
+    @property
+    def native_value(self) -> str:
+        return (
+            self.controller.decision.state
+            if self.controller.decision is not None
+            else "starting"
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return self.controller.attributes

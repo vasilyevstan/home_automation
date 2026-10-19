@@ -34,6 +34,7 @@ COMPONENT_FILES = (
     "extreme_price_protection.py",
     "floor_heating_shadow.py",
     "price_forecast.py",
+    "solar_curtailment.py",
     "sensor.py",
     "select.py",
     "button.py",

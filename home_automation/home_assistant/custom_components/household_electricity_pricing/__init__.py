@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+import logging
+
 import probatio
 
 from homeassistant.config_entries import ConfigEntry
@@ -29,8 +33,10 @@ from .extreme_price_protection import ExtremePriceProtection
 from .floor_heating_shadow import FloorHeatingShadow
 from .price_forecast import HouseholdPriceForecastCoordinator
 from .price_api import HouseholdPriceAPI
+from .solar_curtailment import SolarCurtailment
 
 
+LOGGER = logging.getLogger(__name__)
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 PLATFORMS = ["sensor", "select", "button"]
 GET_PRICES_SCHEMA = probatio.Schema({
@@ -50,6 +56,53 @@ GET_PRICE_FORECAST_SCHEMA = probatio.Schema({
         int, probatio.Range(min=0, max=7)
     ),
 })
+
+
+async def _async_cleanup_runtime(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    runtime: dict,
+    *,
+    remove_data: bool = True,
+) -> None:
+    """Idempotently stop every runtime started for one config entry."""
+    async with runtime["_cleanup_lock"]:
+        cancelled = False
+        if not runtime.get("_callbacks_cleaned"):
+            for remove in reversed(runtime["_cleanup_callbacks"]):
+                try:
+                    result = remove()
+                    if inspect.isawaitable(result):
+                        await result
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    LOGGER.exception(
+                        "Could not remove a config-entry callback during "
+                        "cleanup"
+                    )
+            runtime["_cleanup_callbacks"].clear()
+            runtime["_callbacks_cleaned"] = True
+        if not runtime.get("_runtimes_stopped"):
+            for name, stop in reversed(runtime["_started_runtimes"]):
+                try:
+                    await stop()
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    LOGGER.exception(
+                        "Could not stop the %s runtime during cleanup",
+                        name,
+                    )
+            runtime["_started_runtimes"].clear()
+            runtime["_runtimes_stopped"] = True
+        if remove_data:
+            domain_data = hass.data.get(DOMAIN, {})
+            if domain_data.get(entry.entry_id) is runtime:
+                domain_data.pop(entry.entry_id, None)
+            runtime["_data_removed"] = True
+        if cancelled:
+            raise asyncio.CancelledError
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -110,7 +163,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
     forecast = HouseholdPriceForecastCoordinator(hass, entry, coordinator)
-    await forecast.async_load()
     configured_climates = entry.options.get(
         CONF_EXTREME_PRICE_CLIMATE_ENTITIES
     )
@@ -150,6 +202,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         if optimizer else None
     )
+    solar_curtailment = (
+        SolarCurtailment(hass, entry, coordinator, devices)
+        if entry.data.get(CONF_SOLAR_ENTRY)
+        else None
+    )
     runtime = {
         "coordinator": coordinator,
         "forecast": forecast,
@@ -157,51 +214,96 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "optimizer": optimizer,
         "floor_shadow": floor_shadow,
         "extreme_protection": extreme_protection,
-        "platforms": PLATFORMS if optimizer else ["sensor"],
+        "solar_curtailment": solar_curtailment,
+        "platforms": (
+            PLATFORMS
+            if optimizer or solar_curtailment
+            else ["sensor"]
+        ),
+        "_cleanup_lock": asyncio.Lock(),
+        "_cleanup_callbacks": [],
+        "_started_runtimes": [],
+        "_callbacks_cleaned": False,
+        "_runtimes_stopped": False,
+        "_data_removed": False,
     }
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = runtime
-    if optimizer:
-        await optimizer.async_start()
-    if floor_shadow:
-        await floor_shadow.async_start()
-    if extreme_protection:
-        await extreme_protection.async_start()
-    await hass.config_entries.async_forward_entry_setups(entry, runtime["platforms"])
-    entry.async_on_unload(ha_llm.async_register_api(hass, HouseholdPriceAPI(hass, coordinator)))
-    if entry.data.get(CONF_SOLAR_ENTRY) or entry.data.get(CONF_DAIKIN_ENTRY):
-        entry.async_on_unload(
+    entry.async_on_unload(
+        lambda: _async_cleanup_runtime(hass, entry, runtime)
+    )
+    try:
+        runtime["_started_runtimes"].append(
+            ("price coordinator", coordinator.async_shutdown)
+        )
+        runtime["_started_runtimes"].append(
+            ("price forecast", forecast.async_shutdown)
+        )
+        await forecast.async_load()
+        for name, component in (
+            ("DHW optimizer", optimizer),
+            ("floor-heating shadow", floor_shadow),
+            ("extreme-price protection", extreme_protection),
+            ("solar curtailment", solar_curtailment),
+        ):
+            if component is None:
+                continue
+            runtime["_started_runtimes"].append(
+                (name, component.async_stop)
+            )
+            await component.async_start()
+        await hass.config_entries.async_forward_entry_setups(
+            entry, runtime["platforms"]
+        )
+        runtime["_cleanup_callbacks"].append(
             ha_llm.async_register_api(
-                hass, HomeEnergyDeviceAPI(hass, entry.data, devices=devices)
+                hass, HouseholdPriceAPI(hass, coordinator)
             )
         )
-    entry.async_on_unload(
-        async_track_utc_time_change(
-            hass, coordinator.async_quarter_changed, minute=[0, 15, 30, 45], second=0,
+        if entry.data.get(CONF_SOLAR_ENTRY) or entry.data.get(
+            CONF_DAIKIN_ENTRY
+        ):
+            runtime["_cleanup_callbacks"].append(
+                ha_llm.async_register_api(
+                    hass,
+                    HomeEnergyDeviceAPI(
+                        hass, entry.data, devices=devices
+                    ),
+                )
+            )
+        runtime["_cleanup_callbacks"].append(
+            async_track_utc_time_change(
+                hass,
+                coordinator.async_quarter_changed,
+                minute=[0, 15, 30, 45],
+                second=0,
+            )
         )
-    )
-    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+        runtime["_cleanup_callbacks"].append(
+            entry.add_update_listener(async_reload_entry)
+        )
+    except BaseException:
+        try:
+            await hass.config_entries.async_unload_platforms(
+                entry, runtime["platforms"]
+            )
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            LOGGER.exception(
+                "Could not unload partially forwarded pricing platforms"
+            )
+        await _async_cleanup_runtime(hass, entry, runtime)
+        raise
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
-    forecast = runtime.get("forecast")
-    if forecast:
-        await forecast.async_shutdown()
-    extreme_protection = runtime.get("extreme_protection")
-    if extreme_protection:
-        await extreme_protection.async_stop()
-    floor_shadow = runtime.get("floor_shadow")
-    if floor_shadow:
-        await floor_shadow.async_stop()
-    optimizer = runtime.get("optimizer")
-    if optimizer:
-        await optimizer.async_stop()
     unloaded = await hass.config_entries.async_unload_platforms(
         entry, runtime.get("platforms", ["sensor"])
     )
-    if unloaded:
-        hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+    if unloaded and runtime:
+        await _async_cleanup_runtime(hass, entry, runtime)
     return unloaded
 
 

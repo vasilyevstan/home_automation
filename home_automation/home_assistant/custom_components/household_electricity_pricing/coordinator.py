@@ -31,6 +31,7 @@ from .const import CONF_ELERING_PATH, CONF_NORDPOOL_ENTRY, CONF_PROFILE_PATH, DO
 
 
 LOGGER = logging.getLogger(__name__)
+QUARTER_REFRESH_TRANSITION_SECONDS = 60
 
 
 class HouseholdPriceCoordinator(DataUpdateCoordinator[PriceSnapshot]):
@@ -41,6 +42,9 @@ class HouseholdPriceCoordinator(DataUpdateCoordinator[PriceSnapshot]):
         self.market_errors: dict[date, str] = {}
         self._cache: dict[date, dict[datetime, Decimal]] = {}
         self._attempted: dict[date, datetime] = {}
+        self._quarter_refresh_in_progress = False
+        self._quarter_refresh_started_at: datetime | None = None
+        self._quarter_refresh_hold_until: datetime | None = None
         self.credentials_name = entry.data.get(CONF_ELERING_PATH)
         self.calculator = ElectricityCalculator(
             profile_provider=lambda: load_profile(profile_path(Path(hass.config.config_dir), self.profile_name)),
@@ -61,8 +65,37 @@ class HouseholdPriceCoordinator(DataUpdateCoordinator[PriceSnapshot]):
 
     async def async_quarter_changed(self, now: datetime) -> None:
         # Expire the previous quarter before any provider request can block.
+        self._quarter_refresh_in_progress = True
+        self._quarter_refresh_started_at = now
+        self._quarter_refresh_hold_until = now + timedelta(
+            seconds=QUARTER_REFRESH_TRANSITION_SECONDS
+        )
         self.async_update_listeners()
-        await self.async_request_refresh()
+        try:
+            await self.async_request_refresh()
+        finally:
+            self._quarter_refresh_in_progress = False
+
+    def in_quarter_refresh_transition(self, now: datetime) -> bool:
+        """Return whether stale current data is inside the bounded rollover hold."""
+        started = self._quarter_refresh_started_at
+        hold_until = self._quarter_refresh_hold_until
+        if now.utcoffset() is None:
+            return False
+        if (
+            started is not None
+            and hold_until is not None
+            and started <= now <= hold_until
+        ):
+            return True
+        valid_until = getattr(self.data, "valid_until", None)
+        if (
+            not isinstance(valid_until, datetime)
+            or valid_until.utcoffset() is None
+        ):
+            return False
+        elapsed = (now - valid_until).total_seconds()
+        return 0 <= elapsed <= QUARTER_REFRESH_TRANSITION_SECONDS
 
     async def async_price_response(self, period: str) -> dict:
         if period not in ("today", "tomorrow"):

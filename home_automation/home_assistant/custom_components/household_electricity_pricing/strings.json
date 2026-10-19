@@ -9,7 +9,7 @@
           "nordpool_config_entry": "Nord Pool configuration",
           "profile_path": "Private profile path relative to the HA configuration directory",
           "elering_credentials_path": "Optional private Elering credentials JSON path for automatic bills",
-          "solar_config_entry": "Optional inverter for separately enabled guarded MCP controls",
+          "solar_config_entry": "Optional inverter for guarded reads and conservative solar curtailment",
           "daikin_config_entry": "Optional Daikin for separately enabled guarded MCP controls"
         }
       },
@@ -20,7 +20,7 @@
           "nordpool_config_entry": "Nord Pool configuration",
           "profile_path": "Private profile path relative to the HA configuration directory",
           "elering_credentials_path": "Optional private Elering credentials JSON path for automatic bills",
-          "solar_config_entry": "Optional inverter for separately enabled guarded MCP controls",
+          "solar_config_entry": "Optional inverter for guarded reads and conservative solar curtailment",
           "daikin_config_entry": "Optional Daikin for separately enabled guarded MCP controls"
         }
       }
@@ -66,6 +66,9 @@
       },
       "extreme_price_protection": {
         "name": "Extreme price protection"
+      },
+      "solar_curtailment": {
+        "name": "Solar curtailment"
       }
     }
   },

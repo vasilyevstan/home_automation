@@ -79,7 +79,10 @@ Advanced parameter configuration exposes percentage and fixed-watt derating
 entities on supported devices; some are disabled by default. Scope percentage
 operations to the verified 0..100 policy and watt limits to the device's actual
 Pmax. Preserve mode-aware checks and read-back; a stored limit is not necessarily
-the active limit or measured output.
+the active limit or measured output. Read-only entries remain readable through
+the guarded API, but no write tool or automatic cap is available unless the
+selected entry has elevated parameter configuration and its native configuration
+coordinator.
 
 Grid-feed-in limiting is a different feature and may require a compatible power
 meter. PV generation alone is not household demand or grid export. Do not infer
@@ -380,21 +383,37 @@ automatically selected by an MCP server whose all-APIs option is off.
 That API provides `GetSolarGenerationLimit`, `SetSolarGenerationLimit`,
 `GetDaikinStatus`, and/or `ControlDaikin` for the selected devices only. Add only the discovered, prefixed
 tool names to the client's allowlist after selecting the API. Solar requests
-require expected configured/active limits and explicit permission for a mode
-change. Daikin requests require known inactive guard flags, native mode/range/step,
-and configured/effective read-back where applicable.
+require expected config-entry ID, serial, Pmax, configured/active limits and
+explicit permission for a mode change. `SetSolarGenerationLimit` is not
+advertised for a read-only Huawei entry. Daikin requests require known inactive
+guard flags, native mode/range/step, and configured/effective read-back where
+applicable.
 
 Controls reuse HA's existing device clients. They do not open another inverter
 connection or write a permission-test register during setup. Device
 authentication/permission errors are still enforced on actual requested writes;
-no password is guessed or authentication disabled. Broad Huawei parameter UI
-configuration can remain off while these narrowly scoped MCP operations are
-enabled separately.
+no password is guessed or authentication disabled. Huawei writes fail closed
+unless elevated parameter configuration and the native configuration coordinator
+are both usable.
+
+The guarded writer holds Huawei's `update_lock`, which serializes against native
+polling, but Huawei's own service/entity writes do not participate in that lock.
+After authentication and durable prepared-audit persistence, the guarded writer
+therefore performs a second exact config-entry/serial/Pmax, configured/active
+limit and active-power read immediately before dispatch. Any change is treated
+as an external override and no command is sent. A native write can still race in
+the final interval between that optimistic read and the Modbus write, so do not
+run Huawei-native limit changes concurrently with guarded control.
 
 Intent is journaled privately in HA's
 `.storage/home_energy_control.jsonl` before dispatch. Requests are serialized per
 device, unchanged verified targets produce read-only no-ops, and uncertain
-outcomes are reported instead of automatically replayed or rolled back.
+outcomes are reported instead of controller-level replay, inversion or rollback.
+Pre-dispatch lock, authentication and read failures explicitly state that no
+command was sent. If exact device read-back succeeds but the final audit record
+cannot be persisted, the confirmed device state is retained and the separate
+audit-persistence failure is exposed. The controller makes no claim about retry
+behavior internal to the Huawei transport.
 
 Do not expose an unrestricted service caller, register access, administrator
 tools, boost/installer controls, or automatic optimization through the LLM API.
@@ -402,6 +421,75 @@ A write may take effect even if acknowledgement/read-back fails: report
 uncertainty and inspect fresh state rather than replaying it. Connectivity tests
 are read-only, not same-value writes, toggles, heating changes, or power-limit
 changes.
+
+## Solar curtailment
+
+Selecting a Huawei entry creates an independent deterministic
+`Solar curtailment` runtime even when no Daikin is configured. It uses the exact
+current `export_earnings_eur_kwh` from the pricing coordinator. This is bounded
+open-loop generation curtailment based on export economics; it is not
+zero-export control and does not infer household surplus, grid direction or
+export power.
+
+Policy revision 1 defaults to `Shadow`. `Armed` is hidden until deterministic
+policy replay, elevated Huawei write capability, bound config-entry/serial/Pmax,
+mode-preserving cap calculation and two stable unrestricted observations are
+verified. Passing those gates never selects `Armed` automatically.
+
+An exact negative export price is a Shadow opportunity. Armed entry additionally
+requires:
+
+- export earnings at or below **-€0.010/kWh**;
+- a known contiguous negative-price block with at least 30 minutes remaining;
+- the existing configured and active limit to match at unrestricted 100% or
+  Pmax;
+- fresh inverter AC active power at or above 5,000 W on two observations at
+  least 30 seconds apart, plus a full 60-second qualification dwell;
+- a distinct native-step **4,000 W-equivalent** target in the existing limit
+  mode. An 8 kW inverter in percentage mode therefore uses 50.0%; fixed-watt
+  mode uses 4,000 W. The controller never changes limit mode.
+
+One dispatched acquisition attempt is allowed per contiguous block. The lease
+ends at the earlier of two hours or the block end. Clouds or lower PV output after
+acquisition do not trigger an early restore because the cap can become
+non-binding. The exact original limit is restored on non-negative, stale or
+invalid prices, profile change, lease expiry, block end, mode change or graceful
+unload.
+
+Ownership is stored before and after dispatch and is bound to the pricing config
+entry, inverter serial and Pmax. Startup reconciliation retains an exact target,
+clears an exact original, and treats any other limit as an external/manual
+override without writing. Controller state uses a private atomic JSON file with
+mode 0600, no-follow opens, file and directory `fsync`, and atomic replacement;
+unlike HA `Store.async_save`, serialization and disk failures propagate to the
+caller before dispatch. Legacy Store state is read only for migration.
+
+The manifest orders setup after Huawei when that integration is present. A
+transient not-loaded/setup/retry state defers persisted-ownership reconciliation
+without latching uncertainty; after Huawei is loaded, an actual reconciliation
+read failure faults normally. A persisted pending phase or any post-dispatch
+failure latches an uncertain fault and requires the explicit resume button.
+Pre-dispatch failures may requalify. Manual/external limit changes cancel
+ownership and suppress re-entry for the rest of that block.
+
+At a quarter boundary, the coordinator still expires the old current price
+immediately. During its bounded refresh transition, however, an exact owned cap
+is retained only while the persisted block end, pricing profile and lease remain
+valid. Refreshed data then either continues ownership or requests exact-original
+restoration; rollover alone neither restores nor consumes/suppresses the block.
+
+If device read-back exactly confirms the target or original but final controller
+state or verified-audit persistence fails, the sensor reports a separate
+`persistence_fault`. It keeps the in-memory physical classification exact
+(`owned` target or cleared ownership after original restoration) rather than
+calling that confirmed outcome uncertain.
+
+The status sensor exposes exact prices, block bounds, active-power age, Pmax,
+output and dwell gates, configured/active/target caps, ownership/original/lease,
+operation and audit results, external override and commissioning gates. Its
+value fields are limited to cost per avoided exported kWh and elapsed eligible
+or owned minutes. Without fresh signed grid power it never reports curtailed
+kWh, zero-export performance, or estimated/realized euro savings.
 
 ## Domestic-hot-water price optimizer
 
@@ -544,8 +632,10 @@ setback. At or above 21°C it suppresses the separate +1°C candidate.
 DHW comfort, readiness and preheat states have compressor priority. A
 conflicting floor preheat candidate is recorded as deferred rather than assumed
 to run concurrently. Fresh directional net-grid power and whole-heat-pump
-electrical energy are unavailable, so solar dispatch is disabled and the
-sensor reports price opportunity rather than measured kWh or euro savings.
+electrical energy are unavailable, so solar-driven floor-heating dispatch
+remains disabled and the sensor reports price opportunity rather than measured
+kWh or euro savings. The separate bounded inverter-curtailment controller does
+not make the floor evaluator solar-aware.
 Promotion remains ineligible until at least 14 observed days, five complete
 candidate cycles, thermal-lag review and explicit room-comfort bounds exist.
 
@@ -686,6 +776,10 @@ uv run --no-project --isolated --python 3.14 \
 uv run --no-project --isolated --python 3.14 \
   --with-requirements home_automation/home_assistant/tests/requirements.txt \
   python home_automation/home_assistant/tests/test_controls.py -v
+
+uv run --no-project --isolated --python 3.14 \
+  --with-requirements home_automation/home_assistant/tests/requirements.txt \
+  python home_automation/home_assistant/tests/test_solar_curtailment.py -v
 
 uv run --no-project --isolated --python 3.14 \
   --with-requirements home_automation/home_assistant/tests/requirements.txt \

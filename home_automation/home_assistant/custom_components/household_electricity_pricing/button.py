@@ -6,18 +6,27 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, EXTREME_PRICE_MODE_SHADOW, NAME
+from .const import (
+    DOMAIN,
+    EXTREME_PRICE_MODE_SHADOW,
+    NAME,
+    SOLAR_CURTAILMENT_MODE_SHADOW,
+)
 
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     runtime = hass.data[DOMAIN][entry.entry_id]
-    optimizer = runtime["optimizer"]
-    entities = [
-        DhwOptimizerResumeButton(optimizer, entry.entry_id),
-        DhwOptimizerNormalButton(optimizer, entry.entry_id),
-    ]
+    optimizer = runtime.get("optimizer")
+    entities = []
+    if optimizer is not None:
+        entities.extend(
+            (
+                DhwOptimizerResumeButton(optimizer, entry.entry_id),
+                DhwOptimizerNormalButton(optimizer, entry.entry_id),
+            )
+        )
     protection = runtime.get("extreme_protection")
     if protection is not None:
         entities.extend(
@@ -40,6 +49,20 @@ async def async_setup_entry(
                 ),
                 ExtremePriceProtectionResumeButton(
                     protection,
+                    entry.entry_id,
+                ),
+            )
+        )
+    solar_curtailment = runtime.get("solar_curtailment")
+    if solar_curtailment is not None:
+        entities.extend(
+            (
+                SolarCurtailmentCommissionButton(
+                    solar_curtailment,
+                    entry.entry_id,
+                ),
+                SolarCurtailmentResumeButton(
+                    solar_curtailment,
                     entry.entry_id,
                 ),
             )
@@ -201,3 +224,63 @@ class ExtremePriceProtectionResumeButton(ExtremePriceProtectionButton):
 
     async def async_press(self) -> None:
         await self.protection.async_resume_after_review()
+
+
+class SolarCurtailmentButton(ButtonEntity):
+    _attr_has_entity_name = True
+
+    def __init__(self, controller, entry_id: str, suffix: str) -> None:
+        self.controller = controller
+        self._attr_unique_id = (
+            entry_id + "_solar_curtailment_" + suffix
+        )
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)},
+            name=NAME,
+            manufacturer="home_automation",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            self.controller.async_add_listener(
+                self.async_write_ha_state
+            )
+        )
+
+
+class SolarCurtailmentCommissionButton(SolarCurtailmentButton):
+    _attr_name = "Verify solar curtailment commissioning"
+    _attr_icon = "mdi:solar-power-variant"
+
+    def __init__(self, controller, entry_id: str) -> None:
+        super().__init__(controller, entry_id, "verify_commissioning")
+
+    @property
+    def available(self) -> bool:
+        return (
+            self.controller.mode == SOLAR_CURTAILMENT_MODE_SHADOW
+            and not self.controller.state.get("fault")
+            and not self.controller.state.get("ownership")
+            and not self.controller.commissioning_complete
+        )
+
+    async def async_press(self) -> None:
+        await self.controller.async_verify_commissioning()
+
+
+class SolarCurtailmentResumeButton(SolarCurtailmentButton):
+    _attr_name = "Resume solar curtailment after review"
+    _attr_icon = "mdi:solar-power-variant-outline"
+
+    def __init__(self, controller, entry_id: str) -> None:
+        super().__init__(controller, entry_id, "resume")
+
+    @property
+    def available(self) -> bool:
+        return bool(
+            self.controller.state.get("fault")
+            or self.controller.state.get("persistence_fault")
+        )
+
+    async def async_press(self) -> None:
+        await self.controller.async_resume_after_review()

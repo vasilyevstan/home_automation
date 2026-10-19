@@ -35,6 +35,27 @@ from .const import (
 
 LOGGER = logging.getLogger(__name__)
 FLAGS = ("ErrorState", "WarningState", "EmergencyState", "InstallerState")
+SOLAR_ELEVATED_CONFIGURATION = "enable_parameter_configuration"
+
+
+class SolarPreDispatchError(HomeAssistantError):
+    """Solar operation failed before a device command was dispatched."""
+
+
+class SolarPostDispatchError(HomeAssistantError):
+    """Solar operation failed after dispatch and has an uncertain outcome."""
+
+
+class SolarDependencyNotReady(SolarPreDispatchError):
+    """The selected Huawei runtime has not finished loading."""
+
+
+class SolarExternalOverrideError(SolarPreDispatchError):
+    """Fresh state changed after the caller prepared a solar write."""
+
+    def __init__(self, message: str, status: dict) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def number(value, label, minimum, maximum, step):
@@ -543,19 +564,135 @@ class EnergyDevices:
                     + str(error)
                 ) from error
 
-    def solar_device(self):
-        entry = self.entry(self.solar_entry, "huawei_solar")
+    @staticmethod
+    def _runtime_value(item, key):
+        if isinstance(item, dict):
+            return item.get(key)
+        return getattr(item, key, None)
+
+    def solar_device_data(self):
+        entry = (
+            self.hass.config_entries.async_get_entry(self.solar_entry)
+            if self.solar_entry
+            else None
+        )
+        if entry is None or entry.domain != "huawei_solar":
+            raise HomeAssistantError(
+                "The explicitly selected huawei_solar integration is "
+                "unavailable."
+            )
+        if entry.state is not ConfigEntryState.LOADED:
+            raise SolarDependencyNotReady(
+                "The selected Huawei integration is not loaded "
+                f"({entry.state.value}); no inverter command was sent."
+            )
         from huawei_solar import SUN2000Device
 
-        devices = [
-            item.device for item in entry.runtime_data["device_datas"]
-            if isinstance(item.device, SUN2000Device)
+        runtime_data = entry.runtime_data
+        device_datas = (
+            runtime_data.get("device_datas")
+            if isinstance(runtime_data, dict)
+            else None
+        )
+        if not isinstance(device_datas, list):
+            raise HomeAssistantError(
+                "The selected Huawei entry has no usable device runtime."
+            )
+        matches = [
+            item
+            for item in device_datas
+            if isinstance(self._runtime_value(item, "device"), SUN2000Device)
         ]
-        if len(devices) != 1:
-            raise HomeAssistantError("Select a Huawei entry with exactly one verified SUN2000 inverter.")
-        return devices[0]
+        if len(matches) != 1:
+            raise HomeAssistantError(
+                "Select a Huawei entry with exactly one verified SUN2000 inverter."
+            )
+        return entry, matches[0], self._runtime_value(matches[0], "device")
 
-    async def solar_limit(self, device):
+    def solar_device(self):
+        return self.solar_device_data()[2]
+
+    def solar_write_capability(self) -> tuple[bool, str]:
+        try:
+            entry, device_data, device = self.solar_device_data()
+        except HomeAssistantError as error:
+            return False, str(error)
+        if entry.data.get(SOLAR_ELEVATED_CONFIGURATION) is not True:
+            return (
+                False,
+                "Huawei elevated parameter configuration is disabled.",
+            )
+        coordinator = self._runtime_value(
+            device_data, "configuration_update_coordinator"
+        )
+        if coordinator is None or not callable(
+            getattr(coordinator, "async_request_refresh", None)
+        ):
+            return (
+                False,
+                "The Huawei configuration coordinator is unavailable.",
+            )
+        if not callable(getattr(device.client, "set", None)):
+            return False, "The Huawei runtime has no usable write operation."
+        if entry.data.get("username") and not callable(
+            getattr(device, "ensure_logged_in", None)
+        ):
+            return (
+                False,
+                "The authenticated Huawei runtime cannot refresh its login.",
+            )
+        return (
+            True,
+            "Elevated parameter configuration and the native configuration "
+            "coordinator are available.",
+        )
+
+    def solar_write_available(self) -> bool:
+        return self.solar_write_capability()[0]
+
+    def _require_solar_write_capability(
+        self, entry, device_data, device
+    ) -> str:
+        if entry.data.get(SOLAR_ELEVATED_CONFIGURATION) is not True:
+            raise SolarPreDispatchError(
+                "Huawei elevated parameter configuration is disabled; no "
+                "inverter command was sent."
+            )
+        coordinator = self._runtime_value(
+            device_data, "configuration_update_coordinator"
+        )
+        if coordinator is None or not callable(
+            getattr(coordinator, "async_request_refresh", None)
+        ):
+            raise SolarPreDispatchError(
+                "The Huawei configuration coordinator is unavailable; no "
+                "inverter command was sent."
+            )
+        if not callable(getattr(device.client, "set", None)):
+            raise SolarPreDispatchError(
+                "The Huawei runtime has no usable write operation; no inverter "
+                "command was sent."
+            )
+        if entry.data.get("username") and not callable(
+            getattr(device, "ensure_logged_in", None)
+        ):
+            raise SolarPreDispatchError(
+                "The authenticated Huawei runtime cannot refresh its login; no "
+                "inverter command was sent."
+            )
+        return (
+            "elevated_parameter_configuration_with_native_configuration_"
+            "coordinator"
+        )
+
+    async def solar_limit(
+        self,
+        device,
+        *,
+        config_entry_id: str,
+        write_enabled: bool,
+        write_permission_basis: str,
+    ):
         from huawei_solar import register_names as rn
 
         serial = (await device.client.get(rn.SERIAL_NUMBER)).value
@@ -570,6 +707,13 @@ class EnergyDevices:
             raise HomeAssistantError("The active inverter limit is unavailable.")
         mode, active, command = (item.value for item in values)
         maximum = number((await device.client.get(rn.P_MAX)).value, "Pmax", 1, 1e9, 1)
+        active_power = number(
+            (await device.client.get(rn.ACTIVE_POWER)).value,
+            "Inverter AC active power",
+            -1e9,
+            1e9,
+            1,
+        )
         if (mode, command) == (0, 40125):
             configured = number(
                 (await device.client.get(rn.ACTIVE_POWER_PERCENTAGE_DERATING)).value,
@@ -577,6 +721,7 @@ class EnergyDevices:
             )
             actual = number(active / 10, "Active percentage", 0, 100, 0.1)
             label = "percent"
+            minimum, limit_maximum, step = 0.0, 100.0, 0.1
         elif (mode, command) == (1, 40126):
             configured = number(
                 (await device.client.get(rn.ACTIVE_POWER_FIXED_VALUE_DERATING)).value,
@@ -584,103 +729,391 @@ class EnergyDevices:
             )
             actual = number(active, "Active watt limit", 0, maximum, 1)
             label = "watts"
+            minimum, limit_maximum, step = 0.0, maximum, 1.0
         else:
             raise HomeAssistantError("Another inverter control mode is active; it will not be replaced.")
+        observed_at = datetime.now(timezone.utc).isoformat()
         return {
-            "mode": label, "configured": configured, "active": actual, "pmax_w": maximum,
-            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "config_entry_id": config_entry_id,
+            "serial": serial,
+            "mode": label,
+            "configured": configured,
+            "active": actual,
+            "pmax_w": maximum,
+            "active_power_w": active_power,
+            "active_power_observed_at": observed_at,
+            "limit_minimum": minimum,
+            "limit_maximum": limit_maximum,
+            "limit_step": step,
+            "write_enabled": write_enabled,
+            "write_permission_basis": write_permission_basis,
+            "observed_at": observed_at,
         }
 
     async def get_solar_limit(self):
+        from huawei_solar import HuaweiSolarException
+
         try:
-            async with self.solar_session() as device:
-                return await self.solar_limit(device)
-        except TimeoutError as error:
-            raise HomeAssistantError(
-                "The inverter did not respond within the read deadline; no control command was sent."
+            async with self.solar_session() as (
+                entry,
+                _device_data,
+                device,
+            ):
+                write_enabled, basis = self.solar_write_capability()
+                return await self.solar_limit(
+                    device,
+                    config_entry_id=entry.entry_id,
+                    write_enabled=write_enabled,
+                    write_permission_basis=basis,
+                )
+        except (
+            HomeAssistantError,
+            HuaweiSolarException,
+            TimeoutError,
+            OSError,
+            ValueError,
+            KeyError,
+        ) as error:
+            if isinstance(error, SolarPreDispatchError):
+                raise
+            raise SolarPreDispatchError(
+                "Fresh inverter limit and active power are unavailable; no "
+                "control command was sent. Cause: "
+                + str(error)
             ) from error
 
-    @asynccontextmanager
-    async def solar_session(self):
-        async with asyncio.timeout(30), self.solar_lock:
-            device = self.solar_device()
-            # Native coordinator batches use this same lock.
-            async with device.update_lock:
-                yield device
+    async def get_solar_status(self):
+        """Return one fresh identity, capability, limit, and active-power read."""
+        return await self.get_solar_limit()
 
-    async def set_solar_limit(self, args):
-        entry = self.entry(self.solar_entry, "huawei_solar")
+    @asynccontextmanager
+    async def solar_session(self, *, require_write: bool = False):
+        async with asyncio.timeout(30), self.solar_lock:
+            entry, device_data, device = self.solar_device_data()
+            if require_write:
+                self._require_solar_write_capability(
+                    entry, device_data, device
+                )
+            # Native polling uses this lock. Native service writes do not, so
+            # set_solar_limit also performs an optimistic final exact read.
+            async with device.update_lock:
+                yield entry, device_data, device
+
+    async def set_solar_limit(self, args, *, automatic: bool = False):
         from huawei_solar import HuaweiSolarException, register_names as rn
 
-        async with self.solar_session() as device:
-            previous = await self.solar_limit(device)
-            expected = number(
-                args["expected_value"], "Expected limit", 0,
-                100 if previous["mode"] == "percent" else previous["pmax_w"],
-                0.1 if previous["mode"] == "percent" else 1,
-            )
-            expected_active = number(
-                args["expected_active_value"], "Expected active limit", 0,
-                100 if previous["mode"] == "percent" else previous["pmax_w"],
-                0.1 if previous["mode"] == "percent" else 1,
-            )
-            if (
-                args["expected_mode"] != previous["mode"]
-                or expected != previous["configured"]
-                or expected_active != previous["active"]
+        dispatched = False
+        record = None
+        try:
+            async with self.solar_session(require_write=True) as (
+                entry,
+                _device_data,
+                device,
             ):
-                raise HomeAssistantError("The inverter limit changed; read it again before requesting a change.")
-            mode = args["mode"]
-            if mode not in ("percent", "watts"):
-                raise HomeAssistantError("Choose percent or watts.")
-            if mode != previous["mode"] and args.get("allow_mode_change") is not True:
-                raise HomeAssistantError("Changing the limit mode needs explicit allow_mode_change=true.")
-            requested = number(
-                args["value"], "Requested limit", 0,
-                100 if mode == "percent" else previous["pmax_w"],
-                0.1 if mode == "percent" else 1,
-            )
-            if mode == previous["mode"] and requested == previous["configured"] == previous["active"]:
-                return {"changed": False, "previous": previous, "confirmed": previous}
-            if entry.data.get("username"):
-                if not await device.ensure_logged_in() or not await device.client.heartbeat():
-                    raise HomeAssistantError("Configured inverter authentication failed; no cap write was sent.")
-                refreshed = await self.solar_limit(device)
-                if any(refreshed[key] != previous[key] for key in ("mode", "configured", "active", "pmax_w")):
-                    raise HomeAssistantError("The inverter limit changed during authentication; read it again.")
-            record = {
-                "request_id": str(uuid4()), "device": "solar", "previous": previous,
-                "requested": {"mode": mode, "value": requested},
-            }
-            await self.record("prepared", record)
-            register = (
-                rn.ACTIVE_POWER_PERCENTAGE_DERATING
-                if mode == "percent" else rn.ACTIVE_POWER_FIXED_VALUE_DERATING
-            )
-            try:
+                permission_basis = (
+                    "elevated_parameter_configuration_with_native_"
+                    "configuration_coordinator"
+                )
+                previous = await self.solar_limit(
+                    device,
+                    config_entry_id=entry.entry_id,
+                    write_enabled=True,
+                    write_permission_basis=permission_basis,
+                )
+                expected_entry_id = args.get("expected_config_entry_id")
+                expected_serial = args.get("expected_serial")
+                expected_pmax = number(
+                    args.get("expected_pmax_w"),
+                    "Expected Pmax",
+                    1,
+                    1e9,
+                    1,
+                )
+                if (
+                    expected_entry_id != previous["config_entry_id"]
+                    or expected_serial != previous["serial"]
+                    or expected_pmax != previous["pmax_w"]
+                ):
+                    raise SolarPreDispatchError(
+                        "The inverter config entry, serial, or Pmax changed; "
+                        "read it again before requesting a change. No inverter "
+                        "command was sent."
+                    )
+                expected = number(
+                    args["expected_value"], "Expected limit", 0,
+                    (
+                        100
+                        if previous["mode"] == "percent"
+                        else previous["pmax_w"]
+                    ),
+                    0.1 if previous["mode"] == "percent" else 1,
+                )
+                expected_active = number(
+                    args["expected_active_value"], "Expected active limit", 0,
+                    (
+                        100
+                        if previous["mode"] == "percent"
+                        else previous["pmax_w"]
+                    ),
+                    0.1 if previous["mode"] == "percent" else 1,
+                )
+                if (
+                    args["expected_mode"] != previous["mode"]
+                    or expected != previous["configured"]
+                    or expected_active != previous["active"]
+                ):
+                    raise SolarPreDispatchError(
+                        "The inverter limit changed; read it again before "
+                        "requesting a change. No inverter command was sent."
+                    )
+                if automatic and previous["configured"] != previous["active"]:
+                    raise SolarPreDispatchError(
+                        "Automatic inverter control requires matching "
+                        "configured and active limits; no inverter command was "
+                        "sent."
+                    )
+                mode = args["mode"]
+                if mode not in ("percent", "watts"):
+                    raise SolarPreDispatchError(
+                        "Choose percent or watts; no inverter command was sent."
+                    )
+                if automatic and mode != previous["mode"]:
+                    raise SolarPreDispatchError(
+                        "Automatic inverter control cannot change the active "
+                        "limit mode; no inverter command was sent."
+                    )
+                if (
+                    mode != previous["mode"]
+                    and args.get("allow_mode_change") is not True
+                ):
+                    raise SolarPreDispatchError(
+                        "Changing the limit mode needs explicit "
+                        "allow_mode_change=true; no inverter command was sent."
+                    )
+                requested = number(
+                    args["value"], "Requested limit", 0,
+                    100 if mode == "percent" else previous["pmax_w"],
+                    0.1 if mode == "percent" else 1,
+                )
+                if (
+                    mode == previous["mode"]
+                    and requested
+                    == previous["configured"]
+                    == previous["active"]
+                ):
+                    return {
+                        "changed": False,
+                        "phase": "no_change",
+                        "previous": previous,
+                        "confirmed": previous,
+                        "audit_persisted": True,
+                        "audit_error": None,
+                    }
+                if entry.data.get("username"):
+                    if (
+                        not await device.ensure_logged_in()
+                        or not await device.client.heartbeat()
+                    ):
+                        raise SolarPreDispatchError(
+                            "Configured inverter authentication failed; no cap "
+                            "write was sent."
+                        )
+                    refreshed = await self.solar_limit(
+                        device,
+                        config_entry_id=entry.entry_id,
+                        write_enabled=True,
+                        write_permission_basis=permission_basis,
+                    )
+                    if any(
+                        refreshed[key] != previous[key]
+                        for key in (
+                            "config_entry_id",
+                            "serial",
+                            "mode",
+                            "configured",
+                            "active",
+                            "pmax_w",
+                            "active_power_w",
+                        )
+                    ):
+                        raise SolarPreDispatchError(
+                            "The inverter identity, Pmax, limit, or active "
+                            "power changed "
+                            "during authentication; read it again. No inverter "
+                            "command was sent."
+                        )
+                record = {
+                    "request_id": str(uuid4()),
+                    "device": "solar",
+                    "identity": {
+                        "config_entry_id": previous["config_entry_id"],
+                        "serial": previous["serial"],
+                        "pmax_w": previous["pmax_w"],
+                    },
+                    "expected": {
+                        "config_entry_id": expected_entry_id,
+                        "serial": expected_serial,
+                        "pmax_w": expected_pmax,
+                        "mode": args["expected_mode"],
+                        "configured": expected,
+                        "active": expected_active,
+                    },
+                    "previous": previous,
+                    "requested": {"mode": mode, "value": requested},
+                    "automatic": automatic,
+                }
+                await self.record("prepared", record)
+                immediate = await self.solar_limit(
+                    device,
+                    config_entry_id=entry.entry_id,
+                    write_enabled=True,
+                    write_permission_basis=permission_basis,
+                )
+                exact_keys = (
+                    "config_entry_id",
+                    "serial",
+                    "mode",
+                    "configured",
+                    "active",
+                    "pmax_w",
+                    "active_power_w",
+                )
+                if any(
+                    immediate[key] != previous[key]
+                    for key in exact_keys
+                ):
+                    try:
+                        await self.record(
+                            "not_dispatched",
+                            {
+                                **record,
+                                "reason": (
+                                    "The exact inverter state changed after "
+                                    "prepared persistence."
+                                ),
+                                "observed": immediate,
+                            },
+                        )
+                    except OSError:
+                        LOGGER.exception(
+                            "The solar command was not dispatched, and its "
+                            "not-dispatched audit record could not be "
+                            "persisted."
+                        )
+                    raise SolarExternalOverrideError(
+                        "The inverter identity, Pmax, limit, or active power "
+                        "changed after the prepared audit record. This is "
+                        "treated as an external override and no inverter "
+                        "command was sent.",
+                        immediate,
+                    )
+                register = (
+                    rn.ACTIVE_POWER_PERCENTAGE_DERATING
+                    if mode == "percent"
+                    else rn.ACTIVE_POWER_FIXED_VALUE_DERATING
+                )
+                dispatched = True
                 if not await device.client.set(register, requested):
-                    raise HomeAssistantError("The inverter did not acknowledge the requested limit.")
+                    raise HomeAssistantError(
+                        "The inverter did not acknowledge the requested limit."
+                    )
                 for attempt in range(4):
-                    current = await self.solar_limit(device)
-                    if current["mode"] == mode and current["configured"] == requested and current["active"] == requested:
-                        await self.record("verified", {**record, "confirmed": current})
-                        return {"changed": True, "previous": previous, "confirmed": current}
+                    current = await self.solar_limit(
+                        device,
+                        config_entry_id=entry.entry_id,
+                        write_enabled=True,
+                        write_permission_basis=permission_basis,
+                    )
+                    if (
+                        current["config_entry_id"] == expected_entry_id
+                        and current["serial"] == expected_serial
+                        and current["pmax_w"] == expected_pmax
+                        and current["mode"] == mode
+                        and current["configured"] == requested
+                        and current["active"] == requested
+                    ):
+                        audit_persisted = True
+                        audit_error = None
+                        try:
+                            await self.record(
+                                "verified",
+                                {**record, "confirmed": current},
+                            )
+                        except OSError as error:
+                            audit_persisted = False
+                            audit_error = (
+                                type(error).__name__ + ": " + str(error)
+                            )
+                            LOGGER.exception(
+                                "The inverter limit was exactly confirmed, but "
+                                "the verified audit record could not be "
+                                "persisted."
+                            )
+                        return {
+                            "changed": True,
+                            "phase": "verified",
+                            "previous": previous,
+                            "confirmed": current,
+                            "audit_persisted": audit_persisted,
+                            "audit_error": audit_error,
+                        }
                     if attempt < 3:
                         await asyncio.sleep(0.5)
-                raise HomeAssistantError("The requested configured and active limits were not both confirmed.")
-            except asyncio.CancelledError:
-                LOGGER.error("Solar request cancelled after dispatch began; its prepared journal record remains uncertain.")
-                raise
-            except (HomeAssistantError, HuaweiSolarException, TimeoutError, OSError) as error:
-                LOGGER.error("Solar command outcome is uncertain; read the current limit before further action.")
-                try:
-                    await self.record("uncertain", record)
-                except OSError:
-                    LOGGER.exception("Could not persist the uncertain solar outcome.")
                 raise HomeAssistantError(
-                    "The inverter command may have applied. Read its limit before any retry or restoration; "
-                    "no automatic retry or rollback was performed."
+                    "The requested configured and active limits were not both "
+                    "confirmed."
+                )
+        except asyncio.CancelledError:
+            if dispatched:
+                LOGGER.error("Solar request cancelled after dispatch began; its prepared journal record remains uncertain.")
+            raise
+        except SolarPostDispatchError:
+            raise
+        except (
+            HomeAssistantError,
+            HuaweiSolarException,
+            TimeoutError,
+            OSError,
+            ValueError,
+            KeyError,
+        ) as error:
+            if not dispatched:
+                if isinstance(error, SolarPreDispatchError):
+                    raise
+                raise SolarPreDispatchError(
+                    "The solar operation failed before dispatch; no inverter "
+                    "command was sent. Cause: "
+                    + str(error)
                 ) from error
+            LOGGER.error(
+                "Solar command outcome is uncertain; read the current limit "
+                "before further action."
+            )
+            audit_error = None
+            if record is not None:
+                try:
+                    await self.record(
+                        "uncertain",
+                        {
+                            **record,
+                            "error": type(error).__name__ + ": " + str(error),
+                        },
+                    )
+                except OSError as journal_error:
+                    audit_error = (
+                        type(journal_error).__name__ + ": " + str(journal_error)
+                    )
+                    LOGGER.exception("Could not persist the uncertain solar outcome.")
+            message = (
+                "The inverter command may have applied. Read its limit before "
+                "any controller-level replay, inversion, or restoration. This "
+                "controller dispatched one write and did not replay, invert, or "
+                "roll it back; the transport's internal retry behavior is not "
+                "asserted."
+            )
+            if audit_error:
+                message += " The uncertain audit record also failed: " + audit_error
+            raise SolarPostDispatchError(message) from error
 
     def daikin_api(self):
         entry = self.entry(self.daikin_entry, "daikin_altherma")
@@ -881,7 +1314,7 @@ class SolarLimitRead(llm.Tool):
 class SolarLimitWrite(llm.Tool):
     name = "SetSolarGenerationLimit"
     title = "Explicitly set solar generation limit"
-    description = "Only for an explicit user request. Uses expected configured/active values, native bounds and fresh read-back. No setup permission-test write is performed. Any command error may mean the limit already changed."
+    description = "Only for an explicit user request. Requires elevated Huawei parameter configuration plus expected config-entry, serial, Pmax, configured and active values, native bounds and exact fresh read-back. No setup permission-test write is performed. Only failures after dispatch are reported as possibly applied."
     integration = DOMAIN
     annotations = ToolAnnotations(read_only=False, destructive=False, idempotent=False, open_world=False)
     parameters = probatio.Schema({
@@ -890,6 +1323,9 @@ class SolarLimitWrite(llm.Tool):
         probatio.Required("expected_mode"): probatio.In(("percent", "watts")),
         probatio.Required("expected_value"): probatio.Any(int, float),
         probatio.Required("expected_active_value"): probatio.Any(int, float),
+        probatio.Required("expected_config_entry_id"): str,
+        probatio.Required("expected_serial"): str,
+        probatio.Required("expected_pmax_w"): probatio.Any(int, float),
         probatio.Optional("allow_mode_change", default=False): bool,
     })
 
@@ -897,12 +1333,9 @@ class SolarLimitWrite(llm.Tool):
         self.devices = devices
 
     async def async_call(self, hass, tool_input, llm_context):
-        try:
-            return ToolResult(data=await self.devices.set_solar_limit(tool_input.tool_args))
-        except TimeoutError as error:
-            raise HomeAssistantError(
-                "The solar operation timed out and may have applied. Read its limit before retrying."
-            ) from error
+        return ToolResult(
+            data=await self.devices.set_solar_limit(tool_input.tool_args)
+        )
 
 
 class DaikinWrite(llm.Tool):
@@ -950,10 +1383,12 @@ class HomeEnergyDeviceAPI(llm.API):
     async def async_get_api_instance(self, llm_context: LLMContext) -> llm.APIInstance:
         tools = []
         if self.devices.solar_entry:
-            tools.extend((SolarLimitRead(self.devices), SolarLimitWrite(self.devices)))
+            tools.append(SolarLimitRead(self.devices))
+            if self.devices.solar_write_available():
+                tools.append(SolarLimitWrite(self.devices))
         if self.devices.daikin_entry:
             tools.extend((DaikinRead(self.devices), DaikinWrite(self.devices)))
         return llm.APIInstance(
             api=self, llm_context=llm_context, tools=tools,
-            api_prompt="Device writes require an explicit user request. Never optimize, toggle, probe write permission, or change settings for a status/price question. Errors after dispatch can mean a command applied; read state instead of replaying it.",
+            api_prompt="Device writes require an explicit user request. Never optimize, toggle, probe write permission, or change settings for a status/price question. Only a post-dispatch error means a command may have applied. Read state instead of controller-level replay, inversion, or rollback; no claim is made about retries internal to the underlying transport.",
         )
