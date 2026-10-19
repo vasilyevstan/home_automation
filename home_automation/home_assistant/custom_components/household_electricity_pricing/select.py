@@ -22,6 +22,7 @@ from .const import (
 MODE_LABELS = {
     "paused": "Paused",
     "shadow": "Shadow (no writes)",
+    "readiness_pilot": "Readiness pilot (55→50°C)",
     "safe_target_shift": "Safe target shift",
     "soft_standby": "Soft standby (30°C)",
 }

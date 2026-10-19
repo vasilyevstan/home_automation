@@ -93,6 +93,72 @@ class DhwOptimizerTests(base.HAComponentTests):
         with self.assertRaisesRegex(HomeAssistantError, "soft < floor"):
             self.module.DhwPolicy.from_options({"dhw_soft_target": 46})
 
+    def test_readiness_pilot_only_boosts_inside_final_allowance(self):
+        policy = self.module.DhwPolicy.from_options(
+            {"dhw_initial_heat_minutes": 90}
+        )
+        outside = datetime.fromisoformat("2026-10-15T00:00:00+00:00")
+        prices = self.intervals(
+            outside,
+            ["0.40"] * 4 + ["0.10"] * 4 + ["0.30"] * 20,
+        )
+        hold = self.module.plan_dhw(
+            now=outside,
+            mode=self.const.DHW_MODE_READINESS,
+            policy=policy,
+            observation=self.observation(tank_temperature=49),
+            intervals=prices,
+            heating_minutes=90,
+            lease_expires=None,
+        )
+        self.assertEqual(hold.state, "readiness_pilot")
+        self.assertEqual(hold.desired_target, 50)
+        self.assertTrue(hold.allow_write)
+
+        inside = datetime.fromisoformat("2026-10-15T03:45:00+00:00")
+        charge = self.module.plan_dhw(
+            now=inside,
+            mode=self.const.DHW_MODE_READINESS,
+            policy=policy,
+            observation=self.observation(tank_temperature=49),
+            intervals=prices,
+            heating_minutes=90,
+            lease_expires=None,
+        )
+        self.assertEqual(charge.state, "readiness_charge")
+        self.assertEqual(charge.desired_target, 55)
+        self.assertTrue(charge.urgent)
+
+        ready = self.module.plan_dhw(
+            now=inside,
+            mode=self.const.DHW_MODE_READINESS,
+            policy=policy,
+            observation=self.observation(tank_temperature=50, target_temperature=55),
+            intervals=prices,
+            heating_minutes=90,
+            lease_expires=None,
+        )
+        self.assertEqual(ready.state, "readiness")
+        self.assertEqual(ready.desired_target, 50)
+        self.assertTrue(ready.urgent)
+
+    def test_shadow_proposes_same_readiness_boost_without_writes(self):
+        now = datetime.fromisoformat("2026-10-15T03:45:00+00:00")
+        decision = self.module.plan_dhw(
+            now=now,
+            mode=self.const.DHW_MODE_SHADOW,
+            policy=self.module.DhwPolicy.from_options(
+                {"dhw_initial_heat_minutes": 90}
+            ),
+            observation=self.observation(tank_temperature=49),
+            intervals=self.intervals(now, ["0.20"] * 16),
+            heating_minutes=90,
+            lease_expires=None,
+        )
+        self.assertEqual(decision.state, "readiness_charge")
+        self.assertEqual(decision.desired_target, 55)
+        self.assertFalse(decision.allow_write)
+
     def test_shadow_selects_cheapest_contiguous_window_without_writes(self):
         now = datetime.fromisoformat("2026-10-15T00:00:00+00:00")
         prices = ["0.40"] * 4 + ["0.10"] * 4 + ["0.30"] * 8
@@ -368,6 +434,10 @@ class DhwOptimizerTests(base.HAComponentTests):
         now = datetime.fromisoformat("2026-10-15T04:00:00+00:00")
         observation = self.observation(tank_temperature=48)
         optimizer._update_learning(now, observation)
+        self.assertEqual(
+            optimizer.state["deadline_checks"]["2026-10-15T07:00:00+03:00"],
+            self.module.READINESS_FAILURE,
+        )
         self.assertTrue(optimizer.state["recovery_latched"])
         self.assertIn("07:00 readiness deadline was missed", optimizer.state["recovery_reason"])
 
@@ -384,6 +454,71 @@ class DhwOptimizerTests(base.HAComponentTests):
         )
         self.assertEqual(decision.state, "recovery")
         self.assertEqual(decision.desired_target, 50)
+
+    def test_readiness_delivery_consumed_by_rapid_draw_is_not_a_failure(self):
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        optimizer.mode = self.const.DHW_MODE_READINESS
+        optimizer._update_learning(
+            datetime.fromisoformat("2026-10-15T03:50:00+00:00"),
+            self.observation(tank_temperature=50, target_temperature=55),
+        )
+        optimizer._update_learning(
+            datetime.fromisoformat("2026-10-15T03:58:00+00:00"),
+            self.observation(tank_temperature=46, target_temperature=50),
+        )
+        optimizer._update_learning(
+            datetime.fromisoformat("2026-10-15T04:00:00+00:00"),
+            self.observation(tank_temperature=44, target_temperature=50),
+        )
+        self.assertEqual(
+            optimizer.state["deadline_checks"]["2026-10-15T07:00:00+03:00"],
+            self.module.READINESS_CONSUMED,
+        )
+        self.assertTrue(optimizer.state["recovery_latched"])
+        self.assertIn("measured before a rapid draw", optimizer.state["recovery_reason"])
+
+    def test_rapid_draw_without_measured_readiness_is_excluded(self):
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        optimizer.mode = self.const.DHW_MODE_READINESS
+        optimizer._update_learning(
+            datetime.fromisoformat("2026-10-15T03:50:00+00:00"),
+            self.observation(tank_temperature=49, target_temperature=55),
+        )
+        optimizer._update_learning(
+            datetime.fromisoformat("2026-10-15T03:58:00+00:00"),
+            self.observation(tank_temperature=45, target_temperature=55),
+        )
+        optimizer._update_learning(
+            datetime.fromisoformat("2026-10-15T04:00:00+00:00"),
+            self.observation(tank_temperature=27, target_temperature=55),
+        )
+        self.assertEqual(
+            optimizer.state["deadline_checks"]["2026-10-15T07:00:00+03:00"],
+            self.module.READINESS_CONTAMINATED,
+        )
+        self.assertTrue(optimizer.state["recovery_latched"])
+        self.assertIn("rapid draw obscured", optimizer.state["recovery_reason"])
+
+    def test_override_at_deadline_records_unavailable_check(self):
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        optimizer._update_learning(
+            datetime.fromisoformat("2026-10-15T04:00:00+00:00"),
+            self.observation(
+                tank_temperature=49,
+                override_reason="Extreme price protection has priority.",
+            ),
+        )
+        self.assertEqual(
+            optimizer.state["deadline_checks"]["2026-10-15T07:00:00+03:00"],
+            self.module.READINESS_UNAVAILABLE,
+        )
+        self.assertFalse(optimizer.state["recovery_latched"])
 
     def test_cost_driven_target_changes_observe_minimum_dwell(self):
         now = datetime.fromisoformat("2026-10-15T00:00:00+00:00")
@@ -551,6 +686,40 @@ class DhwOptimizerTests(base.HAComponentTests):
             now + timedelta(hours=4),
         )
 
+    async def test_readiness_write_tracks_separate_pilot_evidence(self):
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        optimizer.mode = self.const.DHW_MODE_READINESS
+        now = datetime.fromisoformat("2026-10-15T03:45:00+00:00")
+        decision = self.module.DhwDecision(
+            mode=self.const.DHW_MODE_READINESS,
+            state="readiness_charge",
+            reason="Synthetic readiness boost",
+            desired_target=55,
+            actual_target=50,
+            tank_temperature=49,
+            deadline=datetime.fromisoformat("2026-10-15T07:00:00+03:00"),
+            selected_window=None,
+            current_price=Decimal("0.20"),
+            price_delta=None,
+            price_delta_percent=None,
+            price_gate=False,
+            data_complete=True,
+            lease_expires=None,
+            allow_write=True,
+            urgent=True,
+        )
+        await optimizer._apply_decision(
+            now,
+            self.observation(tank_temperature=49),
+            decision,
+        )
+        self.assertEqual(optimizer.state["readiness_pilot_confirmed_writes"], 1)
+        self.assertEqual(optimizer.state["confirmed_writes"], 1)
+        self.assertIsNotNone(optimizer.state["readiness_pilot_started_at"])
+        self.assertIsNone(optimizer.state["pilot_started_at"])
+
     async def test_write_failure_latches_fault_without_retry(self):
         optimizer = self.module.DhwOptimizer(
             self.hass, self.pricing_entry, self.coordinator, self.devices
@@ -601,39 +770,58 @@ class DhwOptimizerTests(base.HAComponentTests):
         self.assertIn("priority", optimizer.decision.reason)
         self.devices.control_daikin.assert_not_awaited()
 
-    def test_revision_three_migration_preserves_valid_qualification_evidence(self):
+    def test_revision_five_resets_changed_policy_evidence(self):
         optimizer = self.module.DhwOptimizer(
             self.hass, self.pricing_entry, self.coordinator, self.devices
         )
         optimizer.state.update(
             {
-                "policy_revision": 3,
+                "policy_revision": 4,
                 "shadow_days": ["2026-10-17"],
                 "heating_durations": [60],
                 "deadline_checks": {
-                    "2026-10-17T21:00:00+03:00": True,
+                    "2026-10-17T21:00:00+03:00": self.module.READINESS_SUCCESS,
                 },
                 "decision_history": [{"state": "normal"}],
                 "planned_window_start": "2026-10-17T10:00:00+00:00",
             }
         )
-        optimizer._reset_policy_evidence(preserve_qualification=True)
-        self.assertEqual(optimizer.state["policy_revision"], 4)
-        self.assertEqual(optimizer.state["shadow_days"], ["2026-10-17"])
-        self.assertEqual(optimizer.state["heating_durations"], [60])
-        self.assertEqual(
-            optimizer.state["deadline_checks"],
-            {"2026-10-17T21:00:00+03:00": True},
-        )
+        optimizer._reset_policy_evidence()
+        self.assertEqual(optimizer.state["policy_revision"], 5)
+        self.assertEqual(optimizer.state["shadow_days"], [])
+        self.assertEqual(optimizer.state["heating_durations"], [])
+        self.assertEqual(optimizer.state["deadline_checks"], {})
         self.assertEqual(optimizer.state["decision_history"], [])
         self.assertIsNone(optimizer.state["planned_window_start"])
+
+    async def test_revision_change_pauses_a_persisted_write_capable_mode(self):
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        optimizer.store.async_load = AsyncMock(
+            return_value={
+                "policy_revision": 4,
+                "mode": self.const.DHW_MODE_SAFE,
+                "last_owned_target": 45,
+            }
+        )
+        optimizer.store.async_save = AsyncMock()
+        optimizer.async_evaluate = AsyncMock()
+        await optimizer.async_start()
+        try:
+            self.assertEqual(optimizer.mode, self.const.DHW_MODE_PAUSED)
+            self.assertIn("policy changed", optimizer.state["fault"])
+            self.assertEqual(optimizer.state["last_owned_target"], 45)
+            optimizer.async_evaluate.assert_awaited_once()
+        finally:
+            await optimizer.async_stop()
 
     def test_override_period_does_not_count_readiness_or_heating_evidence(self):
         optimizer = self.module.DhwOptimizer(
             self.hass, self.pricing_entry, self.coordinator, self.devices
         )
         optimizer._update_learning(
-            datetime.fromisoformat("2026-10-17T04:00:00+00:00"),
+            datetime.fromisoformat("2026-10-17T03:45:00+00:00"),
             self.observation(
                 tank_temperature=44,
                 override_reason="Extreme price protection has priority.",
@@ -677,23 +865,37 @@ class DhwOptimizerTests(base.HAComponentTests):
         optimizer = self.module.DhwOptimizer(
             self.hass, self.pricing_entry, self.coordinator, self.devices
         )
-        with self.assertRaisesRegex(HomeAssistantError, "seven observed days"):
+        await optimizer.async_set_mode(self.const.DHW_MODE_READINESS)
+        self.assertEqual(optimizer.mode, self.const.DHW_MODE_READINESS)
+        with self.assertRaisesRegex(HomeAssistantError, "seven observed"):
             await optimizer.async_set_mode(self.const.DHW_MODE_SAFE)
         with self.assertRaisesRegex(HomeAssistantError, "seven-day safe pilot"):
             await optimizer.async_set_mode(self.const.DHW_MODE_SOFT)
 
-    def test_shadow_promotion_requires_successful_readiness_replay(self):
+    def test_safe_promotion_requires_delivered_readiness_pilot_evidence(self):
         optimizer = self.module.DhwOptimizer(
             self.hass, self.pricing_entry, self.coordinator, self.devices
         )
         optimizer.state["shadow_days"] = [f"2026-10-{day:02d}" for day in range(1, 8)]
         optimizer.state["heating_durations"] = [60, 65, 70, 75, 80]
+        optimizer.state["readiness_pilot_started_at"] = (
+            "2026-10-01T00:00:00+00:00"
+        )
+        optimizer.state["readiness_pilot_confirmed_writes"] = 2
         optimizer.state["deadline_checks"] = {
-            f"2026-10-{day:02d}T07:00:00+03:00": True
+            f"2026-10-{day:02d}T07:00:00+03:00": self.module.READINESS_SUCCESS
             for day in range(1, 11)
         }
+        optimizer.state["deadline_checks"]["2026-10-11T07:00:00+03:00"] = (
+            self.module.READINESS_CONTAMINATED
+        )
+        optimizer.state["deadline_checks"]["2026-10-12T07:00:00+03:00"] = (
+            self.module.READINESS_UNAVAILABLE
+        )
         self.assertTrue(optimizer.shadow_ready)
-        optimizer.state["deadline_checks"]["2026-10-10T07:00:00+03:00"] = False
+        optimizer.state["deadline_checks"]["2026-10-10T07:00:00+03:00"] = (
+            self.module.READINESS_FAILURE
+        )
         self.assertFalse(optimizer.shadow_ready)
 
     def test_unowned_or_unknown_device_state_is_never_overwritten(self):
