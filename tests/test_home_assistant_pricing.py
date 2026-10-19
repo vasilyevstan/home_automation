@@ -268,8 +268,11 @@ class HomeAssistantBundleTests(unittest.TestCase):
                 manifest = json.loads(archive.read(prefix + "manifest.json"))
                 self.assertEqual(manifest["requirements"], [])
                 self.assertEqual(manifest["dependencies"], ["nordpool"])
+                self.assertEqual(
+                    manifest["after_dependencies"], ["huawei_solar"]
+                )
                 self.assertEqual(manifest["domain"], "household_electricity_pricing")
-                self.assertEqual(manifest["version"], "0.8.4")
+                self.assertEqual(manifest["version"], "0.9.0")
                 names = archive.namelist()
                 self.assertTrue(all(name.startswith(prefix) for name in names))
                 self.assertFalse(any(
@@ -281,6 +284,7 @@ class HomeAssistantBundleTests(unittest.TestCase):
                 self.assertIn(prefix + "dhw_optimizer.py", names)
                 self.assertIn(prefix + "floor_heating_shadow.py", names)
                 self.assertIn(prefix + "extreme_price_protection.py", names)
+                self.assertIn(prefix + "solar_curtailment.py", names)
                 self.assertIn(prefix + "price_forecast.py", names)
                 self.assertIn(
                     prefix

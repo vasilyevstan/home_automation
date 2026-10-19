@@ -27,10 +27,11 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
         self.devices = self.controls.EnergyDevices(self.hass, {})
         self.devices.record = AsyncMock()
         self.devices.climate_entities = frozenset({"climate.bedroom"})
+        self.devices.solar_entry = "solar-entry"
         self.solar_state = {
             "mode": 0, "active": 1000, "command": 40125,
             "percent": 100.0, "watts": 8000, "maximum": 8000,
-            "serial": "synthetic-inverter",
+            "serial": "synthetic-inverter", "active_power": 6200,
         }
         from huawei_solar import register_names as rn
         self.rn = rn
@@ -38,6 +39,7 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
         async def get(name):
             field = {
                 rn.SERIAL_NUMBER: "serial", rn.P_MAX: "maximum",
+                rn.ACTIVE_POWER: "active_power",
                 rn.ACTIVE_POWER_PERCENTAGE_DERATING: "percent",
                 rn.ACTIVE_POWER_FIXED_VALUE_DERATING: "watts",
             }[name]
@@ -61,13 +63,34 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
         self.solar = SimpleNamespace(
             serial_number="synthetic-inverter",
             update_lock=asyncio.Lock(),
-            client=SimpleNamespace(get=AsyncMock(side_effect=get), get_multiple=AsyncMock(side_effect=get_multiple)),
+            client=SimpleNamespace(
+                get=AsyncMock(side_effect=get),
+                get_multiple=AsyncMock(side_effect=get_multiple),
+                heartbeat=AsyncMock(return_value=True),
+            ),
             set=AsyncMock(side_effect=set_limit),
             has_write_permission=Mock(side_effect=AssertionError("A setup write probe must never run")),
+            ensure_logged_in=AsyncMock(return_value=True),
         )
         self.solar.client.set = self.solar.set
-        self.devices.solar_device = Mock(return_value=self.solar)
-        self.devices.entry = Mock(return_value=SimpleNamespace(data={}))
+        self.solar_data = SimpleNamespace(
+            device=self.solar,
+            configuration_update_coordinator=SimpleNamespace(
+                async_request_refresh=AsyncMock()
+            ),
+        )
+        self.solar_entry = SimpleNamespace(
+            entry_id="solar-entry",
+            data={"enable_parameter_configuration": True},
+            runtime_data={"device_datas": [self.solar_data]},
+        )
+        self.devices.solar_device_data = Mock(
+            side_effect=lambda: (
+                self.solar_entry,
+                self.solar_data,
+                self.solar,
+            )
+        )
         flags = {name: False for name in self.controls.FLAGS}
         self.daikin_state = {
             "function/SpaceHeating": {
@@ -172,6 +195,9 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
         return {
             "mode": "percent", "value": 50.0,
             "expected_mode": "percent", "expected_value": 100.0, "expected_active_value": 100.0,
+            "expected_config_entry_id": "solar-entry",
+            "expected_serial": "synthetic-inverter",
+            "expected_pmax_w": 8000,
             **changes,
         }
 
@@ -179,8 +205,25 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
         result = await self.devices.get_solar_limit()
         self.assertEqual(result["configured"], 100.0)
         self.assertEqual(result["active"], 100.0)
+        self.assertEqual(result["active_power_w"], 6200.0)
+        self.assertEqual(result["serial"], "synthetic-inverter")
+        self.assertEqual(result["config_entry_id"], "solar-entry")
+        self.assertTrue(result["write_enabled"])
         self.solar.set.assert_not_awaited()
         self.solar.has_write_permission.assert_not_called()
+
+    def test_solar_not_loaded_dependency_is_distinct_from_read_failure(self):
+        self.hass.config_entries.async_get_entry = Mock(
+            return_value=SimpleNamespace(
+                domain="huawei_solar",
+                state=self.controls.ConfigEntryState.SETUP_IN_PROGRESS,
+            )
+        )
+        with self.assertRaisesRegex(
+            self.controls.SolarDependencyNotReady,
+            "not loaded",
+        ):
+            self.controls.EnergyDevices.solar_device_data(self.devices)
 
     async def test_solar_read_waits_for_the_native_coordinator_lock(self):
         await self.solar.update_lock.acquire()
@@ -222,12 +265,50 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
         self.solar.set.assert_awaited_once_with(self.rn.ACTIVE_POWER_PERCENTAGE_DERATING, 50.0)
         self.solar.has_write_permission.assert_not_called()
         self.assertEqual([call.args[0] for call in self.devices.record.await_args_list], ["prepared", "verified"])
+        prepared = self.devices.record.await_args_list[0].args[1]
+        self.assertEqual(prepared["identity"], {
+            "config_entry_id": "solar-entry",
+            "serial": "synthetic-inverter",
+            "pmax_w": 8000.0,
+        })
+        self.assertEqual(prepared["expected"]["pmax_w"], 8000.0)
+
+    async def test_solar_write_requires_elevated_native_configuration(self):
+        self.solar_entry.data["enable_parameter_configuration"] = False
+        with self.assertRaisesRegex(
+            self.controls.SolarPreDispatchError,
+            "elevated",
+        ):
+            await self.devices.set_solar_limit(self.solar_request())
+        self.solar.set.assert_not_awaited()
+        api = self.controls.HomeEnergyDeviceAPI(
+            self.hass,
+            {"solar_config_entry": "solar-entry"},
+            devices=self.devices,
+        )
+        tools = await api.async_get_api_instance(None)
+        self.assertEqual(
+            [tool.name for tool in tools.tools],
+            ["GetSolarGenerationLimit"],
+        )
+
+    async def test_solar_write_requires_configuration_coordinator(self):
+        self.solar_data.configuration_update_coordinator = None
+        with self.assertRaisesRegex(
+            self.controls.SolarPreDispatchError,
+            "configuration coordinator",
+        ):
+            await self.devices.set_solar_limit(self.solar_request())
+        self.solar.set.assert_not_awaited()
 
     async def test_solar_bounds_expected_state_and_mode_changes_fail_before_write(self):
         cases = (
             {"value": True}, {"value": float("inf")}, {"value": -1},
             {"value": 100.1}, {"value": 0.01}, {"expected_value": True},
             {"expected_active_value": 99.0}, {"expected_value": 99.0},
+            {"expected_config_entry_id": "other"},
+            {"expected_serial": "other"},
+            {"expected_pmax_w": 7999},
             {"mode": "watts", "value": 1000},
             {"mode": "watts", "value": 8001, "allow_mode_change": True},
         )
@@ -263,10 +344,92 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_solar_write_error_is_uncertain_and_not_retried(self):
         self.solar.set.side_effect = OSError("Synthetic lost acknowledgement")
-        with self.assertRaisesRegex(HomeAssistantError, "may have applied"):
+        with self.assertRaisesRegex(
+            self.controls.SolarPostDispatchError,
+            "may have applied",
+        ):
             await self.devices.set_solar_limit(self.solar_request())
         self.solar.set.assert_awaited_once()
         self.assertEqual(self.devices.record.await_args_list[-1].args[0], "uncertain")
+
+    async def test_solar_predispatch_timeout_is_not_reported_as_applied(self):
+        self.solar.client.get.side_effect = TimeoutError(
+            "Synthetic read timeout"
+        )
+        with self.assertRaisesRegex(
+            self.controls.SolarPreDispatchError,
+            "no inverter command was sent",
+        ):
+            await self.devices.set_solar_limit(self.solar_request())
+        self.solar.set.assert_not_awaited()
+        self.devices.record.assert_not_awaited()
+
+    async def test_solar_verified_state_survives_audit_persistence_failure(self):
+        async def record(event, _record):
+            if event == "verified":
+                raise OSError("Synthetic journal failure")
+
+        self.devices.record.side_effect = record
+        result = await self.devices.set_solar_limit(self.solar_request())
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["confirmed"]["active"], 50.0)
+        self.assertFalse(result["audit_persisted"])
+        self.assertIn("Synthetic journal failure", result["audit_error"])
+        self.solar.set.assert_awaited_once()
+
+    async def test_solar_prepared_audit_failure_prevents_dispatch(self):
+        self.devices.record.side_effect = OSError(
+            "Synthetic prepared journal failure"
+        )
+        with self.assertRaisesRegex(
+            self.controls.SolarPreDispatchError,
+            "before dispatch",
+        ):
+            await self.devices.set_solar_limit(self.solar_request())
+        self.solar.set.assert_not_awaited()
+
+    async def test_solar_final_exact_recheck_catches_cross_integration_change(self):
+        async def record(event, _record):
+            if event == "prepared":
+                self.solar_state["active_power"] = 6100
+
+        self.devices.record.side_effect = record
+        with self.assertRaisesRegex(
+            self.controls.SolarExternalOverrideError,
+            "external override",
+        ) as raised:
+            await self.devices.set_solar_limit(self.solar_request())
+        self.assertEqual(raised.exception.status["active_power_w"], 6100.0)
+        self.solar.set.assert_not_awaited()
+        self.assertEqual(
+            [call.args[0] for call in self.devices.record.await_args_list],
+            ["prepared", "not_dispatched"],
+        )
+
+    async def test_solar_automatic_control_requires_stable_limit_and_mode(self):
+        self.solar_state["active"] = 500
+        with self.assertRaisesRegex(
+            self.controls.SolarPreDispatchError,
+            "matching configured and active",
+        ):
+            await self.devices.set_solar_limit(
+                self.solar_request(expected_active_value=50),
+                automatic=True,
+            )
+        self.solar_state["active"] = 1000
+        with self.assertRaisesRegex(
+            self.controls.SolarPreDispatchError,
+            "cannot change",
+        ):
+            await self.devices.set_solar_limit(
+                self.solar_request(
+                    mode="watts",
+                    value=4000,
+                    allow_mode_change=True,
+                ),
+                automatic=True,
+            )
+        self.solar.set.assert_not_awaited()
 
     async def test_daikin_noop_and_invalid_inputs_do_not_write(self):
         result = await self.devices.control_daikin({"operation": "hot_water_target", "value": 50}, None)
@@ -546,12 +709,27 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
         })
         tools = (await api.async_get_api_instance(None)).tools
         self.assertEqual([tool.name for tool in tools], [
-            "GetSolarGenerationLimit", "SetSolarGenerationLimit", "GetDaikinStatus", "ControlDaikin",
+            "GetSolarGenerationLimit", "GetDaikinStatus", "ControlDaikin",
         ])
         self.assertTrue(tools[0].annotations.read_only)
-        self.assertFalse(tools[1].annotations.read_only)
-        self.assertTrue(tools[2].annotations.read_only)
-        self.assertFalse(tools[3].annotations.read_only)
+        self.assertTrue(tools[1].annotations.read_only)
+        self.assertFalse(tools[2].annotations.read_only)
+        self.devices.daikin_entry = "daikin"
+        elevated = self.controls.HomeEnergyDeviceAPI(
+            self.hass,
+            {},
+            devices=self.devices,
+        )
+        tools = (await elevated.async_get_api_instance(None)).tools
+        self.assertEqual(
+            [tool.name for tool in tools],
+            [
+                "GetSolarGenerationLimit",
+                "SetSolarGenerationLimit",
+                "GetDaikinStatus",
+                "ControlDaikin",
+            ],
+        )
 
     async def test_control_api_can_share_one_serialized_device_runtime(self):
         api = self.controls.HomeEnergyDeviceAPI(

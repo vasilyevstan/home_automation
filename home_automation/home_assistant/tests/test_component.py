@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import importlib
@@ -205,12 +206,30 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         data = await self.refresh()
         observed = []
         remove = self.coordinator.async_add_listener(
-            lambda: observed.append(self.coordinator.data.contains(self.now))
+            lambda: observed.append(
+                (
+                    self.coordinator.data.contains(self.now),
+                    self.coordinator.in_quarter_refresh_transition(
+                        self.now
+                    ),
+                )
+            )
         )
         self.now = data.valid_until
+        self.assertTrue(
+            self.coordinator.in_quarter_refresh_transition(self.now)
+        )
         with patch.object(self.coordinator, "async_request_refresh", new=AsyncMock()):
             await self.coordinator.async_quarter_changed(self.now)
-        self.assertEqual(observed, [False])
+        self.assertEqual(observed, [(False, True)])
+        self.assertTrue(
+            self.coordinator.in_quarter_refresh_transition(self.now)
+        )
+        self.assertFalse(
+            self.coordinator.in_quarter_refresh_transition(
+                self.now + timedelta(seconds=61)
+            )
+        )
         remove()
 
     async def test_invalid_source_currency_or_missing_config_is_explicit(self):
@@ -436,6 +455,342 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                     await result
             await old_coordinator.async_shutdown()
         self.assertNotIn(DOMAIN, {api.id for api in llm.async_get_apis(self.hass)})
+
+    async def test_solar_only_entry_loads_sensor_select_and_button_platforms(self):
+        callbacks = []
+        old_coordinator = self.coordinator
+        self.pricing_entry = entry(
+            DOMAIN,
+            "pricing",
+            {
+                **self.pricing_entry.data,
+                "solar_config_entry": "solar",
+            },
+            ConfigEntryState.SETUP_IN_PROGRESS,
+        )
+        self.entries["pricing"] = self.pricing_entry
+        self.entries["solar"] = entry(
+            "huawei_solar",
+            "solar",
+            {"enable_parameter_configuration": True},
+        )
+        devices = SimpleNamespace(
+            solar_entry="solar",
+            daikin_entry=None,
+            solar_write_available=Mock(return_value=False),
+        )
+        solar = SimpleNamespace(
+            async_start=AsyncMock(),
+            async_stop=AsyncMock(),
+        )
+        try:
+            with (
+                patch.object(
+                    self.integration,
+                    "EnergyDevices",
+                    return_value=devices,
+                ),
+                patch.object(
+                    self.integration,
+                    "SolarCurtailment",
+                    return_value=solar,
+                ),
+                patch.object(
+                    ConfigEntry,
+                    "async_on_unload",
+                    side_effect=lambda callback: callbacks.append(callback),
+                ),
+            ):
+                self.assertTrue(
+                    await self.integration.async_setup_entry(
+                        self.hass, self.pricing_entry
+                    )
+                )
+            self.coordinator = self.pricing_entry.runtime_data
+            self.forward.assert_awaited_once_with(
+                self.pricing_entry,
+                ["sensor", "select", "button"],
+            )
+            runtime = self.hass.data[DOMAIN]["pricing"]
+            self.assertIsNone(runtime["optimizer"])
+            self.assertIs(runtime["solar_curtailment"], solar)
+            solar.async_start.assert_awaited_once()
+            select_module = importlib.import_module(COMPONENT + ".select")
+            button_module = importlib.import_module(COMPONENT + ".button")
+            sensor_module = importlib.import_module(COMPONENT + ".sensor")
+            select_entities = []
+            button_entities = []
+            sensor_entities = []
+            await select_module.async_setup_entry(
+                self.hass,
+                self.pricing_entry,
+                select_entities.extend,
+            )
+            await button_module.async_setup_entry(
+                self.hass,
+                self.pricing_entry,
+                button_entities.extend,
+            )
+            await sensor_module.async_setup_entry(
+                self.hass,
+                self.pricing_entry,
+                sensor_entities.extend,
+            )
+            self.assertEqual(
+                [
+                    entity.__class__.__name__
+                    for entity in select_entities
+                ],
+                ["SolarCurtailmentModeSelect"],
+            )
+            self.assertEqual(
+                [
+                    entity.__class__.__name__
+                    for entity in button_entities
+                ],
+                [
+                    "SolarCurtailmentCommissionButton",
+                    "SolarCurtailmentResumeButton",
+                ],
+            )
+            self.assertIn(
+                "SolarCurtailmentSensor",
+                {
+                    entity.__class__.__name__
+                    for entity in sensor_entities
+                },
+            )
+            self.assertTrue(
+                await self.integration.async_unload_entry(
+                    self.hass, self.pricing_entry
+                )
+            )
+            solar.async_stop.assert_awaited_once()
+        finally:
+            for callback in reversed(callbacks):
+                result = callback()
+                if inspect.isawaitable(result):
+                    await result
+            await old_coordinator.async_shutdown()
+
+    async def test_refused_platform_unload_keeps_runtime_running(self):
+        stop = AsyncMock()
+        runtime = {
+            "platforms": ["sensor", "select", "button"],
+            "_cleanup_lock": asyncio.Lock(),
+            "_cleanup_callbacks": [],
+            "_started_runtimes": [("solar curtailment", stop)],
+            "_callbacks_cleaned": False,
+            "_runtimes_stopped": False,
+            "_data_removed": False,
+        }
+        self.hass.data.setdefault(DOMAIN, {})[
+            self.pricing_entry.entry_id
+        ] = runtime
+        self.hass.config_entries.async_unload_platforms.return_value = False
+        try:
+            self.assertFalse(
+                await self.integration.async_unload_entry(
+                    self.hass,
+                    self.pricing_entry,
+                )
+            )
+            stop.assert_not_awaited()
+            self.assertIs(
+                self.hass.data[DOMAIN][self.pricing_entry.entry_id],
+                runtime,
+            )
+            self.assertFalse(runtime["_runtimes_stopped"])
+        finally:
+            self.hass.config_entries.async_unload_platforms.return_value = True
+            await self.integration._async_cleanup_runtime(
+                self.hass,
+                self.pricing_entry,
+                runtime,
+            )
+
+    async def test_partial_platform_forward_failure_stops_started_runtimes(self):
+        callbacks = []
+        created_coordinator = None
+        self.pricing_entry = entry(
+            DOMAIN,
+            "pricing",
+            {
+                **self.pricing_entry.data,
+                "solar_config_entry": "solar",
+            },
+            ConfigEntryState.SETUP_IN_PROGRESS,
+        )
+        self.entries["pricing"] = self.pricing_entry
+        self.entries["solar"] = entry(
+            "huawei_solar",
+            "solar",
+            {"enable_parameter_configuration": True},
+        )
+        forecast = SimpleNamespace(
+            async_load=AsyncMock(),
+            async_shutdown=AsyncMock(),
+        )
+        devices = SimpleNamespace(
+            solar_entry="solar",
+            daikin_entry=None,
+            solar_write_available=Mock(return_value=False),
+        )
+        solar = SimpleNamespace(
+            async_start=AsyncMock(),
+            async_stop=AsyncMock(),
+        )
+        self.forward.side_effect = HomeAssistantError(
+            "Synthetic platform forwarding failure"
+        )
+        try:
+            with (
+                patch.object(
+                    self.integration,
+                    "HouseholdPriceForecastCoordinator",
+                    return_value=forecast,
+                ),
+                patch.object(
+                    self.integration,
+                    "EnergyDevices",
+                    return_value=devices,
+                ),
+                patch.object(
+                    self.integration,
+                    "SolarCurtailment",
+                    return_value=solar,
+                ),
+                patch.object(
+                    ConfigEntry,
+                    "async_on_unload",
+                    side_effect=lambda callback: callbacks.append(callback),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    HomeAssistantError, "forwarding failure"
+                ):
+                    await self.integration.async_setup_entry(
+                        self.hass, self.pricing_entry
+                    )
+            created_coordinator = self.pricing_entry.runtime_data
+            forecast.async_load.assert_awaited_once()
+            forecast.async_shutdown.assert_awaited_once()
+            solar.async_start.assert_awaited_once()
+            solar.async_stop.assert_awaited_once()
+            self.hass.config_entries.async_unload_platforms.assert_awaited_once_with(
+                self.pricing_entry,
+                ["sensor", "select", "button"],
+            )
+            self.assertNotIn(
+                "pricing", self.hass.data.get(DOMAIN, {})
+            )
+        finally:
+            for callback in reversed(callbacks):
+                result = callback()
+                if inspect.isawaitable(result):
+                    await result
+            if (
+                created_coordinator is not None
+                and created_coordinator is not self.coordinator
+            ):
+                await created_coordinator.async_shutdown()
+
+    async def test_api_registration_failure_cleans_platforms_and_runtime(self):
+        callbacks = []
+        created_coordinator = None
+        self.pricing_entry = entry(
+            DOMAIN,
+            "pricing",
+            {
+                **self.pricing_entry.data,
+                "solar_config_entry": "solar",
+            },
+            ConfigEntryState.SETUP_IN_PROGRESS,
+        )
+        self.entries["pricing"] = self.pricing_entry
+        self.entries["solar"] = entry(
+            "huawei_solar",
+            "solar",
+            {"enable_parameter_configuration": True},
+        )
+        forecast = SimpleNamespace(
+            async_load=AsyncMock(),
+            async_shutdown=AsyncMock(),
+        )
+        devices = SimpleNamespace(
+            solar_entry="solar",
+            daikin_entry=None,
+            solar_write_available=Mock(return_value=False),
+        )
+        solar = SimpleNamespace(
+            async_start=AsyncMock(),
+            async_stop=AsyncMock(),
+        )
+        unregister = Mock()
+        try:
+            with (
+                patch.object(
+                    self.integration,
+                    "HouseholdPriceForecastCoordinator",
+                    return_value=forecast,
+                ),
+                patch.object(
+                    self.integration,
+                    "EnergyDevices",
+                    return_value=devices,
+                ),
+                patch.object(
+                    self.integration,
+                    "SolarCurtailment",
+                    return_value=solar,
+                ),
+                patch.object(
+                    self.integration.ha_llm,
+                    "async_register_api",
+                    side_effect=[
+                        unregister,
+                        HomeAssistantError(
+                            "Synthetic API registration failure"
+                        ),
+                    ],
+                ),
+                patch.object(
+                    ConfigEntry,
+                    "async_on_unload",
+                    side_effect=lambda callback: callbacks.append(callback),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    HomeAssistantError, "API registration failure"
+                ):
+                    await self.integration.async_setup_entry(
+                        self.hass, self.pricing_entry
+                    )
+            created_coordinator = self.pricing_entry.runtime_data
+            self.forward.assert_awaited_once_with(
+                self.pricing_entry,
+                ["sensor", "select", "button"],
+            )
+            self.hass.config_entries.async_unload_platforms.assert_awaited_once_with(
+                self.pricing_entry,
+                ["sensor", "select", "button"],
+            )
+            unregister.assert_called_once()
+            forecast.async_shutdown.assert_awaited_once()
+            solar.async_stop.assert_awaited_once()
+            self.assertNotIn(
+                "pricing", self.hass.data.get(DOMAIN, {})
+            )
+        finally:
+            for callback in reversed(callbacks):
+                result = callback()
+                if inspect.isawaitable(result):
+                    await result
+            if (
+                created_coordinator is not None
+                and created_coordinator is not self.coordinator
+            ):
+                await created_coordinator.async_shutdown()
 
 
 if __name__ == "__main__":
