@@ -202,6 +202,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         if optimizer else None
     )
+    if optimizer is not None and extreme_protection is not None:
+        optimizer.set_extreme_protection(extreme_protection)
+    if floor_shadow is not None and extreme_protection is not None:
+        floor_shadow.set_extreme_protection(extreme_protection)
     solar_curtailment = (
         SolarCurtailment(hass, entry, coordinator, devices)
         if entry.data.get(CONF_SOLAR_ENTRY)
@@ -240,9 +244,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         await forecast.async_load()
         for name, component in (
+            ("extreme-price protection", extreme_protection),
             ("DHW optimizer", optimizer),
             ("floor-heating shadow", floor_shadow),
-            ("extreme-price protection", extreme_protection),
             ("solar curtailment", solar_curtailment),
         ):
             if component is None:

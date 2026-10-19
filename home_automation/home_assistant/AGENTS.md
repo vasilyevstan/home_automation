@@ -76,14 +76,24 @@
   circuit standby, weather-dependent control, and configured/effective target
   mismatch suspend optimizer ownership. An uncertain write latches fault and
   needs an explicit fresh-read resume; do not replay or invert it.
+- Repeat the relevant manufacturer checks immediately before every Daikin
+  dispatch and bind automatic requests to the exact expected previous target or
+  circuit state. Reject a queued stale decision instead of overwriting a newer
+  device or user change. Extreme Price Protection has priority while faulted,
+  while it owns a protected load, while Armed lacks a current canonical price,
+  or while a published hard-stop quarter is active.
 - Keep the floor-heating evaluator separate from DHW counters and strictly
   zero-write until an explicit later pilot. The native LWT offset range is
-  -10°C to +10°C, but capability is not permission: primary Shadow candidates
-  stay inside the observed -2°C/0°C schedule and +1°C remains a separately
-  reported aggressive candidate. Plan only from complete Tallinn delivery days
-  with DST-aware 92/96/100-quarter boundaries; preserve a validated anchored
-  pair until its peak ends. Require complete candidate-day all-in prices, the
-  comfort guard, useful heating conditions and DHW compressor priority.
+  -10°C to +10°C, but capability is not permission: revision 4 applies one
+  relative 4°C overlay to the fresh native offset, bounded to -6°C through
+  +4°C. At or above 21°C preserve the native offset instead of adding heat; at
+  or below 20°C remove a negative offset without lowering an already warmer
+  native setting. Plan only from complete Tallinn delivery days with DST-aware
+  92/96/100-quarter boundaries; preserve a validated anchored pair until its
+  peak ends. Require complete candidate-day all-in prices, the comfort guard,
+  useful heating conditions and DHW compressor priority. Reset floor evidence
+  when this numerical policy changes and require five clean revision-4 cycles
+  plus controlled offset commissioning before promotion.
 - Use only explicitly configured, fresh occupied-room temperature entities for
   floor comfort decisions. Require every configured source and use the coldest
   room. The Daikin `IndoorTemperature` reading is from an unheated garage and
@@ -102,12 +112,16 @@
   sensors as EUR per shifted kWh, deduplicated by anchored plan. Never label the
   spread itself as saved euros. Estimated or realized euros require measured
   electrical energy attributable to that exact action; confirmed writes alone
-  are insufficient.
+  are insufficient. Keep growing operational history in private storage/events;
+  expose only a small bounded recent-decision list in Recorder attributes.
 - Keep extreme-price protection independent from both heating optimizers. It
   consumes canonical published household all-in quarters only: forecasts may
   warn but cannot authorize device control. Preserve the €1.50/kWh hard stop,
   €2/kWh alert severity, €0.50/kWh-for-two-hours warning, two-hour maximum
   lease, DHW 45°C/readiness exits and 20.5°C coldest-room floor restore guard.
+- Start Extreme Price Protection before DHW and floor runtimes so persisted
+  breaker ownership is reconciled before ordinary heating evaluation. Stop the
+  ordinary runtimes before the breaker during cleanup.
 - Extreme-price installation and option saves default to Shadow. Do not expose
   or accept Armed until observation is qualified by seven live Shadow days or
   the deterministic seven-day commissioning replay, and alert delivery plus

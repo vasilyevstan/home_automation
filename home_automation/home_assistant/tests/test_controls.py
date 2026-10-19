@@ -99,7 +99,11 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
             },
             "function/DomesticHotWaterTank": {
                 "states": {**flags, "WeatherDependentState": False},
-                "operations": {"Power": "on", "DomesticHotWaterTemperatureHeating": 50.0},
+                "operations": {
+                    "Power": "on",
+                    "DomesticHotWaterTemperatureHeating": 50.0,
+                    "powerful": "0",
+                },
             },
         }
         self.control_mode = "LWT control"
@@ -481,6 +485,75 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
         self.daikin.device.device_info.return_value = {"serial_number": "different"}
         with self.assertRaisesRegex(HomeAssistantError, "identity"):
             await self.devices.control_daikin({"operation": "heating_enabled", "value": False}, None)
+        self.assertEqual(self.writes, [])
+
+    async def test_daikin_automatic_expected_state_mismatch_blocks_before_write(self):
+        for request in (
+            {
+                "operation": "hot_water_target",
+                "value": 51,
+                "expected_previous": 49,
+            },
+            {
+                "operation": "heating_offset",
+                "value": -2,
+                "expected_previous": -1,
+            },
+            {
+                "operation": "heating_enabled",
+                "value": False,
+                "expected_previous": "standby",
+            },
+        ):
+            with self.subTest(request=request), self.assertRaisesRegex(
+                HomeAssistantError,
+                "expected previous",
+            ):
+                await self.devices.control_daikin(request, None)
+        self.assertEqual(self.writes, [])
+
+    async def test_daikin_writer_rechecks_manufacturer_ownership_guards(self):
+        self.daikin_state["function/DomesticHotWaterTank"]["operations"][
+            "Power"
+        ] = "standby"
+        with self.assertRaisesRegex(HomeAssistantError, "circuit to be on"):
+            await self.devices.control_daikin(
+                {"operation": "hot_water_target", "value": 51},
+                None,
+            )
+        self.daikin_state["function/DomesticHotWaterTank"]["operations"][
+            "Power"
+        ] = "on"
+        self.daikin_state["function/DomesticHotWaterTank"]["operations"][
+            "powerful"
+        ] = "1"
+        with self.assertRaisesRegex(HomeAssistantError, "powerful"):
+            await self.devices.control_daikin(
+                {"operation": "hot_water_target", "value": 51},
+                None,
+            )
+        self.daikin_state["function/DomesticHotWaterTank"]["operations"][
+            "powerful"
+        ] = "0"
+        self.daikin_state["function/SpaceHeating"]["operations"][
+            "Power"
+        ] = "standby"
+        with self.assertRaisesRegex(HomeAssistantError, "circuit to be on"):
+            await self.devices.control_daikin(
+                {"operation": "heating_offset", "value": -2},
+                None,
+            )
+        self.daikin_state["function/SpaceHeating"]["operations"][
+            "Power"
+        ] = "on"
+        self.daikin_state["function/SpaceHeating"]["states"][
+            "TargetTemperatureOverruledState"
+        ] = True
+        with self.assertRaisesRegex(HomeAssistantError, "overriding"):
+            await self.devices.control_daikin(
+                {"operation": "heating_enabled", "value": False},
+                None,
+            )
         self.assertEqual(self.writes, [])
 
     async def test_daikin_fresh_readback_confirms_one_native_service_call(self):

@@ -1115,6 +1115,38 @@ class ExtremePriceProtection:
             return EXTREME_PRICE_MODES
         return (EXTREME_PRICE_MODE_OFF, EXTREME_PRICE_MODE_SHADOW)
 
+    def ordinary_control_block_reason(
+        self,
+        now: datetime,
+    ) -> str | None:
+        if self.state.get("fault"):
+            return (
+                "Extreme price protection is faulted; ordinary heating "
+                "optimization is suspended until review."
+            )
+        if self._ownership():
+            return (
+                "Extreme price protection owns one or more protected loads; "
+                "ordinary heating optimization is suspended."
+            )
+        if self.mode != EXTREME_PRICE_MODE_ARMED:
+            return None
+        current = _current_price(
+            now,
+            published_intervals(self.coordinator),
+        )
+        if current is None:
+            return (
+                "Extreme price protection lacks a current canonical price; "
+                "ordinary heating optimization is suspended."
+            )
+        if current >= Decimal(str(EXTREME_PRICE_THRESHOLD_EUR_KWH)):
+            return (
+                "A published catastrophic-price block is active; Extreme "
+                "price protection has priority over ordinary heating optimization."
+            )
+        return None
+
     def _sync_floor_contamination(self) -> None:
         if self.floor_shadow is None:
             return
@@ -1169,9 +1201,11 @@ class ExtremePriceProtection:
         if not isinstance(heating, dict) or not isinstance(water, dict):
             return {
                 "water_enabled": None,
+                "water_power": None,
                 "tank_temperature": None,
                 "water_guard": "Fresh Daikin circuit state is unavailable.",
                 "heating_enabled": None,
+                "heating_power": None,
                 "room_temperature": None,
                 "heating_guard": "Fresh Daikin circuit state is unavailable.",
             }
@@ -1264,11 +1298,13 @@ class ExtremePriceProtection:
             )
         return {
             "water_enabled": water_enabled,
+            "water_power": water_power,
             "tank_temperature": _number(
                 water.get("sensors", {}).get("TankTemperature")
             ),
             "water_guard": water_guard,
             "heating_enabled": heating_enabled,
+            "heating_power": heating_power,
             "room_temperature": room_temperature,
             "heating_guard": heating_guard,
         }
@@ -1554,7 +1590,11 @@ class ExtremePriceProtection:
                     self._suppress(block_id, load_id)
                 return False
             result = await self.devices.control_daikin(
-                {"operation": "hot_water_enabled", "value": True},
+                {
+                    "operation": "hot_water_enabled",
+                    "value": True,
+                    "expected_previous": daikin["water_power"],
+                },
                 Context(),
             )
             if result.get("confirmed") != "on":
@@ -1570,7 +1610,11 @@ class ExtremePriceProtection:
                     self._suppress(block_id, load_id)
                 return False
             result = await self.devices.control_daikin(
-                {"operation": "heating_enabled", "value": True},
+                {
+                    "operation": "heating_enabled",
+                    "value": True,
+                    "expected_previous": daikin["heating_power"],
+                },
                 Context(),
             )
             if result.get("confirmed") != "on":
@@ -1621,7 +1665,11 @@ class ExtremePriceProtection:
         )
         if action.load_id == LOAD_HOT_WATER:
             result = await self.devices.control_daikin(
-                {"operation": "hot_water_enabled", "value": False},
+                {
+                    "operation": "hot_water_enabled",
+                    "value": False,
+                    "expected_previous": daikin["water_power"],
+                },
                 Context(),
             )
             if result.get("confirmed") != "standby":
@@ -1629,7 +1677,11 @@ class ExtremePriceProtection:
             previous = {"power": "on"}
         elif action.load_id == LOAD_FLOOR_HEATING:
             result = await self.devices.control_daikin(
-                {"operation": "heating_enabled", "value": False},
+                {
+                    "operation": "heating_enabled",
+                    "value": False,
+                    "expected_previous": daikin["heating_power"],
+                },
                 Context(),
             )
             if result.get("confirmed") != "standby":
@@ -1970,10 +2022,15 @@ class ExtremePriceProtection:
                 observation_key: str,
             ) -> None:
                 nonlocal attempted
+                previous = "on"
                 for value, expected in ((False, "standby"), (True, "on")):
                     attempted = True
                     result = await self.devices.control_daikin(
-                        {"operation": operation, "value": value},
+                        {
+                            "operation": operation,
+                            "value": value,
+                            "expected_previous": previous,
+                        },
                         Context(),
                     )
                     if result.get("confirmed") != expected:
@@ -1996,6 +2053,7 @@ class ExtremePriceProtection:
                             "confirmed": expected,
                         }
                     )
+                    previous = expected
 
             try:
                 await exercise("hot_water_enabled", "water_enabled")

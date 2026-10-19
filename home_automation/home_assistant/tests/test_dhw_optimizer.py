@@ -535,7 +535,16 @@ class DhwOptimizerTests(base.HAComponentTests):
             urgent=False,
         )
         await optimizer._apply_decision(now, observation, decision)
-        self.assertEqual(self.writes, [{"operation": "hot_water_target", "value": 30}])
+        self.assertEqual(
+            self.writes,
+            [
+                {
+                    "operation": "hot_water_target",
+                    "value": 30,
+                    "expected_previous": 50.0,
+                }
+            ],
+        )
         self.assertEqual(optimizer.state["last_owned_target"], 30)
         self.assertEqual(
             datetime.fromisoformat(optimizer.state["lease_expires"]),
@@ -571,6 +580,98 @@ class DhwOptimizerTests(base.HAComponentTests):
             await optimizer._apply_decision(now, self.observation(), decision)
         self.assertIn("may have applied", optimizer.state["fault"])
         self.devices.control_daikin.assert_awaited_once()
+
+    async def test_extreme_price_arbitration_blocks_decision_and_write(self):
+        await self.refresh()
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        optimizer.mode = self.const.DHW_MODE_SAFE
+        optimizer.set_extreme_protection(
+            SimpleNamespace(
+                ordinary_control_block_reason=lambda _now: (
+                    "Extreme price protection has priority."
+                )
+            )
+        )
+        await optimizer.async_evaluate(
+            datetime.fromisoformat("2026-10-15T00:00:00+00:00")
+        )
+        self.assertEqual(optimizer.decision.state, "override")
+        self.assertIn("priority", optimizer.decision.reason)
+        self.devices.control_daikin.assert_not_awaited()
+
+    def test_revision_three_migration_preserves_valid_qualification_evidence(self):
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        optimizer.state.update(
+            {
+                "policy_revision": 3,
+                "shadow_days": ["2026-10-17"],
+                "heating_durations": [60],
+                "deadline_checks": {
+                    "2026-10-17T21:00:00+03:00": True,
+                },
+                "decision_history": [{"state": "normal"}],
+                "planned_window_start": "2026-10-17T10:00:00+00:00",
+            }
+        )
+        optimizer._reset_policy_evidence(preserve_qualification=True)
+        self.assertEqual(optimizer.state["policy_revision"], 4)
+        self.assertEqual(optimizer.state["shadow_days"], ["2026-10-17"])
+        self.assertEqual(optimizer.state["heating_durations"], [60])
+        self.assertEqual(
+            optimizer.state["deadline_checks"],
+            {"2026-10-17T21:00:00+03:00": True},
+        )
+        self.assertEqual(optimizer.state["decision_history"], [])
+        self.assertIsNone(optimizer.state["planned_window_start"])
+
+    def test_override_period_does_not_count_readiness_or_heating_evidence(self):
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        optimizer._update_learning(
+            datetime.fromisoformat("2026-10-17T04:00:00+00:00"),
+            self.observation(
+                tank_temperature=44,
+                override_reason="Extreme price protection has priority.",
+            ),
+        )
+        self.assertEqual(optimizer.state["deadline_checks"], {})
+        self.assertEqual(optimizer.state["heating_durations"], [])
+        self.assertIsNone(optimizer.state["cycle_started_at"])
+
+    def test_status_attributes_stay_below_recorder_limit(self):
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        now = datetime.fromisoformat("2026-10-15T00:00:00+00:00")
+        optimizer.decision = self.module.plan_dhw(
+            now=now,
+            mode=self.const.DHW_MODE_SHADOW,
+            policy=self.policy,
+            observation=self.observation(),
+            intervals=self.intervals(
+                now,
+                ["0.40"] * 4 + ["0.10"] * 4 + ["0.30"] * 8,
+            ),
+            heating_minutes=60,
+            lease_expires=None,
+        )
+        optimizer.state["decision_history"] = [
+            {
+                "observed_at": now.isoformat(),
+                "state": "recovery",
+                "reason": "Synthetic detailed decision " + ("x" * 500),
+                "write_sent": False,
+            }
+            for _ in range(24)
+        ]
+        attributes = optimizer.attributes
+        self.assertEqual(len(attributes["recent_decisions"]), 4)
+        self.assertLess(len(json.dumps(attributes)), 16000)
 
     async def test_promotions_are_gated_by_observation_evidence(self):
         optimizer = self.module.DhwOptimizer(
@@ -624,7 +725,16 @@ class DhwOptimizerTests(base.HAComponentTests):
         self.status["effective_hot_water_target"] = 45
         await optimizer.async_return_to_normal()
         self.assertEqual(optimizer.mode, self.const.DHW_MODE_PAUSED)
-        self.assertEqual(self.writes, [{"operation": "hot_water_target", "value": 50}])
+        self.assertEqual(
+            self.writes,
+            [
+                {
+                    "operation": "hot_water_target",
+                    "value": 50,
+                    "expected_previous": 45.0,
+                }
+            ],
+        )
         self.assertIsNone(optimizer.state["last_owned_target"])
 
     async def test_options_validate_live_native_target_range(self):
