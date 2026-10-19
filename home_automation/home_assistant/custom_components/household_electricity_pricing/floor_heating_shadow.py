@@ -9,13 +9,14 @@ from decimal import Decimal, InvalidOperation
 import math
 from typing import Callable, Iterable
 
+from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_UNIT_OF_MEASUREMENT,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import Context, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import (
     async_track_state_change_event,
@@ -38,6 +39,10 @@ from .const import (
     FLOOR_HORIZON_HOURS,
     FLOOR_MAX_OUTDOOR_TEMPERATURE,
     FLOOR_MAX_SHIFT_HOURS,
+    FLOOR_MODE_ACTIVE,
+    FLOOR_MODE_PAUSED,
+    FLOOR_MODE_SHADOW,
+    FLOOR_MODES,
     FLOOR_MIN_LEAVING_WATER_TEMPERATURE,
     FLOOR_MIN_OFFSET,
     FLOOR_NATIVE_MAX_OFFSET,
@@ -66,9 +71,11 @@ from .dhw_optimizer import (
 
 STORE_VERSION = 1
 STORE_KEY_SUFFIX = "floor_heating_shadow"
-POLICY_REVISION = 4
+POLICY_REVISION = 5
 DECISION_HISTORY_LIMIT = 96
 RECENT_DECISIONS_ATTRIBUTE_LIMIT = 4
+NOTIFICATION_ID = DOMAIN + "_floor_heating_fault"
+ACTIVE_STATES = {"preheat", "coast", "comfort_guard"}
 
 
 def _number(value: object) -> float | None:
@@ -174,11 +181,11 @@ class FloorHeatingPolicy:
             raise HomeAssistantError("Floor offsets must satisfy minimum <= neutral < preheat.")
         if self.minimum_offset < -6 or self.preheat_offset > 4:
             raise HomeAssistantError(
-                "The revised floor Shadow must remain inside -6°C to +4°C."
+                "The floor optimizer must remain inside -6°C to +4°C."
             )
         if self.shift_delta != 4:
             raise HomeAssistantError(
-                "The revised floor Shadow uses one meaningful 4°C overlay."
+                "The floor optimizer uses one meaningful 4°C overlay."
             )
         if self.comfort_floor >= self.preheat_ceiling:
             raise HomeAssistantError("The floor comfort threshold must be below the preheat ceiling.")
@@ -459,7 +466,7 @@ def plan_floor_heating(
     if not policy.minimum_offset <= observation.actual_offset <= policy.preheat_offset:
         return decision(
             "yield",
-            "The native/manual LWT offset is outside the revised -6°C to +4°C Shadow envelope.",
+            "The native/manual LWT offset is outside the optimizer's -6°C to +4°C envelope.",
             observation.actual_offset,
         )
     if observation.indoor_temperature <= policy.comfort_floor:
@@ -604,6 +611,7 @@ class FloorHeatingShadow:
         self.lock = asyncio.Lock()
         self.started = False
         self.extreme_protection = None
+        self.mode = FLOOR_MODE_SHADOW
         self.decision: FloorHeatingDecision | None = None
         self.listeners: list[Callable[[], None]] = []
         self.unsubscribers: list[Callable[[], None]] = []
@@ -627,6 +635,13 @@ class FloorHeatingShadow:
             "planned_peak_average": None,
             "planned_peak_intervals": None,
             "confirmed_writes": 0,
+            "owner_activation_approved_at": None,
+            "active_started_at": None,
+            "ownership": None,
+            "pending_operation": None,
+            "last_write_at": None,
+            "fault": None,
+            "manual_override": None,
             "qualified_opportunity_count": 0,
             "last_qualified_opportunity_plan_id": None,
             "last_qualified_opportunity_at": None,
@@ -634,10 +649,32 @@ class FloorHeatingShadow:
 
     async def async_start(self) -> None:
         stored = await self.store.async_load()
-        if isinstance(stored, dict) and stored.get("policy_revision") == POLICY_REVISION:
+        if isinstance(stored, dict) and stored.get("policy_revision") in (
+            4,
+            POLICY_REVISION,
+        ):
+            mode = stored.get("mode")
+            if mode in FLOOR_MODES:
+                self.mode = mode
             for key in self.state:
                 if key in stored:
                     self.state[key] = stored[key]
+            if stored.get("policy_revision") == 4:
+                self.state["policy_revision"] = POLICY_REVISION
+                self.mode = FLOOR_MODE_SHADOW
+                self.state["ownership"] = None
+                self.state["pending_operation"] = None
+                self.state["last_write_at"] = None
+                self.state["fault"] = None
+                self.state["manual_override"] = None
+            if (
+                self.state.get("pending_operation") is not None
+                and not self.state.get("fault")
+            ):
+                self.state["fault"] = (
+                    "A persisted floor-offset command has an uncertain outcome. "
+                    "Read fresh state, then use Resume after review."
+                )
         self.started = True
         self.unsubscribers.append(
             self.coordinator.async_add_listener(self._schedule_evaluation)
@@ -665,11 +702,18 @@ class FloorHeatingShadow:
         await self.async_evaluate()
 
     async def async_stop(self) -> None:
-        self.started = False
-        for unsubscribe in self.unsubscribers:
-            unsubscribe()
-        self.unsubscribers.clear()
-        await self._save()
+        try:
+            if self.state.get("ownership") is not None:
+                await self.async_return_to_baseline(
+                    pause=False,
+                    evaluate=False,
+                )
+        finally:
+            self.started = False
+            for unsubscribe in self.unsubscribers:
+                unsubscribe()
+            self.unsubscribers.clear()
+            await self._save()
 
     @callback
     def async_add_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
@@ -717,7 +761,7 @@ class FloorHeatingShadow:
         await self.async_evaluate(now)
 
     async def _save(self) -> None:
-        await self.store.async_save(self.state)
+        await self.store.async_save({"mode": self.mode, **self.state})
 
     def _room_temperature(
         self, observed_at: datetime
@@ -809,11 +853,11 @@ class FloorHeatingShadow:
         enabled = power == "on" if power in ("on", "standby") else None
         reason = None
         if not isinstance(states, dict) or any(states.get(flag) is not False for flag in FLAGS):
-            reason = "A Daikin safety flag is active or unknown; floor Shadow yielded."
+            reason = "A Daikin safety flag is active or unknown; the floor optimizer yielded."
         elif states.get("TargetTemperatureOverruledState") not in (None, False):
             reason = "Daikin is temporarily overriding the space-heating target."
         elif status.get("control_mode") != "LWT control":
-            reason = "Floor Shadow requires freshly verified LWT control."
+            reason = "The floor optimizer requires freshly verified LWT control."
         elif operations.get("OperationMode") != "heating":
             reason = "Daikin is not in heating operation mode."
         elif enabled is not True:
@@ -823,7 +867,7 @@ class FloorHeatingShadow:
             external_influence_reason = (
                 "Room-level HVAC is enabled for "
                 + ", ".join(active_room_hvac)
-                + "; floor Shadow yields to external room control."
+                + "; the floor optimizer yields to external room control."
             )
         elif self.external_influences:
             external_influence_reason = "; ".join(
@@ -992,6 +1036,7 @@ class FloorHeatingShadow:
             self.state["comfort_blocks"] += 1
         record = {
             "observed_at": now.isoformat(),
+            "mode": self.mode,
             "state": decision.state,
             "reason": decision.reason,
             "actual_offset_c": decision.actual_offset,
@@ -1011,6 +1056,208 @@ class FloorHeatingShadow:
             self.state["decision_history"] + [record]
         )[-DECISION_HISTORY_LIMIT:]
         self.hass.bus.async_fire(EVENT_FLOOR_SHADOW_DECISION, record)
+
+    @property
+    def pilot_eligible(self) -> bool:
+        return (
+            len(self.state["shadow_days"]) >= 14
+            and self.state["candidate_cycles"] >= 5
+            and not self.state.get("fault")
+            and not self.state.get("manual_override")
+        )
+
+    def _ownership(self) -> dict | None:
+        owner = self.state.get("ownership")
+        if not isinstance(owner, dict):
+            return None
+        if (
+            _number(owner.get("baseline_offset")) is None
+            or _number(owner.get("target_offset")) is None
+            or owner.get("phase") not in ACTIVE_STATES
+        ):
+            return None
+        return owner
+
+    def _extreme_block_reason(self, now: datetime) -> str | None:
+        if self.extreme_protection is None:
+            return None
+        return self.extreme_protection.ordinary_control_block_reason(now)
+
+    def _normalize_owned_decision(
+        self,
+        observation: FloorHeatingObservation,
+        decision: FloorHeatingDecision,
+    ) -> FloorHeatingDecision:
+        owner = self._ownership()
+        if owner is None or observation.actual_offset is None:
+            return decision
+        baseline = _number(owner.get("baseline_offset"))
+        target = _number(owner.get("target_offset"))
+        if baseline is None or target is None:
+            return decision
+        if observation.actual_offset != target:
+            self.state["manual_override"] = (
+                "The native floor offset changed while the optimizer owned "
+                f"{target:g}°C. The new {observation.actual_offset:g}°C value "
+                "was preserved and automatic floor writes returned to Shadow."
+            )
+            self.state["ownership"] = None
+            self.mode = FLOOR_MODE_SHADOW
+            return replace(
+                decision,
+                state="yield",
+                reason=self.state["manual_override"],
+                proposed_offset=observation.actual_offset,
+            )
+        if decision.state == "yield":
+            desired = target
+        elif decision.state == "preheat":
+            desired = min(
+                self.policy.preheat_offset,
+                baseline + self.policy.shift_delta,
+            )
+        elif decision.state == "coast":
+            desired = max(
+                self.policy.minimum_offset,
+                baseline - self.policy.shift_delta,
+            )
+        elif decision.state == "comfort_guard":
+            desired = max(baseline, self.policy.neutral_offset)
+        else:
+            desired = baseline
+        return replace(decision, proposed_offset=desired)
+
+    async def _dispatch_offset(
+        self,
+        *,
+        now: datetime,
+        previous: float,
+        target: float,
+        baseline: float,
+        phase: str,
+        restoring: bool,
+    ) -> bool:
+        block_reason = self._extreme_block_reason(now)
+        if block_reason is not None:
+            return False
+        pending = {
+            "previous_offset": previous,
+            "target_offset": target,
+            "baseline_offset": baseline,
+            "phase": phase,
+            "restoring": restoring,
+            "prepared_at": now.isoformat(),
+        }
+        self.state["pending_operation"] = pending
+        await self._save()
+        try:
+            result = await self.devices.control_daikin(
+                {
+                    "operation": "heating_offset",
+                    "value": target,
+                    "expected_previous": previous,
+                },
+                Context(),
+            )
+        except (HomeAssistantError, TimeoutError) as error:
+            self.state["fault"] = (
+                "A guarded floor-offset command failed and may have applied. "
+                "Read fresh state, then use Resume after review. " + str(error)
+            )
+            persistent_notification.async_create(
+                self.hass,
+                self.state["fault"],
+                "Floor-heating optimizer paused",
+                NOTIFICATION_ID,
+            )
+            await self._save()
+            return False
+        confirmed = _number(result.get("confirmed"))
+        if confirmed != target:
+            self.state["fault"] = (
+                "The guarded floor-offset command returned an unexpected "
+                "confirmation; inspect fresh state before resuming."
+            )
+            persistent_notification.async_create(
+                self.hass,
+                self.state["fault"],
+                "Floor-heating optimizer paused",
+                NOTIFICATION_ID,
+            )
+            await self._save()
+            return False
+        self.state["pending_operation"] = None
+        self.state["last_write_at"] = now.isoformat()
+        self.state["confirmed_writes"] += int(
+            result.get("changed") is True
+        )
+        if restoring:
+            self.state["ownership"] = None
+        else:
+            self.state["ownership"] = {
+                "baseline_offset": baseline,
+                "target_offset": target,
+                "phase": phase,
+                "acquired_at": (
+                    self._ownership() or {}
+                ).get("acquired_at", now.isoformat()),
+                "updated_at": now.isoformat(),
+            }
+        if self.state["decision_history"]:
+            self.state["decision_history"][-1]["write_sent"] = bool(
+                result.get("changed")
+            )
+        return True
+
+    async def _apply_decision(
+        self,
+        now: datetime,
+        observation: FloorHeatingObservation,
+        decision: FloorHeatingDecision,
+    ) -> None:
+        if (
+            self.mode != FLOOR_MODE_ACTIVE
+            or self.state.get("fault")
+            or self.state.get("manual_override")
+            or observation.actual_offset is None
+            or decision.proposed_offset is None
+        ):
+            return
+        current = observation.actual_offset
+        target = decision.proposed_offset
+        owner = self._ownership()
+        if owner is None:
+            if decision.state not in ACTIVE_STATES or target == current:
+                return
+            await self._dispatch_offset(
+                now=now,
+                previous=current,
+                target=target,
+                baseline=current,
+                phase=decision.state,
+                restoring=False,
+            )
+            return
+        baseline = _number(owner.get("baseline_offset"))
+        if baseline is None:
+            return
+        restoring = decision.state not in ACTIVE_STATES
+        if target == current:
+            if restoring and target == baseline:
+                self.state["ownership"] = None
+            return
+        await self._dispatch_offset(
+            now=now,
+            previous=current,
+            target=target,
+            baseline=baseline,
+            phase=(
+                decision.state
+                if decision.state in ACTIVE_STATES
+                else str(owner["phase"])
+            ),
+            restoring=restoring,
+        )
 
     async def async_evaluate(self, now: datetime | None = None) -> None:
         async with self.lock:
@@ -1050,6 +1297,25 @@ class FloorHeatingShadow:
                 )
                 if planned is None and decision.plan is not None:
                     self._store_plan(decision.plan)
+                if self.state.get("fault"):
+                    decision = replace(
+                        decision,
+                        state="fault",
+                        reason=str(self.state["fault"]),
+                        proposed_offset=observation.actual_offset,
+                    )
+                elif self.state.get("manual_override"):
+                    decision = replace(
+                        decision,
+                        state="yield",
+                        reason=str(self.state["manual_override"]),
+                        proposed_offset=observation.actual_offset,
+                    )
+                else:
+                    decision = self._normalize_owned_decision(
+                        observation,
+                        decision,
+                    )
                 local_day = observed_at.astimezone(TALLINN).date().isoformat()
                 if local_day not in self.state["shadow_days"]:
                     self.state["shadow_days"] = (
@@ -1057,6 +1323,11 @@ class FloorHeatingShadow:
                     )[-45:]
                 self._record(observed_at, decision)
                 self.decision = decision
+                await self._apply_decision(
+                    observed_at,
+                    observation,
+                    decision,
+                )
             except (HomeAssistantError, TimeoutError, ValueError, KeyError) as error:
                 self.decision = FloorHeatingDecision(
                     state="unavailable",
@@ -1079,6 +1350,179 @@ class FloorHeatingShadow:
                 )
             await self._save()
             self._notify_listeners()
+
+    async def async_set_mode(
+        self,
+        mode: str,
+        *,
+        owner_approved: bool = False,
+    ) -> None:
+        if mode not in FLOOR_MODES:
+            raise HomeAssistantError("Unknown floor-heating optimizer mode.")
+        approved = self.state.get("owner_activation_approved_at")
+        if (
+            mode == FLOOR_MODE_ACTIVE
+            and not self.pilot_eligible
+            and not approved
+            and not owner_approved
+        ):
+            raise HomeAssistantError(
+                "Active floor shifting requires 14 observed days, five clean "
+                "candidate cycles, or an explicit owner-approved activation."
+            )
+        if owner_approved:
+            status = await self.devices.get_daikin_status()
+            observation = self._observation(
+                status,
+                dt_util.utcnow().astimezone(UTC),
+            )
+            if observation.override_reason is not None:
+                raise HomeAssistantError(observation.override_reason)
+            if observation.actual_offset is None:
+                raise HomeAssistantError(
+                    "A fresh native floor offset is required before activation."
+                )
+            self.state["owner_activation_approved_at"] = (
+                dt_util.utcnow().astimezone(UTC).isoformat()
+            )
+            self.state["manual_override"] = None
+        if mode != FLOOR_MODE_ACTIVE and self._ownership() is not None:
+            await self.async_return_to_baseline(
+                pause=False,
+                evaluate=False,
+            )
+        async with self.lock:
+            self.mode = mode
+            if mode == FLOOR_MODE_ACTIVE and self.state["active_started_at"] is None:
+                self.state["active_started_at"] = (
+                    dt_util.utcnow().astimezone(UTC).isoformat()
+                )
+            await self._save()
+        await self.async_evaluate()
+
+    async def async_activate_owner_approved(self) -> None:
+        await self.async_set_mode(
+            FLOOR_MODE_ACTIVE,
+            owner_approved=True,
+        )
+
+    async def async_resume_after_review(self) -> None:
+        status = await self.devices.get_daikin_status()
+        observed_at = dt_util.utcnow().astimezone(UTC)
+        observation = self._observation(status, observed_at)
+        if observation.actual_offset is None:
+            raise HomeAssistantError(
+                "A fresh native floor offset is required before resume."
+            )
+        async with self.lock:
+            pending = self.state.get("pending_operation")
+            if isinstance(pending, dict):
+                previous = _number(pending.get("previous_offset"))
+                target = _number(pending.get("target_offset"))
+                baseline = _number(pending.get("baseline_offset"))
+                if observation.actual_offset == target and baseline is not None:
+                    if pending.get("restoring"):
+                        self.state["ownership"] = None
+                    else:
+                        self.state["ownership"] = {
+                            "baseline_offset": baseline,
+                            "target_offset": target,
+                            "phase": pending.get("phase"),
+                            "acquired_at": pending.get("prepared_at"),
+                            "updated_at": observed_at.isoformat(),
+                        }
+                    self.state["pending_operation"] = None
+                elif observation.actual_offset == previous:
+                    self.state["pending_operation"] = None
+                else:
+                    self.mode = FLOOR_MODE_SHADOW
+                    self.state["ownership"] = None
+                    self.state["pending_operation"] = None
+                    self.state["manual_override"] = (
+                        "Fresh state after an uncertain command matched neither "
+                        "the previous nor requested offset; the external value "
+                        "was preserved."
+                    )
+                    await self._save()
+                    raise HomeAssistantError(
+                        self.state["manual_override"]
+                    )
+            owner = self._ownership()
+            if owner is not None:
+                target = _number(owner.get("target_offset"))
+                baseline = _number(owner.get("baseline_offset"))
+                if observation.actual_offset == baseline:
+                    self.state["ownership"] = None
+                elif observation.actual_offset != target:
+                    raise HomeAssistantError(
+                        "The native floor offset no longer matches optimizer "
+                        "ownership; the external value was preserved."
+                    )
+            self.state["fault"] = None
+            self.state["manual_override"] = None
+            await self._save()
+        persistent_notification.async_dismiss(
+            self.hass,
+            NOTIFICATION_ID,
+        )
+        await self.async_evaluate(observed_at)
+
+    async def async_return_to_baseline(
+        self,
+        *,
+        pause: bool = True,
+        evaluate: bool = True,
+    ) -> None:
+        status = await self.devices.get_daikin_status()
+        observed_at = dt_util.utcnow().astimezone(UTC)
+        observation = self._observation(status, observed_at)
+        if observation.actual_offset is None:
+            raise HomeAssistantError(
+                "A fresh native floor offset is required before restore."
+            )
+        async with self.lock:
+            if self.state.get("pending_operation") is not None:
+                raise HomeAssistantError(
+                    "Resolve the uncertain floor command before restoring."
+                )
+            owner = self._ownership()
+            if owner is not None:
+                baseline = _number(owner.get("baseline_offset"))
+                target = _number(owner.get("target_offset"))
+                if observation.actual_offset == target and baseline is not None:
+                    restored = await self._dispatch_offset(
+                        now=observed_at,
+                        previous=observation.actual_offset,
+                        target=baseline,
+                        baseline=baseline,
+                        phase=str(owner["phase"]),
+                        restoring=True,
+                    )
+                    if not restored:
+                        await self._save()
+                        raise HomeAssistantError(
+                            self.state.get("fault")
+                            or self._extreme_block_reason(observed_at)
+                            or "The floor baseline restore was not confirmed."
+                        )
+                elif observation.actual_offset == baseline:
+                    self.state["ownership"] = None
+                else:
+                    self.mode = FLOOR_MODE_SHADOW
+                    self.state["ownership"] = None
+                    self.state["manual_override"] = (
+                        "The native floor offset changed outside optimizer "
+                        "ownership; it was preserved instead of restoring."
+                    )
+                    await self._save()
+                    raise HomeAssistantError(
+                        self.state["manual_override"]
+                    )
+            if pause:
+                self.mode = FLOOR_MODE_SHADOW
+            await self._save()
+        if evaluate:
+            await self.async_evaluate(observed_at)
 
     @property
     def optimization_value(self) -> Decimal | None:
@@ -1115,9 +1559,13 @@ class FloorHeatingShadow:
         return {
             "metric": "price_opportunity_per_shifted_kwh",
             "controller": "floor_heating",
-            "valuation_status": "counterfactual",
-            "operating_mode": FLOOR_SHADOW_MODE,
-            "shadow_zero_writes": True,
+            "valuation_status": (
+                "live_action_unattributed"
+                if self.mode == FLOOR_MODE_ACTIVE
+                else "counterfactual"
+            ),
+            "operating_mode": self.mode,
+            "shadow_zero_writes": self.mode == FLOOR_MODE_SHADOW,
             "plan_id": plan_id,
             "plan_status": plan_status,
             "opportunity_qualified": decision.price_gate,
@@ -1155,6 +1603,12 @@ class FloorHeatingShadow:
                 "candidate_cycle_contaminated"
             ],
             "confirmed_writes": self.state["confirmed_writes"],
+            "ownership": self._ownership() is not None,
+            "owned_action_started_at": (
+                self._ownership().get("acquired_at")
+                if self._ownership() is not None
+                else None
+            ),
             "measured_shifted_energy_kwh": None,
             "estimated_savings_eur": None,
             "realized_savings_eur": None,
@@ -1168,13 +1622,28 @@ class FloorHeatingShadow:
     def attributes(self) -> dict:
         if self.decision is None:
             return {
-                "mode": FLOOR_SHADOW_MODE,
-                "reason": "Floor Shadow has not evaluated yet.",
+                "mode": self.mode,
+                "reason": "Floor heating has not evaluated yet.",
                 "write_allowed": False,
-                "shadow_zero_writes": True,
+                "shadow_zero_writes": self.mode == FLOOR_MODE_SHADOW,
+                "owner_activation_approved": bool(
+                    self.state["owner_activation_approved_at"]
+                ),
+                "owner_activation_approved_at": self.state[
+                    "owner_activation_approved_at"
+                ],
+                "fault": self.state["fault"],
+                "manual_override": self.state["manual_override"],
             }
         result = self.decision.attributes()
         result.update({
+            "mode": self.mode,
+            "write_allowed": (
+                self.mode == FLOOR_MODE_ACTIVE
+                and not self.state.get("fault")
+                and not self.state.get("manual_override")
+            ),
+            "shadow_zero_writes": self.mode == FLOOR_MODE_SHADOW,
             "policy_revision": POLICY_REVISION,
             "native_minimum_offset_c": FLOOR_NATIVE_MIN_OFFSET,
             "native_maximum_offset_c": FLOOR_NATIVE_MAX_OFFSET,
@@ -1210,13 +1679,26 @@ class FloorHeatingShadow:
                 "thermal_response_evidence_eligible"
             ],
             "confirmed_writes": self.state["confirmed_writes"],
-            "pilot_eligible": False,
+            "pilot_eligible": self.pilot_eligible,
             "pilot_eligibility_reason": (
-                "Write control remains disabled until at least 14 observed days, "
-                "five clean revision-4 candidate cycles, thermal-lag review, "
-                "controlled offset commissioning and explicit room-comfort "
-                "bounds are approved."
+                "The evidence gate requires at least 14 observed days and five "
+                "clean revision-5 candidate cycles. Explicit owner-approved "
+                "activation is recorded separately and does not relabel the "
+                "evidence gate as passed."
             ),
+            "owner_activation_approved": bool(
+                self.state["owner_activation_approved_at"]
+            ),
+            "owner_activation_approved_at": self.state[
+                "owner_activation_approved_at"
+            ],
+            "active_started_at": self.state["active_started_at"],
+            "ownership": self._ownership() is not None,
+            "ownership_details": self._ownership(),
+            "pending_operation": self.state["pending_operation"],
+            "last_write_at": self.state["last_write_at"],
+            "fault": self.state["fault"],
+            "manual_override": self.state["manual_override"],
             "solar_dispatch_available": False,
             "solar_dispatch_reason": (
                 "Fresh signed net-grid power is unavailable; PV generation alone "

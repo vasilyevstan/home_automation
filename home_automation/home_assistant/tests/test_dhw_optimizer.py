@@ -872,6 +872,24 @@ class DhwOptimizerTests(base.HAComponentTests):
         with self.assertRaisesRegex(HomeAssistantError, "seven-day safe pilot"):
             await optimizer.async_set_mode(self.const.DHW_MODE_SOFT)
 
+    async def test_owner_approved_activation_records_override_and_enables_soft_mode(self):
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        optimizer.async_evaluate = AsyncMock()
+
+        await optimizer.async_set_mode(
+            self.const.DHW_MODE_SOFT,
+            owner_approved=True,
+        )
+
+        self.assertEqual(optimizer.mode, self.const.DHW_MODE_SOFT)
+        self.assertIsNotNone(
+            optimizer.state["owner_full_control_approved_at"]
+        )
+        self.assertTrue(optimizer.attributes["owner_full_control_approved"])
+        optimizer.async_evaluate.assert_awaited_once()
+
     def test_safe_promotion_requires_delivered_readiness_pilot_evidence(self):
         optimizer = self.module.DhwOptimizer(
             self.hass, self.pricing_entry, self.coordinator, self.devices

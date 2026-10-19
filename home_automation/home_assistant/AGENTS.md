@@ -83,6 +83,12 @@
   setting. Keep the circuit enabled, never actively cool, never use boost, and
   never hide the HA-outage residual risk. Native DHW standby/off remains out of
   scope unless a later task supplies new evidence and policy.
+- Preserve the evidence-gated DHW promotion path, but permit a separately
+  recorded owner-approved early activation when the owner explicitly requests
+  full control. Do not synthesize qualification days, cycles, checks or writes.
+  Early activation changes authority only; every comfort/readiness exit,
+  four-hour lease, exact expected-previous check, manufacturer guard, ownership
+  rule and uncertain-command latch remains mandatory.
 - Manual/manufacturer changes, powerful/hygiene-like operation, safety flags,
   circuit standby, weather-dependent control, and configured/effective target
   mismatch suspend optimizer ownership. An uncertain write latches fault and
@@ -93,9 +99,9 @@
   device or user change. Extreme Price Protection has priority while faulted,
   while it owns a protected load, while Armed lacks a current canonical price,
   or while a published hard-stop quarter is active.
-- Keep the floor-heating evaluator separate from DHW counters and strictly
-  zero-write until an explicit later pilot. The native LWT offset range is
-  -10°C to +10°C, but capability is not permission: revision 4 applies one
+- Keep the floor-heating optimizer separate from DHW counters and default it to
+  zero-write Shadow. The native LWT offset range is -10°C to +10°C, but
+  capability is not permission: revision 5 applies one
   relative 4°C overlay to the fresh native offset, bounded to -6°C through
   +4°C. At or above 21°C preserve the native offset instead of adding heat; at
   or below 20°C remove a negative offset without lowering an already warmer
@@ -103,8 +109,16 @@
   92/96/100-quarter boundaries; preserve a validated anchored pair until its
   peak ends. Require complete candidate-day all-in prices, the comfort guard,
   useful heating conditions and DHW compressor priority. Reset floor evidence
-  when this numerical policy changes and require five clean revision-4 cycles
-  plus controlled offset commissioning before promotion.
+  when this numerical policy changes and require five clean revision-5 cycles
+  before evidence-gated promotion. A separately recorded, explicit owner
+  approval may activate the pilot earlier without marking that evidence passed.
+- In active floor mode, capture one fresh baseline before the first offset
+  action, keep the owned target stable across evaluations, and restore the
+  exact baseline only while current state still matches ownership. Bind every
+  dispatch to exact expected previous state and native read-back. External
+  changes cancel ownership and return to Shadow. Persist a pending operation
+  before dispatch; any post-dispatch error faults and requires fresh-state
+  reconciliation without automatic retry, inversion or rollback.
 - Use only explicitly configured, fresh occupied-room temperature entities for
   floor comfort decisions. Require every configured source and use the coldest
   room. The Daikin `IndoorTemperature` reading is from an unheated garage and
@@ -216,9 +230,12 @@
   owned cap only under its persisted block/profile/lease. Rollover alone must
   not restore, suppress, or consume the block; refreshed data decides whether
   ownership continues.
-- Solar sensors may report the exact cost per avoided exported kWh and elapsed
-  eligible/owned minutes. Without fresh signed grid power they must never report
-  curtailed kWh, zero-export performance, or estimated/realized euro savings.
+- Solar sensors may report the exact negative-export cost opportunity per kWh
+  and elapsed eligible/owned minutes. Without fresh signed grid power they must
+  never report curtailed kWh, zero-export performance, or estimated/realized
+  euro savings.
+  Keep the dedicated solar opportunity sensor Recorder-safe and label Armed
+  values as live but unattributed, never realized savings.
 - HA must be the sole Huawei Modbus client during handover. Keep the old local
   solar MCP disconnected as rollback; cloud history is independent. Generation
   caps, export limits, and household load are not interchangeable.

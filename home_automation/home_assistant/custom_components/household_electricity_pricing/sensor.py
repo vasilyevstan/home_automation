@@ -88,6 +88,12 @@ async def async_setup_entry(
                 entry.entry_id,
             )
         )
+        entities.append(
+            SolarCurtailmentOpportunitySensor(
+                solar_curtailment,
+                entry.entry_id,
+            )
+        )
     activity_controllers = [
         controller
         for controller in (
@@ -282,7 +288,7 @@ class DhwOptimizationOpportunitySensor(OptimizationOpportunitySensor):
 
 class FloorHeatingShadowSensor(SensorEntity):
     _attr_has_entity_name = True
-    _attr_name = "Floor heating shadow"
+    _attr_name = "Floor heating optimizer"
     _attr_icon = "mdi:heating-coil"
 
     def __init__(self, shadow, entry_id: str) -> None:
@@ -487,10 +493,20 @@ class EnergyControlActivitySensor(SensorEntity):
                 state = record.get("state")
                 if state in ("unavailable", "hold"):
                     continue
+                write_sent = bool(record.get("write_sent"))
+                mode = record.get("mode")
                 events.append({
                     "observed_at": observed_at.isoformat(),
                     "system": "Floor heating",
-                    "kind": "simulation",
+                    "kind": (
+                        "verified_command"
+                        if write_sent
+                        else (
+                            "simulation"
+                            if mode in (None, "shadow")
+                            else "no_command"
+                        )
+                    ),
                     "state": state,
                     "change": self._temperature_change(
                         record.get("actual_offset_c"),
@@ -498,7 +514,15 @@ class EnergyControlActivitySensor(SensorEntity):
                         "Offset",
                     ),
                     "reason": record.get("reason"),
-                    "result": "Not sent; floor heating remains Shadow-only.",
+                    "result": (
+                        "Guarded command confirmed by native Daikin read-back."
+                        if write_sent
+                        else (
+                            "Not sent; floor heating was in Shadow."
+                            if mode in (None, "shadow")
+                            else "No floor-offset command was required."
+                        )
+                    ),
                 })
 
         if self.extreme_protection is not None:
@@ -652,3 +676,14 @@ class SolarCurtailmentSensor(SensorEntity):
     @property
     def extra_state_attributes(self) -> dict:
         return self.controller.attributes
+
+
+class SolarCurtailmentOpportunitySensor(OptimizationOpportunitySensor):
+    _attr_name = "Solar curtailment price opportunity"
+
+    def __init__(self, controller, entry_id: str) -> None:
+        super().__init__(
+            controller,
+            entry_id,
+            "solar_curtailment_price_opportunity",
+        )

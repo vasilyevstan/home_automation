@@ -237,6 +237,27 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(unknown.block.end_known)
 
+    def test_negative_export_opportunity_never_claims_realized_savings(self):
+        controller = self.controller()
+        controller.last_price = self.module.price_context(
+            self.snapshot(["0.01", "-0.02", "-0.03", "0.00"]),
+            self.runtime_now,
+        )
+
+        self.assertEqual(
+            controller.optimization_value,
+            Decimal("0.02"),
+        )
+        attributes = controller.optimization_value_attributes
+        self.assertEqual(attributes["valuation_status"], "counterfactual")
+        self.assertEqual(
+            attributes["opportunity_eur_per_kwh"],
+            "0.02",
+        )
+        self.assertIsNone(attributes["measured_curtailed_energy_kwh"])
+        self.assertIsNone(attributes["estimated_savings_eur"])
+        self.assertIsNone(attributes["realized_savings_eur"])
+
     async def test_armed_is_gated_and_never_selected_automatically(self):
         controller = self.controller()
         self.coordinator.data = self.snapshot(

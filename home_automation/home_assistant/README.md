@@ -593,6 +593,14 @@ The runtime mode select provides:
   safe-pilot writes, permit the 30°C target under a persisted four-hour lease.
 - `paused`: issue no automatic targets.
 
+The evidence gates remain the normal promotion path. A separate
+`Activate full hot water control` button records an explicit owner-approved
+early activation timestamp and selects `soft_standby` without fabricating
+qualification days, cycles or checks. All comfort/readiness exits, target
+ownership, exact expected-previous validation, manufacturer guards, leases and
+fault latches remain unchanged. This override is intentionally auditable in
+the status attributes.
+
 The 30°C target is soft standby, not active cooling and not the comfort floor.
 It leaves the DHW circuit enabled but relies on HA to restore 50°C at the 45°C
 threshold, lease expiry, readiness lead time, incomplete data, or a failed price
@@ -630,9 +638,9 @@ write-capable mode, confirmed commands still do not establish euro savings:
 `realized_savings_eur` remain unavailable until attributable whole-Daikin
 electrical energy exists.
 
-## Floor-heating Shadow
+## Floor-heating optimizer
 
-Selecting a Daikin entry also creates a separate floor-heating Shadow sensor.
+Selecting a Daikin entry also creates a separate floor-heating optimizer.
 Configure one or more occupied-room `sensor` or `climate` temperature entities
 in the integration options. Every configured source must be available and no
 more than 30 minutes old; the evaluator uses the coldest room as its
@@ -641,16 +649,27 @@ unheated garage in this installation and is exposed only as diagnostic context.
 There is no fallback from a missing room source to that garage reading.
 
 The separate `Floor heating room temperature` sensor publishes the resulting
-coldest fresh occupied-room value and its source details. Floor Shadow remains
-permanently zero-write in this version: it never calls the guarded Daikin
-writer, never changes the native schedule and never shares DHW qualification
-counters. It combines the configured comfort observation with fresh Daikin
-outdoor/leaving-water data and canonical published all-in prices, then records
-counterfactual LWT-offset decisions.
+coldest fresh occupied-room value and its source details. The optimizer
+defaults to `shadow`, remains separate from DHW counters and records the same
+counterfactual LWT-offset decisions as before. `active` mode may be selected
+after the evidence gate passes, or by the explicit
+`Activate floor heating price shift` owner-approval button. Owner approval is
+recorded without relabeling the evidence gate as passed.
+
+Every live offset action captures the fresh native offset as its baseline,
+binds the command to the exact expected previous value, and requires native
+read-back. Re-evaluation keeps the one intended overlay instead of ratcheting
+another 4°C from the already-owned value. Leaving the action window, changing
+mode, hitting a safety/comfort exit, or unloading restores the exact baseline
+only while the current value still matches optimizer ownership. External
+changes cancel ownership and return the controller to Shadow. A post-dispatch
+error persists the pending operation, latches a fault, and requires fresh-state
+reconciliation through `Resume floor heating after review`; it is never
+retried or inverted automatically.
 
 Configured climate entities remain valid comfort measurements when their
 setpoint changes while the unit is off. If any configured room HVAC is enabled
-for heating, cooling, drying or fan operation, Floor Shadow still uses its
+for heating, cooling, drying or fan operation, the floor optimizer still uses its
 measured temperature for the 20°C comfort guard but otherwise yields the
 price-shift proposal. The period is marked as externally influenced and is not
 eligible as floor thermal-response evidence. Candidate-cycle evidence is
@@ -659,8 +678,8 @@ missing-input or DHW-priority contamination.
 
 The verified Daikin surface supports a native **-10°C to +10°C** weather-curve
 offset. That capability is not a safe optimization envelope by itself. Floor
-policy revision 4 evaluates one meaningful **4°C relative overlay**, bounded to
-an initial **-6°C to +4°C** Shadow envelope:
+policy revision 5 evaluates one meaningful **4°C relative overlay**, bounded to
+an initial **-6°C to +4°C** envelope:
 
 | Fresh native offset | Cheap-block proposal | Paired peak proposal |
 | ---: | ---: | ---: |
@@ -668,7 +687,7 @@ an initial **-6°C to +4°C** Shadow envelope:
 | 0°C | +4°C | -4°C |
 
 Other fresh native offsets use the same `native ± 4°C` rule and clamp at the
-revision-4 bounds. The old separate +1°C aggressive candidate is retained only
+revision-5 bounds. The old separate +1°C aggressive candidate is retained only
 as a compatibility field in historical decision data; it is no longer the
 policy.
 
@@ -681,7 +700,7 @@ quarters are never forecast or zero-filled. Within that evidence it pairs a
 two-hour cheap block with a later two-hour expensive block no more than eight
 hours away, and requires the same €0.05/kWh and 20% materiality gates as the
 DHW policy. It yields to safety/override states, non-LWT control, circuit
-standby, missing temperatures and offsets outside the revision-4 envelope. At
+standby, missing temperatures and offsets outside the revision-5 envelope. At
 or below the 20°C indoor guard it removes a negative offset without lowering an
 already warmer native setting. At or above 21°C it records `preheat_limited` and
 preserves the native offset instead of adding heat.
@@ -693,10 +712,17 @@ electrical energy are unavailable, so solar-driven floor-heating dispatch
 remains disabled and the sensor reports price opportunity rather than measured
 kWh or euro savings. The separate bounded inverter-curtailment controller does
 not make the floor evaluator solar-aware.
-Promotion remains ineligible until at least 14 observed days, five clean
-revision-4 candidate cycles, thermal-lag review, controlled offset commissioning,
-and explicit room-comfort bounds exist. Revision-4 evidence starts from zero
-because the numerical floor policy changed.
+The evidence gate remains ineligible until at least 14 observed days and five
+clean revision-5 candidate cycles. The explicit owner-approved path can select
+active mode earlier, but it does not claim that thermal-lag evidence passed.
+The numerical -6°C to +4°C envelope and 4°C overlay are unchanged from revision
+4; revision 5 adds guarded ownership and write/restore behavior.
+
+The dedicated floor opportunity sensor changes its valuation status from
+`counterfactual` to `live_action_unattributed` in active mode. Confirmed offset
+writes and owned-action time are recorded, but measured shifted energy,
+estimated savings and realized savings remain unavailable without attributable
+whole-heat-pump electrical energy.
 
 The dedicated `Floor heating price opportunity` sensor records the paired peak
 average minus cheap-block average in EUR per shifted kWh. Its compact attributes
@@ -710,7 +736,8 @@ recent decisions to stay below Recorder's attribute-size limit.
 ## Extreme price protection
 
 Selecting a Daikin entry also creates a separate catastrophic-price controller.
-It does not change the DHW optimizer mode or make Floor Shadow write-capable.
+It does not change either optimizer mode and always has priority over their
+ordinary writes while faulted, owner-active or inside a hard-stop block.
 The controller uses only canonical published household all-in
 `import_eur_kwh` quarters; forecasts may remain advisory but never authorize a
 shutdown. Missing current publication is unavailable, not zero and not a reason

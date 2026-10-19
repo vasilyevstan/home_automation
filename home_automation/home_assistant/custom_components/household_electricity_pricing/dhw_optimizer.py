@@ -747,6 +747,7 @@ class DhwOptimizer:
             "readiness_pilot_confirmed_writes": 0,
             "pilot_started_at": None,
             "safe_pilot_confirmed_writes": 0,
+            "owner_full_control_approved_at": None,
             "deadline_checks": {},
             "readiness_window_peaks": {},
             "readiness_rapid_draws": {},
@@ -785,6 +786,7 @@ class DhwOptimizer:
             "readiness_pilot_confirmed_writes": 0,
             "pilot_started_at": None,
             "safe_pilot_confirmed_writes": 0,
+            "owner_full_control_approved_at": None,
             "deadline_checks": {},
             "readiness_window_peaks": {},
             "readiness_rapid_draws": {},
@@ -1479,19 +1481,47 @@ class DhwOptimizer:
         if self.state["decision_history"]:
             self.state["decision_history"][-1]["write_sent"] = bool(result.get("changed"))
 
-    async def async_set_mode(self, mode: str) -> None:
+    async def async_set_mode(
+        self,
+        mode: str,
+        *,
+        owner_approved: bool = False,
+    ) -> None:
         if mode not in DHW_MODES:
             raise HomeAssistantError("Unknown DHW optimizer mode.")
-        if mode == DHW_MODE_SAFE and not self.shadow_ready:
+        approval = self.state.get("owner_full_control_approved_at")
+        if (
+            mode == DHW_MODE_SAFE
+            and not self.shadow_ready
+            and not approval
+            and not owner_approved
+        ):
             raise HomeAssistantError(
                 "Safe target shift requires seven observed Shadow/readiness-pilot "
                 "days, five usable heating cycles, ten delivered readiness checks "
                 "with no genuine failure, and at least two confirmed readiness-pilot "
                 "writes."
             )
-        if mode == DHW_MODE_SOFT and not self.soft_ready:
+        if (
+            mode == DHW_MODE_SOFT
+            and not self.soft_ready
+            and not approval
+            and not owner_approved
+        ):
             raise HomeAssistantError(
                 "Soft standby requires the completed seven-day safe pilot and ten confirmed writes."
+            )
+        if owner_approved:
+            status = await self.devices.get_daikin_status()
+            observation = self._observation(status)
+            if observation.override_reason is not None:
+                raise HomeAssistantError(observation.override_reason)
+            if observation.enabled is not True:
+                raise HomeAssistantError(
+                    "The DHW circuit must be on before owner-approved activation."
+                )
+            self.state["owner_full_control_approved_at"] = (
+                dt_util.utcnow().astimezone(UTC).isoformat()
             )
         previous = self.mode
         self.mode = mode
@@ -1515,6 +1545,9 @@ class DhwOptimizer:
             self.state["lease_expires"] = None
         await self._save()
         await self.async_evaluate()
+
+    async def async_activate_full_control(self) -> None:
+        await self.async_set_mode(DHW_MODE_SOFT, owner_approved=True)
 
     async def async_resume(self) -> None:
         await self.devices.get_daikin_status()
@@ -1711,6 +1744,12 @@ class DhwOptimizer:
             "safe_pilot_confirmed_writes": self.state[
                 "safe_pilot_confirmed_writes"
             ],
+            "owner_full_control_approved_at": self.state[
+                "owner_full_control_approved_at"
+            ],
+            "owner_full_control_approved": bool(
+                self.state["owner_full_control_approved_at"]
+            ),
             "pilot_days": (
                 max(0, (dt_util.utcnow() - pilot_started.astimezone(UTC)).days)
                 if pilot_started else 0

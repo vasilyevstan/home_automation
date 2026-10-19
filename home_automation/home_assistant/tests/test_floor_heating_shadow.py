@@ -8,7 +8,7 @@ import importlib
 import json
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import test_component as base
 
@@ -23,6 +23,7 @@ class FloorHeatingShadowTests(base.HAComponentTests):
         self.module = importlib.import_module(
             base.COMPONENT + ".floor_heating_shadow"
         )
+        self.const = importlib.import_module(base.COMPONENT + ".const")
         self.sensor_module = importlib.import_module(base.COMPONENT + ".sensor")
         self.policy = self.module.FloorHeatingPolicy()
 
@@ -207,7 +208,7 @@ class FloorHeatingShadowTests(base.HAComponentTests):
         )
         self.assertEqual(external.state, "yield")
         self.assertEqual(external.proposed_offset, -7)
-        self.assertIn("Shadow envelope", external.reason)
+        self.assertIn("optimizer", external.reason)
 
     def test_complete_current_delivery_day_does_not_require_partial_tomorrow(self):
         start = datetime.fromisoformat("2026-10-17T00:00:00+00:00")
@@ -536,6 +537,424 @@ class FloorHeatingShadowTests(base.HAComponentTests):
         finally:
             await shadow.async_stop()
 
+    async def test_owner_approved_active_mode_writes_once_and_restores_baseline(self):
+        await self.refresh()
+        self.hass.states.async_set(
+            "sensor.room_temperature",
+            "20.5",
+            {"unit_of_measurement": "°C"},
+        )
+        delivery_day = date(2026, 10, 20)
+        start, _end = self.module.market_bounds(delivery_day)
+        prices = self.delivery_day_intervals(delivery_day)
+        status = self._runtime_status()
+        status["heating"]["operations"][
+            "LeavingWaterTemperatureOffsetHeating"
+        ] = -2
+
+        async def control(args, _context):
+            previous = status["heating"]["operations"][
+                "LeavingWaterTemperatureOffsetHeating"
+            ]
+            status["heating"]["operations"][
+                "LeavingWaterTemperatureOffsetHeating"
+            ] = float(args["value"])
+            return {
+                "changed": True,
+                "operation": "heating_offset",
+                "previous": previous,
+                "confirmed": float(args["value"]),
+            }
+
+        devices = SimpleNamespace(
+            get_daikin_status=AsyncMock(return_value=status),
+            control_daikin=AsyncMock(side_effect=control),
+        )
+        shadow = self.module.FloorHeatingShadow(
+            self.hass,
+            self._runtime_entry(["sensor.room_temperature"]),
+            self.coordinator,
+            devices,
+            None,
+        )
+        shadow.mode = self.const.FLOOR_MODE_ACTIVE
+        shadow.state["owner_activation_approved_at"] = (
+            start.isoformat()
+        )
+
+        with (
+            patch.object(
+                self.module,
+                "published_intervals",
+                return_value=prices,
+            ),
+            patch.object(
+                self.module,
+                "read_room_temperature_source",
+                side_effect=lambda *_args, now=None, **_kwargs: (
+                    20.5,
+                    now,
+                    None,
+                ),
+            ),
+        ):
+            await shadow.async_evaluate(start + timedelta(hours=10))
+            self.assertEqual(shadow.decision.state, "preheat")
+            self.assertEqual(shadow.decision.proposed_offset, 2)
+            self.assertEqual(
+                status["heating"]["operations"][
+                    "LeavingWaterTemperatureOffsetHeating"
+                ],
+                2,
+            )
+            self.assertEqual(devices.control_daikin.await_count, 1)
+            self.assertIsNotNone(shadow.state["ownership"])
+
+            await shadow.async_evaluate(
+                start + timedelta(hours=10, minutes=15)
+            )
+            self.assertEqual(shadow.decision.proposed_offset, 2)
+            self.assertEqual(devices.control_daikin.await_count, 1)
+
+            await shadow.async_evaluate(start + timedelta(hours=13))
+            self.assertEqual(shadow.decision.state, "hold")
+            self.assertEqual(shadow.decision.proposed_offset, -2)
+            self.assertEqual(
+                status["heating"]["operations"][
+                    "LeavingWaterTemperatureOffsetHeating"
+                ],
+                -2,
+            )
+            self.assertEqual(devices.control_daikin.await_count, 2)
+            self.assertIsNone(shadow.state["ownership"])
+            self.assertEqual(shadow.state["confirmed_writes"], 2)
+
+    async def test_floor_active_mode_requires_evidence_or_owner_approval(self):
+        await self.refresh()
+        self.hass.states.async_set(
+            "sensor.room_temperature",
+            "20.5",
+            {"unit_of_measurement": "°C"},
+        )
+        devices = SimpleNamespace(
+            get_daikin_status=AsyncMock(
+                return_value=self._runtime_status()
+            ),
+            control_daikin=AsyncMock(),
+        )
+        shadow = self.module.FloorHeatingShadow(
+            self.hass,
+            self._runtime_entry(["sensor.room_temperature"]),
+            self.coordinator,
+            devices,
+            None,
+        )
+        shadow.async_evaluate = AsyncMock()
+
+        with self.assertRaisesRegex(
+            self.module.HomeAssistantError,
+            "owner-approved",
+        ):
+            await shadow.async_set_mode(self.const.FLOOR_MODE_ACTIVE)
+
+        await shadow.async_set_mode(
+            self.const.FLOOR_MODE_ACTIVE,
+            owner_approved=True,
+        )
+        self.assertEqual(shadow.mode, self.const.FLOOR_MODE_ACTIVE)
+        self.assertIsNotNone(
+            shadow.state["owner_activation_approved_at"]
+        )
+        self.assertTrue(shadow.attributes["owner_activation_approved"])
+
+    async def test_uncertain_acquisition_reconciles_without_replaying(self):
+        self.hass.states.async_set(
+            "sensor.room_temperature",
+            "20.5",
+            {"unit_of_measurement": "°C"},
+        )
+        status = self._runtime_status()
+        status["heating"]["operations"][
+            "LeavingWaterTemperatureOffsetHeating"
+        ] = -2
+
+        async def uncertain_control(args, _context):
+            status["heating"]["operations"][
+                "LeavingWaterTemperatureOffsetHeating"
+            ] = float(args["value"])
+            raise self.module.HomeAssistantError(
+                "Synthetic post-dispatch uncertainty."
+            )
+
+        devices = SimpleNamespace(
+            get_daikin_status=AsyncMock(return_value=status),
+            control_daikin=AsyncMock(side_effect=uncertain_control),
+        )
+        shadow = self.module.FloorHeatingShadow(
+            self.hass,
+            self._runtime_entry(["sensor.room_temperature"]),
+            self.coordinator,
+            devices,
+            None,
+        )
+        shadow.mode = self.const.FLOOR_MODE_ACTIVE
+        shadow._save = AsyncMock()
+        now = self.now.astimezone(self.module.UTC)
+
+        with patch.object(
+            self.module.persistent_notification,
+            "async_create",
+        ):
+            confirmed = await shadow._dispatch_offset(
+                now=now,
+                previous=-2,
+                target=2,
+                baseline=-2,
+                phase="preheat",
+                restoring=False,
+            )
+        self.assertFalse(confirmed)
+        self.assertIsNotNone(shadow.state["fault"])
+        self.assertIsNotNone(shadow.state["pending_operation"])
+        self.assertIsNone(shadow.state["ownership"])
+        self.assertEqual(devices.control_daikin.await_count, 1)
+
+        shadow.async_evaluate = AsyncMock()
+        with patch.object(
+            self.module.persistent_notification,
+            "async_dismiss",
+        ):
+            await shadow.async_resume_after_review()
+        self.assertIsNone(shadow.state["fault"])
+        self.assertIsNone(shadow.state["pending_operation"])
+        self.assertEqual(
+            shadow.state["ownership"]["baseline_offset"],
+            -2,
+        )
+        self.assertEqual(
+            shadow.state["ownership"]["target_offset"],
+            2,
+        )
+        self.assertEqual(devices.control_daikin.await_count, 1)
+
+    async def test_external_offset_change_relinquishes_ownership(self):
+        shadow = self.module.FloorHeatingShadow(
+            self.hass,
+            self._runtime_entry([]),
+            self.coordinator,
+            SimpleNamespace(),
+            None,
+        )
+        shadow.mode = self.const.FLOOR_MODE_ACTIVE
+        shadow.state["ownership"] = {
+            "baseline_offset": -2,
+            "target_offset": 2,
+            "phase": "preheat",
+            "acquired_at": self.now.isoformat(),
+            "updated_at": self.now.isoformat(),
+        }
+        delivery_day = date(2026, 10, 20)
+        start, _end = self.module.market_bounds(delivery_day)
+        decision = self.module.plan_floor_heating(
+            now=start,
+            policy=self.policy,
+            observation=self.observation(actual_offset=0),
+            intervals=self.delivery_day_intervals(delivery_day),
+        )
+
+        normalized = shadow._normalize_owned_decision(
+            self.observation(actual_offset=0),
+            decision,
+        )
+
+        self.assertEqual(normalized.state, "yield")
+        self.assertEqual(normalized.proposed_offset, 0)
+        self.assertEqual(shadow.mode, self.const.FLOOR_MODE_SHADOW)
+        self.assertIsNone(shadow.state["ownership"])
+        self.assertIn(
+            "preserved",
+            shadow.state["manual_override"],
+        )
+
+    async def test_uncertain_restore_reconciles_at_baseline_without_replay(self):
+        self.hass.states.async_set(
+            "sensor.room_temperature",
+            "20.5",
+            {"unit_of_measurement": "°C"},
+        )
+        status = self._runtime_status()
+        status["heating"]["operations"][
+            "LeavingWaterTemperatureOffsetHeating"
+        ] = 2
+
+        async def uncertain_restore(args, _context):
+            status["heating"]["operations"][
+                "LeavingWaterTemperatureOffsetHeating"
+            ] = float(args["value"])
+            raise self.module.HomeAssistantError(
+                "Synthetic restore uncertainty."
+            )
+
+        devices = SimpleNamespace(
+            get_daikin_status=AsyncMock(return_value=status),
+            control_daikin=AsyncMock(side_effect=uncertain_restore),
+        )
+        shadow = self.module.FloorHeatingShadow(
+            self.hass,
+            self._runtime_entry(["sensor.room_temperature"]),
+            self.coordinator,
+            devices,
+            None,
+        )
+        shadow.mode = self.const.FLOOR_MODE_ACTIVE
+        shadow.state["ownership"] = {
+            "baseline_offset": -2,
+            "target_offset": 2,
+            "phase": "preheat",
+            "acquired_at": self.now.isoformat(),
+            "updated_at": self.now.isoformat(),
+        }
+        shadow._save = AsyncMock()
+
+        with (
+            patch.object(
+                self.module.persistent_notification,
+                "async_create",
+            ),
+            self.assertRaisesRegex(
+                self.module.HomeAssistantError,
+                "may have applied",
+            ),
+        ):
+            await shadow.async_return_to_baseline(evaluate=False)
+        self.assertIsNotNone(shadow.state["pending_operation"])
+        self.assertIsNotNone(shadow.state["ownership"])
+        self.assertEqual(devices.control_daikin.await_count, 1)
+
+        shadow.async_evaluate = AsyncMock()
+        with patch.object(
+            self.module.persistent_notification,
+            "async_dismiss",
+        ):
+            await shadow.async_resume_after_review()
+        self.assertIsNone(shadow.state["pending_operation"])
+        self.assertIsNone(shadow.state["ownership"])
+        self.assertIsNone(shadow.state["fault"])
+        self.assertEqual(devices.control_daikin.await_count, 1)
+
+    async def test_mode_change_restores_exact_owned_baseline(self):
+        self.hass.states.async_set(
+            "sensor.room_temperature",
+            "20.5",
+            {"unit_of_measurement": "°C"},
+        )
+        status = self._runtime_status()
+        status["heating"]["operations"][
+            "LeavingWaterTemperatureOffsetHeating"
+        ] = 2
+
+        async def control(args, _context):
+            previous = status["heating"]["operations"][
+                "LeavingWaterTemperatureOffsetHeating"
+            ]
+            status["heating"]["operations"][
+                "LeavingWaterTemperatureOffsetHeating"
+            ] = float(args["value"])
+            return {
+                "changed": True,
+                "operation": "heating_offset",
+                "previous": previous,
+                "confirmed": float(args["value"]),
+            }
+
+        devices = SimpleNamespace(
+            get_daikin_status=AsyncMock(return_value=status),
+            control_daikin=AsyncMock(side_effect=control),
+        )
+        shadow = self.module.FloorHeatingShadow(
+            self.hass,
+            self._runtime_entry(["sensor.room_temperature"]),
+            self.coordinator,
+            devices,
+            None,
+        )
+        shadow.mode = self.const.FLOOR_MODE_ACTIVE
+        shadow.state["ownership"] = {
+            "baseline_offset": -2,
+            "target_offset": 2,
+            "phase": "preheat",
+            "acquired_at": self.now.isoformat(),
+            "updated_at": self.now.isoformat(),
+        }
+        shadow._save = AsyncMock()
+        shadow.async_evaluate = AsyncMock()
+
+        await shadow.async_set_mode(self.const.FLOOR_MODE_SHADOW)
+
+        self.assertEqual(shadow.mode, self.const.FLOOR_MODE_SHADOW)
+        self.assertIsNone(shadow.state["ownership"])
+        self.assertEqual(
+            status["heating"]["operations"][
+                "LeavingWaterTemperatureOffsetHeating"
+            ],
+            -2,
+        )
+        devices.control_daikin.assert_awaited_once()
+        self.assertEqual(
+            devices.control_daikin.await_args.args[0],
+            {
+                "operation": "heating_offset",
+                "value": -2,
+                "expected_previous": 2,
+            },
+        )
+
+    async def test_startup_latches_persisted_pending_command_without_write(self):
+        await self.refresh()
+        self.hass.states.async_set(
+            "sensor.room_temperature",
+            "20.5",
+            {"unit_of_measurement": "°C"},
+        )
+        devices = SimpleNamespace(
+            get_daikin_status=AsyncMock(
+                return_value=self._runtime_status()
+            ),
+            control_daikin=AsyncMock(),
+        )
+        shadow = self.module.FloorHeatingShadow(
+            self.hass,
+            self._runtime_entry(["sensor.room_temperature"]),
+            self.coordinator,
+            devices,
+            None,
+        )
+        stored = {
+            **shadow.state,
+            "mode": self.const.FLOOR_MODE_ACTIVE,
+            "pending_operation": {
+                "previous_offset": -2,
+                "target_offset": 2,
+                "baseline_offset": -2,
+                "phase": "preheat",
+                "restoring": False,
+                "prepared_at": self.now.isoformat(),
+            },
+        }
+        shadow.store = SimpleNamespace(
+            async_load=AsyncMock(return_value=stored),
+            async_save=AsyncMock(),
+        )
+
+        await shadow.async_start()
+        try:
+            self.assertEqual(shadow.mode, self.const.FLOOR_MODE_ACTIVE)
+            self.assertIn("uncertain outcome", shadow.state["fault"])
+            self.assertEqual(shadow.decision.state, "fault")
+            devices.control_daikin.assert_not_awaited()
+        finally:
+            await shadow.async_stop()
+
     async def test_extreme_price_arbitration_yields_before_floor_evidence(self):
         await self.refresh()
         self.hass.states.async_set(
@@ -611,6 +1030,13 @@ class FloorHeatingShadowTests(base.HAComponentTests):
         self.assertIsNone(attributes["estimated_savings_eur"])
         self.assertIsNone(attributes["realized_savings_eur"])
         self.assertLess(len(json.dumps(attributes)), 2048)
+
+        shadow.mode = self.const.FLOOR_MODE_ACTIVE
+        live_attributes = sensor.extra_state_attributes
+        self.assertEqual(
+            live_attributes["valuation_status"],
+            "live_action_unattributed",
+        )
 
 
 if __name__ == "__main__":
