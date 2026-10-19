@@ -236,6 +236,11 @@
   euro savings.
   Keep the dedicated solar opportunity sensor Recorder-safe and label Armed
   values as live but unattributed, never realized savings.
+- Keep configured, active and requested solar-limit history in dedicated
+  Recorder-safe equivalent-watt sensors. Preserve native percent/watt mode in
+  attributes, keep solar operation history bounded, and include verified,
+  pre-dispatch and uncertain solar outcomes in the compact cross-controller
+  activity feed.
 - HA must be the sole Huawei Modbus client during handover. Keep the old local
   solar MCP disconnected as rollback; cloud history is independent. Generation
   caps, export limits, and household load are not interchangeable.

@@ -529,22 +529,89 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
             },
             async_add_listener=Mock(),
         )
+        solar = SimpleNamespace(
+            operation_history=[
+                {
+                    "at": (
+                        now - timedelta(minutes=10)
+                    ).isoformat(),
+                    "operation": "acquire",
+                    "phase": "verified",
+                    "success": True,
+                    "previous": {
+                        "mode": "percent",
+                        "configured": 100.0,
+                    },
+                    "confirmed": {
+                        "mode": "percent",
+                        "configured": 45.4,
+                    },
+                },
+                {
+                    "at": now.isoformat(),
+                    "operation": "restore",
+                    "phase": "post_dispatch_uncertain",
+                    "success": False,
+                    "error": "Synthetic uncertain restore.",
+                },
+            ],
+            async_add_listener=Mock(),
+        )
         sensor = self.sensor_module.EnergyControlActivitySensor(
             optimizer,
             floor,
             extreme,
+            solar,
             "pricing",
         )
 
         attributes = sensor.extra_state_attributes
-        self.assertEqual(attributes["verified_command_count"], 1)
+        self.assertEqual(attributes["verified_command_count"], 2)
         self.assertEqual(attributes["no_command_count"], 1)
         self.assertEqual(attributes["simulation_count"], 1)
+        self.assertEqual(attributes["uncertain_command_count"], 1)
         self.assertEqual(
             [event["kind"] for event in attributes["events"]],
-            ["verified_command", "no_command", "simulation"],
+            [
+                "verified_command",
+                "no_command",
+                "simulation",
+                "verified_command",
+                "uncertain_command",
+            ],
         )
-        self.assertEqual(sensor.native_value, "simulation")
+        self.assertEqual(sensor.native_value, "uncertain_command")
+
+    def test_solar_power_limit_sensors_use_equivalent_watts(self):
+        controller = SimpleNamespace(
+            attributes={
+                "configured_limit_equivalent_w": 8000,
+                "active_limit_equivalent_w": 6000,
+                "requested_limit_equivalent_w": 4000,
+                "configured_limit_mode": "percent",
+                "pmax_w": 8000,
+            },
+            async_add_listener=Mock(),
+        )
+        sensors = (
+            self.sensor_module.SolarConfiguredPowerLimitSensor(
+                controller,
+                "pricing",
+            ),
+            self.sensor_module.SolarActivePowerLimitSensor(
+                controller,
+                "pricing",
+            ),
+            self.sensor_module.SolarControllerPowerRequestSensor(
+                controller,
+                "pricing",
+            ),
+        )
+        self.assertEqual(
+            [sensor.native_value for sensor in sensors],
+            [8000.0, 6000.0, 4000.0],
+        )
+        self.assertTrue(all(sensor.available for sensor in sensors))
 
     async def test_owner_activation_and_floor_controls_delegate_explicitly(self):
         select_module = importlib.import_module(COMPONENT + ".select")
@@ -641,6 +708,9 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         solar = SimpleNamespace(
             async_start=AsyncMock(),
             async_stop=AsyncMock(),
+            async_add_listener=Mock(),
+            attributes={},
+            operation_history=[],
         )
         try:
             with (
@@ -725,6 +795,17 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                     entity.__class__.__name__
                     for entity in sensor_entities
                 },
+            )
+            self.assertEqual(
+                sum(
+                    entity.__class__.__name__.endswith(
+                        "PowerLimitSensor"
+                    )
+                    or entity.__class__.__name__
+                    == "SolarControllerPowerRequestSensor"
+                    for entity in sensor_entities
+                ),
+                3,
             )
             self.assertTrue(
                 await self.integration.async_unload_entry(

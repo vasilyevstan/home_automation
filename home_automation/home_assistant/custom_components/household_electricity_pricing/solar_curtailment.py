@@ -54,6 +54,7 @@ POLICY_REVISION = 1
 STORE_KEY_SUFFIX = "solar_curtailment"
 ACTIVE_POWER_MAX_AGE_SECONDS = 45
 HISTORY_LIMIT = 64
+OPERATION_HISTORY_LIMIT = 12
 STARTUP_DEPENDENCY_DEFERRAL_SECONDS = 60
 
 
@@ -76,6 +77,25 @@ def _validate_private_filename(filename: str) -> None:
         or "\\" in filename
     ):
         raise ValueError("Invalid private state filename.")
+
+
+def _equivalent_limit_w(
+    mode: object,
+    value: object,
+    pmax_w: object,
+) -> float | None:
+    try:
+        numeric_value = float(value)
+        numeric_pmax = float(pmax_w)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric_value) or not math.isfinite(numeric_pmax):
+        return None
+    if mode == "percent":
+        return round(numeric_pmax * numeric_value / 100, 3)
+    if mode == "watts":
+        return round(numeric_value, 3)
+    return None
 
 
 def _load_private_json(directory: Path, filename: str) -> dict | None:
@@ -608,6 +628,7 @@ class SolarCurtailment:
             "qualification": None,
             "eligible_since": None,
             "last_operation": None,
+            "operation_history": [],
             "commissioning": {
                 "policy_replay_verified": False,
                 "write_permission_verified": False,
@@ -773,7 +794,27 @@ class SolarCurtailment:
         self.evaluation_tasks.add(task)
         task.add_done_callback(self.evaluation_tasks.discard)
 
+    @property
+    def operation_history(self) -> list[dict]:
+        history = [
+            deepcopy(item)
+            for item in self.state.get("operation_history", [])
+            if isinstance(item, dict)
+        ]
+        latest = self.state.get("last_operation")
+        if isinstance(latest, dict) and latest.get("at"):
+            identity = (latest.get("operation"), latest.get("at"))
+            if history and (
+                history[-1].get("operation"),
+                history[-1].get("at"),
+            ) == identity:
+                history[-1] = deepcopy(latest)
+            else:
+                history.append(deepcopy(latest))
+        return history[-OPERATION_HISTORY_LIMIT:]
+
     async def _save(self) -> None:
+        self.state["operation_history"] = self.operation_history
         await self.state_file.async_save(
             {"mode": self.mode, **self.state}
         )
@@ -1387,12 +1428,16 @@ class SolarCurtailment:
                 "audit_error": result.get("audit_error"),
             }
         )
+        if isinstance(result.get("confirmed"), dict):
+            self.last_status = deepcopy(result["confirmed"])
         self.state["ownership"] = owner
         self.state["last_operation"] = {
             "operation": "acquire",
             "phase": "verified",
             "success": True,
             "changed": result.get("changed"),
+            "previous": result.get("previous"),
+            "confirmed": result.get("confirmed"),
             "block_id": block.identity,
             "audit_persisted": result.get("audit_persisted"),
             "audit_error": result.get("audit_error"),
@@ -1593,11 +1638,15 @@ class SolarCurtailment:
             self._set_decision("fault", str(error))
             return
         self.state["ownership"] = None
+        if isinstance(result.get("confirmed"), dict):
+            self.last_status = deepcopy(result["confirmed"])
         self.state["last_operation"] = {
             "operation": "restore",
             "phase": "verified",
             "success": True,
             "changed": result.get("changed"),
+            "previous": result.get("previous"),
+            "confirmed": result.get("confirmed"),
             "reason": reason,
             "audit_persisted": result.get("audit_persisted"),
             "audit_error": result.get("audit_error"),
@@ -2218,6 +2267,38 @@ class SolarCurtailment:
         )
         original = owner.get("original") if owner is not None else None
         owned_target = owner.get("target") if owner is not None else None
+        configured_limit_w = _equivalent_limit_w(
+            status.get("mode"),
+            status.get("configured"),
+            status.get("pmax_w"),
+        )
+        active_limit_w = _equivalent_limit_w(
+            status.get("mode"),
+            status.get("active"),
+            status.get("pmax_w"),
+        )
+        requested_limit_w = configured_limit_w
+        if owner is not None:
+            requested = (
+                original
+                if owner.get("phase") == "pending_restore"
+                else owned_target
+            )
+            if isinstance(requested, dict):
+                requested_limit_w = _equivalent_limit_w(
+                    requested.get("mode"),
+                    requested.get("configured"),
+                    status.get("pmax_w"),
+                )
+        elif (
+            decision.state in ("shadow_opportunity", "qualifying")
+            and isinstance(target, dict)
+        ):
+            requested_limit_w = _equivalent_limit_w(
+                target.get("mode"),
+                target.get("value"),
+                status.get("pmax_w"),
+            )
         return {
             "mode": self.mode,
             "state": decision.state,
@@ -2276,6 +2357,9 @@ class SolarCurtailment:
             "configured_limit_mode": status.get("mode"),
             "configured_limit": status.get("configured"),
             "active_limit": status.get("active"),
+            "configured_limit_equivalent_w": configured_limit_w,
+            "active_limit_equivalent_w": active_limit_w,
+            "requested_limit_equivalent_w": requested_limit_w,
             "limit_minimum": status.get("limit_minimum"),
             "limit_maximum": status.get("limit_maximum"),
             "limit_step": status.get("limit_step"),
