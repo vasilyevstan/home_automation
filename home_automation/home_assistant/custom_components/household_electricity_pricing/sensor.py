@@ -546,7 +546,24 @@ class EnergyControlActivitySensor(SensorEntity):
                 })
 
         events.sort(key=lambda item: item["observed_at"])
-        return events[-12:]
+        deduplicated = []
+        last_signature_by_system = {}
+        for event in events:
+            signature = tuple(
+                event.get(key)
+                for key in (
+                    "kind",
+                    "state",
+                    "change",
+                    "reason",
+                    "result",
+                )
+            )
+            if last_signature_by_system.get(event["system"]) == signature:
+                continue
+            last_signature_by_system[event["system"]] = signature
+            deduplicated.append(event)
+        return deduplicated[-12:]
 
     @property
     def native_value(self) -> str:
