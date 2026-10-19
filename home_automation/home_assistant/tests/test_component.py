@@ -500,6 +500,16 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         "state": "coast",
                         "reason": "Expensive block.",
                         "write_sent": False,
+                    },
+                    {
+                        "observed_at": (
+                            now - timedelta(minutes=20)
+                        ).isoformat(),
+                        "actual_offset_c": 0,
+                        "proposed_offset_c": -4,
+                        "state": "coast",
+                        "reason": "Expensive block.",
+                        "write_sent": False,
                     }
                 ]
             },
