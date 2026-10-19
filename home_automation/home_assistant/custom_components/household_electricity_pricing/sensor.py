@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta, timezone
 from decimal import Decimal
 
 from homeassistant.components.sensor import (
@@ -84,6 +85,24 @@ async def async_setup_entry(
         entities.append(
             SolarCurtailmentSensor(
                 solar_curtailment,
+                entry.entry_id,
+            )
+        )
+    activity_controllers = [
+        controller
+        for controller in (
+            optimizer,
+            floor_shadow,
+            extreme_protection,
+        )
+        if controller is not None
+    ]
+    if activity_controllers:
+        entities.append(
+            EnergyControlActivitySensor(
+                optimizer,
+                floor_shadow,
+                extreme_protection,
                 entry.entry_id,
             )
         )
@@ -345,6 +364,210 @@ class FloorRoomTemperatureSensor(SensorEntity):
                 "thermal_response_evidence_eligible"
             ],
             "daikin_garage_temperature_c": details["daikin_indoor_temperature_c"],
+        }
+
+
+class EnergyControlActivitySensor(SensorEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Energy control activity"
+    _attr_icon = "mdi:timeline-check-outline"
+
+    def __init__(
+        self,
+        optimizer,
+        floor_shadow,
+        extreme_protection,
+        entry_id: str,
+    ) -> None:
+        self.optimizer = optimizer
+        self.floor_shadow = floor_shadow
+        self.extreme_protection = extreme_protection
+        self._attr_unique_id = entry_id + "_energy_control_activity"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)},
+            name=NAME,
+            manufacturer="home_automation",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        for controller in (
+            self.optimizer,
+            self.floor_shadow,
+            self.extreme_protection,
+        ):
+            if controller is not None:
+                self.async_on_remove(
+                    controller.async_add_listener(self.async_write_ha_state)
+                )
+
+    @staticmethod
+    def _timestamp(value: object):
+        if not isinstance(value, str):
+            return None
+        parsed = dt_util.parse_datetime(value)
+        return parsed.astimezone(timezone.utc) if parsed is not None else None
+
+    @staticmethod
+    def _temperature_change(
+        actual: object,
+        proposed: object,
+        label: str,
+    ) -> str:
+        before = "—" if actual is None else f"{actual}°C"
+        after = "—" if proposed is None else f"{proposed}°C"
+        return f"{label} {before} → {after}"
+
+    def _events(self) -> list[dict]:
+        now = dt_util.utcnow().astimezone(timezone.utc)
+        cutoff = now - timedelta(hours=24)
+        events = []
+
+        if self.optimizer is not None:
+            pilot_started = self._timestamp(
+                self.optimizer.state.get("readiness_pilot_started_at")
+            )
+            for record in self.optimizer.state.get("decision_history", []):
+                observed_at = self._timestamp(record.get("observed_at"))
+                if observed_at is None or observed_at < cutoff:
+                    continue
+                state = record.get("state")
+                if state == "unavailable":
+                    continue
+                write_sent = bool(record.get("write_sent"))
+                live = (
+                    pilot_started is not None
+                    and observed_at >= pilot_started
+                )
+                if not write_sent:
+                    if live and state not in (
+                        "readiness_pilot",
+                        "recovery",
+                        "fault",
+                        "manual_override",
+                    ):
+                        continue
+                    if not live and state == "normal":
+                        continue
+                kind = (
+                    "verified_command"
+                    if write_sent
+                    else "no_command" if live
+                    else "simulation"
+                )
+                events.append({
+                    "observed_at": observed_at.isoformat(),
+                    "system": "Hot water",
+                    "kind": kind,
+                    "state": state,
+                    "change": self._temperature_change(
+                        record.get("actual_target_c"),
+                        record.get("proposed_target_c"),
+                        "Target",
+                    ),
+                    "reason": record.get("reason"),
+                    "result": (
+                        "Guarded command confirmed by native Daikin read-back."
+                        if write_sent
+                        else (
+                            "No device command was sent."
+                            if live
+                            else "Not sent; the controller was in Shadow."
+                        )
+                    ),
+                })
+
+        if self.floor_shadow is not None:
+            for record in self.floor_shadow.state.get(
+                "decision_history",
+                [],
+            ):
+                observed_at = self._timestamp(record.get("observed_at"))
+                if observed_at is None or observed_at < cutoff:
+                    continue
+                state = record.get("state")
+                if state in ("unavailable", "hold"):
+                    continue
+                events.append({
+                    "observed_at": observed_at.isoformat(),
+                    "system": "Floor heating",
+                    "kind": "simulation",
+                    "state": state,
+                    "change": self._temperature_change(
+                        record.get("actual_offset_c"),
+                        record.get("proposed_offset_c"),
+                        "Offset",
+                    ),
+                    "reason": record.get("reason"),
+                    "result": "Not sent; floor heating remains Shadow-only.",
+                })
+
+        if self.extreme_protection is not None:
+            for record in self.extreme_protection.state.get(
+                "decision_history",
+                [],
+            ):
+                observed_at = self._timestamp(record.get("observed_at"))
+                if observed_at is None or observed_at < cutoff:
+                    continue
+                state = record.get("state")
+                actions = record.get("actions") or []
+                write_sent = bool(record.get("write_sent"))
+                if (
+                    state in ("clear", "unavailable")
+                    and not actions
+                    and not write_sent
+                ):
+                    continue
+                events.append({
+                    "observed_at": observed_at.isoformat(),
+                    "system": "Extreme protection",
+                    "kind": (
+                        "verified_command"
+                        if write_sent
+                        else "no_command"
+                    ),
+                    "state": state,
+                    "change": (
+                        ", ".join(
+                            "{}: {}".format(
+                                action.get("load_id", "load"),
+                                action.get("operation", "review"),
+                            )
+                            for action in actions
+                        )
+                        or "No protected-load change"
+                    ),
+                    "reason": record.get("reason"),
+                    "result": (
+                        "Sequential protected-load commands were confirmed."
+                        if write_sent
+                        else "No protected-load command was sent."
+                    ),
+                })
+
+        events.sort(key=lambda item: item["observed_at"])
+        return events[-12:]
+
+    @property
+    def native_value(self) -> str:
+        events = self._events()
+        return events[-1]["kind"] if events else "no_recent_activity"
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        events = self._events()
+        return {
+            "window_hours": 24,
+            "events": events,
+            "verified_command_count": sum(
+                event["kind"] == "verified_command" for event in events
+            ),
+            "simulation_count": sum(
+                event["kind"] == "simulation" for event in events
+            ),
+            "no_command_count": sum(
+                event["kind"] == "no_command" for event in events
+            ),
         }
 
 

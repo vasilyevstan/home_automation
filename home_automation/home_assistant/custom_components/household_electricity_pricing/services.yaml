@@ -27,6 +27,7 @@ get_price_forecast:
           options:
             - current
             - archive
+            - evolution
     history_days:
       default: 7
       selector:
@@ -51,6 +52,9 @@ get_price_forecast:
           max: 7
           step: 1
           mode: box
+    delivery_date:
+      selector:
+        date:
 
 quote_electricity_interval:
   fields:

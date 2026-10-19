@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 import importlib
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import test_component as base
 
@@ -184,6 +184,122 @@ class PriceForecastTests(base.HAComponentTests):
                 point["horizon_days"] == 1
                 for point in archive["intervals"]
             )
+        )
+        await coordinator.async_shutdown()
+
+    async def test_archive_retains_vintages_and_evolution_orders_them(self):
+        coordinator = await self.forecast_coordinator()
+        older = self.report(
+            issued_delta=timedelta(hours=2),
+            p50=Decimal("100"),
+        )
+        newer = self.report(
+            issued_delta=timedelta(minutes=20),
+            p50=Decimal("80"),
+        )
+        self.assertTrue(coordinator._record_report(older, self.now))
+        self.assertTrue(coordinator._record_report(newer, self.now))
+        self.assertEqual(len(coordinator.archive), 2 * 7 * 24)
+
+        latest = await coordinator.async_response("archive", 8, 1, 1)
+        self.assertEqual(latest["stored_hours"], 24)
+        self.assertEqual(len(latest["intervals"]), 24 * 4)
+        first_latest = latest["intervals"][0]
+        expected_latest = self.pricing.forecast_import_eur_kwh(
+            coordinator._profile(),
+            Decimal("80"),
+            datetime.fromisoformat(first_latest["start"]),
+        )
+        self.assertEqual(
+            first_latest["prediction"]["p50_import_eur_kwh"],
+            expected_latest,
+        )
+
+        delivery_day = datetime.fromisoformat(
+            latest["intervals"][0]["start"]
+        ).date()
+        evolution = await coordinator.async_response(
+            "evolution",
+            8,
+            1,
+            1,
+            delivery_day,
+        )
+        self.assertEqual(evolution["schema_version"], 2)
+        self.assertEqual(evolution["retained_issuance_count"], 2)
+        self.assertEqual(evolution["expected_intervals"], 24 * 4)
+        self.assertEqual(evolution["available_intervals"], 24 * 4)
+        self.assertTrue(evolution["complete_delivery_coverage"])
+        self.assertEqual(evolution["comparison_intervals"], 24 * 4)
+        self.assertEqual(
+            Decimal(evolution["first_retained_mae_eur_kwh"]),
+            0,
+        )
+        self.assertGreater(
+            Decimal(evolution["latest_retained_mae_eur_kwh"]),
+            0,
+        )
+        self.assertEqual(evolution["movement"], "worsened")
+        first_point = evolution["intervals"][0]
+        self.assertEqual(first_point["revision_count"], 2)
+        self.assertLess(
+            datetime.fromisoformat(first_point["first_retained"]["issued_at"]),
+            datetime.fromisoformat(first_point["latest_retained"]["issued_at"]),
+        )
+        self.assertFalse(evolution["tracking_active_for_full_horizon"])
+        await coordinator.async_shutdown()
+
+    async def test_same_issuance_with_changed_values_is_rejected(self):
+        coordinator = await self.forecast_coordinator()
+        original = self.report(p50=Decimal("100"))
+        conflicting = self.report(p50=Decimal("101"))
+        self.assertTrue(coordinator._record_report(original, self.now))
+        with self.assertRaisesRegex(
+            self.module.ForecastError,
+            "without a new issuance",
+        ):
+            coordinator._record_report(conflicting, self.now)
+        await coordinator.async_shutdown()
+
+    async def test_version_one_archive_migrates_as_partial_vintage_history(self):
+        coordinator = await self.forecast_coordinator()
+        report = self.report()
+        slot = report.hours[0]
+        legacy = {
+            "start": slot.start.astimezone(self.module.UTC).isoformat(),
+            "issued_at": report.issued_at.astimezone(
+                self.module.UTC
+            ).isoformat(),
+            "model_trained_at": report.model_trained_at.astimezone(
+                self.module.UTC
+            ).isoformat(),
+            "horizon_days": slot.horizon_days,
+            "p10_spot_eur_mwh": format(slot.p10, "f"),
+            "p50_spot_eur_mwh": format(slot.p50, "f"),
+            "p90_spot_eur_mwh": format(slot.p90, "f"),
+        }
+        coordinator.store.async_load = AsyncMock(
+            return_value={"records": [legacy]}
+        )
+        coordinator.store.async_save = AsyncMock()
+        await coordinator.async_load()
+
+        self.assertEqual(len(coordinator.archive), 1)
+        migrated = next(iter(coordinator.archive.values()))
+        self.assertEqual(
+            migrated["archive_origin"],
+            self.module.ARCHIVE_ORIGIN_MIGRATED,
+        )
+        coordinator.store.async_save.assert_awaited_once()
+        saved = coordinator.store.async_save.await_args.args[0]
+        self.assertEqual(
+            saved["schema_version"],
+            self.module.ARCHIVE_SCHEMA_VERSION,
+        )
+        self.assertIsNotNone(saved["vintage_tracking_started_at"])
+        self.assertEqual(
+            saved["records"][0]["archive_origin"],
+            self.module.ARCHIVE_ORIGIN_MIGRATED,
         )
         await coordinator.async_shutdown()
 
@@ -438,6 +554,25 @@ class PriceForecastTests(base.HAComponentTests):
             return_response=True,
         )
         self.assertEqual(future_archive["stored_hours"], 24)
+        delivery_day = datetime.fromisoformat(
+            future_archive["intervals"][0]["start"]
+        ).date()
+        evolution = await self.hass.services.async_call(
+            base.DOMAIN,
+            "get_price_forecast",
+            {
+                "config_entry": "pricing",
+                "view": "evolution",
+                "history_days": 8,
+                "horizon_days": 1,
+                "include_future_days": 1,
+                "delivery_date": delivery_day.isoformat(),
+            },
+            blocking=True,
+            return_response=True,
+        )
+        self.assertEqual(evolution["delivery_date"], delivery_day.isoformat())
+        self.assertEqual(evolution["retained_issuance_count"], 1)
         self.now = datetime.fromisoformat(current["window_end"]) + timedelta(
             hours=1
         )

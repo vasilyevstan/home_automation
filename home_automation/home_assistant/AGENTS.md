@@ -33,14 +33,21 @@
   167/168/169 hours across DST. Canonical HA Nord Pool quarters replace
   predictions when published. If canonical published data is missing, report
   unavailable rather than trusting a second published-price source.
-- Retain only the latest provider issuance per delivery hour and D-1 through
-  D-7 horizon for 90 days. Keep raw hourly quantiles in storage and recompute
-  quarter-hour all-in values with the tariff effective at delivery time.
+- Retain every distinct provider issuance per delivery hour and D-1 through
+  D-7 horizon for 90 days. Deduplicate exact same-issuance values and reject
+  conflicting values under one issuance timestamp. Keep raw hourly quantiles
+  in storage and recompute quarter-hour all-in values with the tariff effective
+  at delivery time. Migrate the prior latest-only archive as explicitly partial
+  evidence rather than presenting it as original forecast history.
 - Keep future archived delivery hours hidden by default. The explicit bounded
   `include_future_days` archive option may expose them for publication
   comparison, but charts must join exact quarter-hour timestamps and render
   only pairs with a canonical published household price. Partial or missing
   publication is unavailable, never zero.
+- Keep the backward-compatible `archive` response latest-only per delivery
+  hour. Use the bounded one-delivery-day `evolution` response for chronological
+  vintages, and label its first value as original only when tracking covered
+  the complete requested horizon and no migrated latest-only record is present.
 - Forecasts, p10-p90 bands and provider accuracy are advisory evidence. They
   cannot authorize heating writes, finalize bills, prove savings, or be exposed
   through an unauthenticated application endpoint. Keep the detailed payload in

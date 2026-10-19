@@ -249,8 +249,11 @@ data:
 
 `view: current` returns all quarter-hour published/p10/p50/p90 values, daily
 summaries, freshness, completeness, warnings, attribution and provider accuracy.
-The integration stores the latest provider issuance for each delivery hour and
-D-1 through D-7 horizon for 90 days. Query that evidence with:
+The integration stores every distinct provider issuance for each delivery hour
+and D-1 through D-7 horizon for 90 days. A migrated archive created before
+version 0.11.0 retains only its last surviving issuance and is labeled as
+partial evidence rather than an original forecast. Query the backward-compatible
+latest-retained view with:
 
 ```yaml
 action: household_electricity_pricing.get_price_forecast
@@ -268,6 +271,28 @@ canonical tomorrow prices publish. A comparison must join exact quarter-hour
 timestamps and show a point only when both the retained prediction and the
 canonical published household price exist; missing or partial publication is
 not zero.
+
+Use the bounded evolution view to inspect every retained revision for one
+delivery date:
+
+```yaml
+action: household_electricity_pricing.get_price_forecast
+data:
+  config_entry: YOUR_HOUSEHOLD_PRICING_ENTRY_ID
+  view: evolution
+  delivery_date: "2026-10-20"
+  history_days: 7
+  horizon_days: 1
+  include_future_days: 1
+```
+
+The response returns each quarter's chronological vintages plus the first and
+latest retained values, issuance coverage, and explicit capture-quality flags.
+It calls the first value original only when vintage tracking covered the full
+requested D-N window and no migrated latest-only record is involved. Compare
+forecast revisions with canonical household prices by exact quarter timestamp;
+do not infer missing actuals or invent revisions that were overwritten before
+vintage tracking began.
 
 A future application can call the same action through HA's authenticated REST
 service API instead of introducing a separate unauthenticated server. Use a

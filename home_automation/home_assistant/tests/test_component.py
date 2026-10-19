@@ -456,6 +456,86 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
             await old_coordinator.async_shutdown()
         self.assertNotIn(DOMAIN, {api.id for api in llm.async_get_apis(self.hass)})
 
+    async def test_energy_control_activity_distinguishes_commands_and_shadows(self):
+        now = self.now.astimezone(timezone.utc)
+        optimizer = SimpleNamespace(
+            state={
+                "readiness_pilot_started_at": (
+                    now - timedelta(hours=3)
+                ).isoformat(),
+                "decision_history": [
+                    {
+                        "observed_at": (
+                            now - timedelta(hours=2)
+                        ).isoformat(),
+                        "actual_target_c": 50,
+                        "proposed_target_c": 55,
+                        "state": "readiness_charge",
+                        "reason": "Readiness charge.",
+                        "write_sent": True,
+                    },
+                    {
+                        "observed_at": (
+                            now - timedelta(hours=1)
+                        ).isoformat(),
+                        "actual_target_c": 50,
+                        "proposed_target_c": 50,
+                        "state": "readiness_pilot",
+                        "reason": "Hold normal target.",
+                        "write_sent": False,
+                    },
+                ],
+            },
+            async_add_listener=Mock(),
+        )
+        floor = SimpleNamespace(
+            state={
+                "decision_history": [
+                    {
+                        "observed_at": (
+                            now - timedelta(minutes=30)
+                        ).isoformat(),
+                        "actual_offset_c": 0,
+                        "proposed_offset_c": -4,
+                        "state": "coast",
+                        "reason": "Expensive block.",
+                        "write_sent": False,
+                    }
+                ]
+            },
+            async_add_listener=Mock(),
+        )
+        extreme = SimpleNamespace(
+            state={
+                "decision_history": [
+                    {
+                        "observed_at": now.isoformat(),
+                        "state": "clear",
+                        "reason": "No block.",
+                        "actions": [],
+                        "write_sent": False,
+                    }
+                ]
+            },
+            async_add_listener=Mock(),
+        )
+        sensor = self.sensor_module.EnergyControlActivitySensor(
+            optimizer,
+            floor,
+            extreme,
+            "pricing",
+        )
+
+        attributes = sensor.extra_state_attributes
+        self.assertEqual(attributes["verified_command_count"], 1)
+        self.assertEqual(attributes["no_command_count"], 1)
+        self.assertEqual(attributes["simulation_count"], 1)
+        self.assertEqual(
+            [event["kind"] for event in attributes["events"]],
+            ["verified_command", "no_command", "simulation"],
+        )
+        self.assertEqual(sensor.native_value, "simulation")
+
     async def test_solar_only_entry_loads_sensor_select_and_button_platforms(self):
         callbacks = []
         old_coordinator = self.coordinator

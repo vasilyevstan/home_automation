@@ -45,7 +45,9 @@ GET_PRICES_SCHEMA = probatio.Schema({
 })
 GET_PRICE_FORECAST_SCHEMA = probatio.Schema({
     probatio.Required("config_entry"): ConfigEntrySelector({"integration": DOMAIN}),
-    probatio.Optional("view", default="current"): probatio.In(("current", "archive")),
+    probatio.Optional("view", default="current"): probatio.In(
+        ("current", "archive", "evolution")
+    ),
     probatio.Optional("history_days", default=7): probatio.All(
         int, probatio.Range(min=1, max=90)
     ),
@@ -55,6 +57,7 @@ GET_PRICE_FORECAST_SCHEMA = probatio.Schema({
     probatio.Optional("include_future_days", default=0): probatio.All(
         int, probatio.Range(min=0, max=7)
     ),
+    probatio.Optional("delivery_date"): cv.date,
 })
 
 
@@ -131,6 +134,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             call.data["history_days"],
             call.data["horizon_days"],
             call.data["include_future_days"],
+            call.data.get("delivery_date"),
         )
 
     hass.services.async_register(
