@@ -2101,6 +2101,75 @@ class SolarCurtailment:
         await self.async_evaluate(now)
 
     @property
+    def optimization_value(self) -> Decimal | None:
+        context = self.last_price
+        if (
+            context is None
+            or context.export_earnings is None
+            or context.export_earnings >= 0
+        ):
+            return None
+        return -context.export_earnings
+
+    @property
+    def optimization_value_attributes(self) -> dict:
+        now = dt_util.utcnow().astimezone(timezone.utc)
+        owner = self._ownership()
+        acquired = (
+            _instant(owner.get("acquired_at"))
+            if owner is not None
+            else None
+        )
+        eligible_since = _instant(self.state.get("eligible_since"))
+        value = self.optimization_value
+        if value is None:
+            return {
+                "metric": "negative_export_cost_opportunity_per_kwh",
+                "controller": "solar_curtailment",
+                "valuation_status": "unavailable",
+                "operating_mode": self.mode,
+                "measured_curtailed_energy_kwh": None,
+                "estimated_savings_eur": None,
+                "realized_savings_eur": None,
+                "savings_unavailable_reason": (
+                    "No negative net export-earnings interval is active."
+                ),
+            }
+        return {
+            "metric": "negative_export_cost_opportunity_per_kwh",
+            "controller": "solar_curtailment",
+            "valuation_status": (
+                "live_action_unattributed"
+                if self.mode == SOLAR_CURTAILMENT_MODE_ARMED
+                else "counterfactual"
+            ),
+            "operating_mode": self.mode,
+            "shadow_zero_writes": (
+                self.mode == SOLAR_CURTAILMENT_MODE_SHADOW
+            ),
+            "opportunity_eur_per_kwh": format(value, "f"),
+            "ownership": owner is not None,
+            "eligible_minutes": (
+                max(0, int((now - eligible_since).total_seconds() // 60))
+                if eligible_since is not None
+                else 0
+            ),
+            "owned_minutes": (
+                max(0, int((now - acquired).total_seconds() // 60))
+                if acquired is not None
+                else 0
+            ),
+            "measured_grid_export_available": False,
+            "measured_curtailed_energy_kwh": None,
+            "estimated_savings_eur": None,
+            "realized_savings_eur": None,
+            "savings_unavailable_reason": (
+                "Signed grid-export power is not measured, so avoided exported "
+                "energy and realized euros cannot be attributed."
+            ),
+        }
+
+    @property
     def attributes(self) -> dict:
         now = dt_util.utcnow().astimezone(timezone.utc)
         context = self.last_price

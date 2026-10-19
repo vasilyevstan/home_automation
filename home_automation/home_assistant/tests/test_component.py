@@ -546,6 +546,75 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(sensor.native_value, "simulation")
 
+    async def test_owner_activation_and_floor_controls_delegate_explicitly(self):
+        select_module = importlib.import_module(COMPONENT + ".select")
+        button_module = importlib.import_module(COMPONENT + ".button")
+        floor = SimpleNamespace(
+            mode="shadow",
+            state={
+                "fault": None,
+                "manual_override": None,
+                "ownership": None,
+            },
+            async_set_mode=AsyncMock(),
+            async_activate_owner_approved=AsyncMock(),
+            async_resume_after_review=AsyncMock(),
+            async_return_to_baseline=AsyncMock(),
+        )
+        optimizer = SimpleNamespace(
+            state={"fault": None},
+            async_activate_full_control=AsyncMock(),
+        )
+
+        mode_select = select_module.FloorHeatingModeSelect(
+            floor,
+            "pricing",
+        )
+        self.assertEqual(
+            mode_select.options,
+            [
+                "Paused",
+                "Shadow (no writes)",
+                "Active price shift",
+            ],
+        )
+        await mode_select.async_select_option("Active price shift")
+        floor.async_set_mode.assert_awaited_once_with("active")
+
+        activate_floor = button_module.FloorHeatingActivateButton(
+            floor,
+            "pricing",
+        )
+        self.assertTrue(activate_floor.available)
+        await activate_floor.async_press()
+        floor.async_activate_owner_approved.assert_awaited_once()
+
+        resume_floor = button_module.FloorHeatingResumeButton(
+            floor,
+            "pricing",
+        )
+        floor.state["manual_override"] = "External change."
+        self.assertTrue(resume_floor.available)
+        await resume_floor.async_press()
+        floor.async_resume_after_review.assert_awaited_once()
+
+        baseline_floor = button_module.FloorHeatingBaselineButton(
+            floor,
+            "pricing",
+        )
+        floor.state["ownership"] = {"target_offset": 4}
+        self.assertTrue(baseline_floor.available)
+        await baseline_floor.async_press()
+        floor.async_return_to_baseline.assert_awaited_once()
+
+        activate_dhw = button_module.DhwOptimizerFullControlButton(
+            optimizer,
+            "pricing",
+        )
+        self.assertTrue(activate_dhw.available)
+        await activate_dhw.async_press()
+        optimizer.async_activate_full_control.assert_awaited_once()
+
     async def test_solar_only_entry_loads_sensor_select_and_button_platforms(self):
         callbacks = []
         old_coordinator = self.coordinator
@@ -645,6 +714,13 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIn(
                 "SolarCurtailmentSensor",
+                {
+                    entity.__class__.__name__
+                    for entity in sensor_entities
+                },
+            )
+            self.assertIn(
+                "SolarCurtailmentOpportunitySensor",
                 {
                     entity.__class__.__name__
                     for entity in sensor_entities

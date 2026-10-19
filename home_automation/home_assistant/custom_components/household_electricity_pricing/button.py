@@ -25,6 +25,28 @@ async def async_setup_entry(
             (
                 DhwOptimizerResumeButton(optimizer, entry.entry_id),
                 DhwOptimizerNormalButton(optimizer, entry.entry_id),
+                DhwOptimizerFullControlButton(
+                    optimizer,
+                    entry.entry_id,
+                ),
+            )
+        )
+    floor_controller = runtime.get("floor_shadow")
+    if floor_controller is not None:
+        entities.extend(
+            (
+                FloorHeatingActivateButton(
+                    floor_controller,
+                    entry.entry_id,
+                ),
+                FloorHeatingResumeButton(
+                    floor_controller,
+                    entry.entry_id,
+                ),
+                FloorHeatingBaselineButton(
+                    floor_controller,
+                    entry.entry_id,
+                ),
             )
         )
     protection = runtime.get("extreme_protection")
@@ -101,6 +123,91 @@ class DhwOptimizerNormalButton(DhwOptimizerButton):
 
     async def async_press(self) -> None:
         await self.optimizer.async_return_to_normal()
+
+
+class DhwOptimizerFullControlButton(DhwOptimizerButton):
+    _attr_name = "Activate full hot water control"
+    _attr_icon = "mdi:water-boiler-auto"
+
+    def __init__(self, optimizer, entry_id: str) -> None:
+        super().__init__(optimizer, entry_id, "activate_full_control")
+
+    @property
+    def available(self) -> bool:
+        return not self.optimizer.state.get("fault")
+
+    async def async_press(self) -> None:
+        await self.optimizer.async_activate_full_control()
+
+
+class FloorHeatingButton(ButtonEntity):
+    _attr_has_entity_name = True
+
+    def __init__(self, controller, entry_id: str, suffix: str) -> None:
+        self.controller = controller
+        self._attr_unique_id = (
+            entry_id + "_floor_heating_optimizer_" + suffix
+        )
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)},
+            name=NAME,
+            manufacturer="home_automation",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            self.controller.async_add_listener(
+                self.async_write_ha_state
+            )
+        )
+
+
+class FloorHeatingActivateButton(FloorHeatingButton):
+    _attr_name = "Activate floor heating price shift"
+    _attr_icon = "mdi:heating-coil"
+
+    def __init__(self, controller, entry_id: str) -> None:
+        super().__init__(controller, entry_id, "activate")
+
+    @property
+    def available(self) -> bool:
+        return not self.controller.state.get("fault")
+
+    async def async_press(self) -> None:
+        await self.controller.async_activate_owner_approved()
+
+
+class FloorHeatingResumeButton(FloorHeatingButton):
+    _attr_name = "Resume floor heating after review"
+    _attr_icon = "mdi:play-circle-outline"
+
+    def __init__(self, controller, entry_id: str) -> None:
+        super().__init__(controller, entry_id, "resume")
+
+    @property
+    def available(self) -> bool:
+        return bool(
+            self.controller.state.get("fault")
+            or self.controller.state.get("manual_override")
+        )
+
+    async def async_press(self) -> None:
+        await self.controller.async_resume_after_review()
+
+
+class FloorHeatingBaselineButton(FloorHeatingButton):
+    _attr_name = "Return floor heating to baseline"
+    _attr_icon = "mdi:restore"
+
+    def __init__(self, controller, entry_id: str) -> None:
+        super().__init__(controller, entry_id, "baseline")
+
+    @property
+    def available(self) -> bool:
+        return self.controller.state.get("ownership") is not None
+
+    async def async_press(self) -> None:
+        await self.controller.async_return_to_baseline()
 
 
 class ExtremePriceProtectionButton(ButtonEntity):

@@ -12,6 +12,9 @@ from .const import (
     EXTREME_PRICE_MODE_ARMED,
     EXTREME_PRICE_MODE_OFF,
     EXTREME_PRICE_MODE_SHADOW,
+    FLOOR_MODE_ACTIVE,
+    FLOOR_MODE_PAUSED,
+    FLOOR_MODE_SHADOW,
     NAME,
     SOLAR_CURTAILMENT_MODE_ARMED,
     SOLAR_CURTAILMENT_MODE_OFF,
@@ -43,6 +46,14 @@ SOLAR_MODE_LABELS = {
 SOLAR_LABEL_MODES = {
     label: mode for mode, label in SOLAR_MODE_LABELS.items()
 }
+FLOOR_MODE_LABELS = {
+    FLOOR_MODE_PAUSED: "Paused",
+    FLOOR_MODE_SHADOW: "Shadow (no writes)",
+    FLOOR_MODE_ACTIVE: "Active price shift",
+}
+FLOOR_LABEL_MODES = {
+    label: mode for mode, label in FLOOR_MODE_LABELS.items()
+}
 
 
 async def async_setup_entry(
@@ -54,6 +65,14 @@ async def async_setup_entry(
     if optimizer is not None:
         entities.append(
             DhwOptimizerModeSelect(optimizer, entry.entry_id)
+        )
+    floor_controller = runtime.get("floor_shadow")
+    if floor_controller is not None:
+        entities.append(
+            FloorHeatingModeSelect(
+                floor_controller,
+                entry.entry_id,
+            )
         )
     protection = runtime.get("extreme_protection")
     if protection is not None:
@@ -135,6 +154,38 @@ class ExtremePriceProtectionModeSelect(SelectEntity):
     async def async_select_option(self, option: str) -> None:
         await self.protection.async_set_mode(
             EXTREME_LABEL_MODES[option]
+        )
+
+
+class FloorHeatingModeSelect(SelectEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Floor heating optimizer mode"
+    _attr_icon = "mdi:heating-coil"
+    _attr_options = list(FLOOR_MODE_LABELS.values())
+
+    def __init__(self, controller, entry_id: str) -> None:
+        self.controller = controller
+        self._attr_unique_id = entry_id + "_floor_heating_optimizer_mode"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)},
+            name=NAME,
+            manufacturer="home_automation",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            self.controller.async_add_listener(
+                self.async_write_ha_state
+            )
+        )
+
+    @property
+    def current_option(self) -> str:
+        return FLOOR_MODE_LABELS[self.controller.mode]
+
+    async def async_select_option(self, option: str) -> None:
+        await self.controller.async_set_mode(
+            FLOOR_LABEL_MODES[option]
         )
 
 
