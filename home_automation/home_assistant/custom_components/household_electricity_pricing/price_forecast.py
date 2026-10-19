@@ -53,8 +53,11 @@ FORECAST_STALE_SECONDS = 3 * 60 * 60
 FORECAST_UPDATE_INTERVAL = timedelta(hours=1)
 ARCHIVE_RETENTION_DAYS = 90
 STORE_VERSION = 1
+ARCHIVE_SCHEMA_VERSION = 2
 STORE_KEY_SUFFIX = "price_forecast"
 HOUR = timedelta(hours=1)
+ARCHIVE_ORIGIN_OBSERVED = "observed_vintage"
+ARCHIVE_ORIGIN_MIGRATED = "migrated_latest_only"
 
 
 @dataclass(frozen=True)
@@ -294,6 +297,7 @@ def _sensor_attributes(response: dict) -> dict:
             "daily_summaries",
             "accuracy",
             "archive",
+            "evolution_summary",
             "warnings",
         )
     }
@@ -325,6 +329,7 @@ class HouseholdPriceForecastCoordinator(
             private=True,
         )
         self.archive: dict[str, dict] = {}
+        self.vintage_tracking_started_at: str | None = None
         self.refresh_error: str | None = None
 
     async def async_load(self) -> None:
@@ -335,14 +340,47 @@ class HouseholdPriceForecastCoordinator(
         if not isinstance(rows, list):
             LOGGER.warning("Stored household price forecasts are invalid; archive reset.")
             return
+        schema_version = stored.get("schema_version", 1)
+        if schema_version not in (1, ARCHIVE_SCHEMA_VERSION):
+            LOGGER.warning(
+                "Stored household price forecast schema %s is unsupported; "
+                "archive reset.",
+                schema_version,
+            )
+            return
         try:
-            self.archive = {
-                self._archive_key(row): self._validated_archive_record(row)
-                for row in rows
-            }
+            archive = {}
+            default_origin = (
+                ARCHIVE_ORIGIN_MIGRATED if schema_version == 1 else None
+            )
+            for row in rows:
+                record = self._validated_archive_record(
+                    row,
+                    default_origin=default_origin,
+                )
+                key = self._archive_key(record)
+                previous = archive.get(key)
+                if previous is not None and previous != record:
+                    raise ForecastError(
+                        "Stored forecast records conflict for one issuance."
+                    )
+                archive[key] = record
+            if schema_version == ARCHIVE_SCHEMA_VERSION:
+                tracking_started = _instant(
+                    stored.get("vintage_tracking_started_at"),
+                    "Stored vintage tracking timestamp",
+                )
+            else:
+                tracking_started = dt_util.utcnow().astimezone(UTC)
         except ForecastError as error:
             LOGGER.warning("Stored household price forecasts are invalid: %s", error)
             self.archive = {}
+            self.vintage_tracking_started_at = None
+            return
+        self.archive = archive
+        self.vintage_tracking_started_at = tracking_started.isoformat()
+        if schema_version == 1:
+            await self._save_archive()
 
     def _profile(self) -> PricingProfile:
         path = profile_path(Path(self.hass.config.config_dir), self.profile_name)
@@ -496,6 +534,36 @@ class HouseholdPriceForecastCoordinator(
                     + ", ".join(undercovered)
                 )
         first_day = start.astimezone(TALLINN).date()
+        evolution = self._evolution_response(
+            profile,
+            now,
+            1,
+            1,
+            0,
+            None,
+            published_prices,
+        )
+        evolution_summary = {
+            key: evolution[key]
+            for key in (
+                "delivery_date",
+                "retained_issuance_count",
+                "first_retained_issued_at",
+                "latest_retained_issued_at",
+                "tracking_active_for_full_horizon",
+                "contains_migrated_latest_only",
+                "comparison_intervals",
+                "first_retained_mae_eur_kwh",
+                "latest_retained_mae_eur_kwh",
+                "first_retained_bias_eur_kwh",
+                "latest_retained_bias_eur_kwh",
+                "mae_change_eur_kwh",
+                "movement",
+                "improved_intervals",
+                "worsened_intervals",
+                "unchanged_intervals",
+            )
+        }
         response = {
             "schema_version": 1,
             "view": "current",
@@ -533,12 +601,16 @@ class HouseholdPriceForecastCoordinator(
             "intervals": points,
             "daily_summaries": _daily_summaries(points, first_day),
             "accuracy": accuracy_response,
+            "evolution_summary": evolution_summary,
             "archive": {
                 "retention_days": ARCHIVE_RETENTION_DAYS,
                 "record_count": len(self.archive),
+                "delivery_hour_count": self._delivery_hour_count(),
+                "migrated_latest_only_records": self._migrated_record_count(),
+                "vintage_tracking_started_at": self.vintage_tracking_started_at,
                 "sampling": (
-                    "Latest provider issuance retained per delivery hour and "
-                    "provider horizon day"
+                    "All distinct provider issuances are retained per delivery "
+                    "hour and provider horizon day."
                 ),
             },
             "warnings": warnings,
@@ -551,10 +623,18 @@ class HouseholdPriceForecastCoordinator(
 
     @staticmethod
     def _archive_key(record: dict) -> str:
-        return "{}|{}".format(record.get("start"), record.get("horizon_days"))
+        return "{}|{}|{}".format(
+            record.get("start"),
+            record.get("horizon_days"),
+            record.get("issued_at"),
+        )
 
     @staticmethod
-    def _validated_archive_record(record: object) -> dict:
+    def _validated_archive_record(
+        record: object,
+        *,
+        default_origin: str | None = None,
+    ) -> dict:
         if not isinstance(record, dict):
             raise ForecastError("Stored forecast record must be an object")
         start = _instant(record.get("start"), "Stored forecast start")
@@ -570,6 +650,9 @@ class HouseholdPriceForecastCoordinator(
         p90 = _decimal(record.get("p90_spot_eur_mwh"), "Stored forecast p90")
         if not p10 <= p50 <= p90:
             raise ForecastError("Stored forecast must have p10 <= p50 <= p90")
+        origin = record.get("archive_origin", default_origin)
+        if origin not in (ARCHIVE_ORIGIN_OBSERVED, ARCHIVE_ORIGIN_MIGRATED):
+            raise ForecastError("Stored forecast archive origin is invalid")
         return {
             "start": start.isoformat(),
             "issued_at": issued_at.isoformat(),
@@ -578,7 +661,20 @@ class HouseholdPriceForecastCoordinator(
             "p10_spot_eur_mwh": format(p10, "f"),
             "p50_spot_eur_mwh": format(p50, "f"),
             "p90_spot_eur_mwh": format(p90, "f"),
+            "archive_origin": origin,
         }
+
+    def _delivery_hour_count(self) -> int:
+        return len({
+            (record["start"], record["horizon_days"])
+            for record in self.archive.values()
+        })
+
+    def _migrated_record_count(self) -> int:
+        return sum(
+            record["archive_origin"] == ARCHIVE_ORIGIN_MIGRATED
+            for record in self.archive.values()
+        )
 
     def _record_report(self, report: ForecastReport, now: datetime) -> bool:
         changed = False
@@ -587,6 +683,9 @@ class HouseholdPriceForecastCoordinator(
             slot_start = slot.start.astimezone(UTC)
             if not isinstance(slot, PredictedHour) or not start <= slot_start < end:
                 continue
+            if self.vintage_tracking_started_at is None:
+                self.vintage_tracking_started_at = now.astimezone(UTC).isoformat()
+                changed = True
             record = {
                 "start": slot_start.isoformat(),
                 "issued_at": report.issued_at.astimezone(UTC).isoformat(),
@@ -595,21 +694,25 @@ class HouseholdPriceForecastCoordinator(
                 "p10_spot_eur_mwh": format(slot.p10, "f"),
                 "p50_spot_eur_mwh": format(slot.p50, "f"),
                 "p90_spot_eur_mwh": format(slot.p90, "f"),
+                "archive_origin": ARCHIVE_ORIGIN_OBSERVED,
             }
             key = self._archive_key(record)
             previous = self.archive.get(key)
             if previous is not None:
-                previous_issued = _instant(
-                    previous["issued_at"], "Stored forecast issuance"
+                comparable_keys = (
+                    "start",
+                    "issued_at",
+                    "model_trained_at",
+                    "horizon_days",
+                    "p10_spot_eur_mwh",
+                    "p50_spot_eur_mwh",
+                    "p90_spot_eur_mwh",
                 )
-                if previous_issued > report.issued_at.astimezone(UTC):
-                    continue
-                if previous_issued == report.issued_at.astimezone(UTC):
-                    if previous != record:
-                        raise ForecastError(
-                            "The provider changed a forecast without a new issuance."
-                        )
-                    continue
+                if any(previous[key] != record[key] for key in comparable_keys):
+                    raise ForecastError(
+                        "The provider changed a forecast without a new issuance."
+                    )
+                continue
             self.archive[key] = record
             changed = True
         cutoff = now.astimezone(UTC) - timedelta(days=ARCHIVE_RETENTION_DAYS)
@@ -625,11 +728,14 @@ class HouseholdPriceForecastCoordinator(
 
     async def _save_archive(self) -> None:
         await self.store.async_save({
+            "schema_version": ARCHIVE_SCHEMA_VERSION,
+            "vintage_tracking_started_at": self.vintage_tracking_started_at,
             "records": sorted(
                 self.archive.values(),
                 key=lambda record: (
                     record["start"],
                     record["horizon_days"],
+                    record["issued_at"],
                 ),
             )
         })
@@ -676,15 +782,31 @@ class HouseholdPriceForecastCoordinator(
                 now.astimezone(TALLINN).date()
                 + timedelta(days=include_future_days)
             )
-        points = []
-        stored_hours = 0
-        for record in sorted(self.archive.values(), key=lambda item: item["start"]):
+        latest_records = {}
+        for record in self.archive.values():
             start = _instant(record["start"], "Stored forecast start")
             if (
                 record["horizon_days"] != horizon_days
                 or not start_bound <= start < end_bound
             ):
                 continue
+            previous = latest_records.get(record["start"])
+            if (
+                previous is None
+                or _instant(
+                    previous["issued_at"],
+                    "Stored forecast issuance",
+                )
+                < _instant(record["issued_at"], "Stored forecast issuance")
+            ):
+                latest_records[record["start"]] = record
+        points = []
+        stored_hours = 0
+        for record in sorted(
+            latest_records.values(),
+            key=lambda item: item["start"],
+        ):
+            start = _instant(record["start"], "Stored forecast start")
             stored_hours += 1
             raw = {
                 key: _decimal(record[key], key)
@@ -753,11 +875,359 @@ class HouseholdPriceForecastCoordinator(
             "archive": {
                 "retention_days": ARCHIVE_RETENTION_DAYS,
                 "record_count": len(self.archive),
+                "delivery_hour_count": self._delivery_hour_count(),
+                "migrated_latest_only_records": self._migrated_record_count(),
+                "vintage_tracking_started_at": self.vintage_tracking_started_at,
                 "sampling": (
-                    "Latest provider issuance retained per delivery hour and "
-                    "provider horizon day"
+                    "The latest retained issuance is selected per delivery hour "
+                    "and provider horizon day. Use the evolution view for all "
+                    "retained vintages."
                 ),
             },
+        }
+
+    def _evolution_response(
+        self,
+        profile: PricingProfile,
+        now: datetime,
+        history_days: int,
+        horizon_days: int,
+        include_future_days: int,
+        delivery_date: date | None,
+        published_prices: dict[datetime, str] | None = None,
+    ) -> dict:
+        local_today = now.astimezone(TALLINN).date()
+        earliest_day = local_today - timedelta(days=history_days)
+        latest_day = local_today + timedelta(days=include_future_days)
+        available_days = sorted({
+            _instant(record["start"], "Stored forecast start")
+            .astimezone(TALLINN)
+            .date()
+            for record in self.archive.values()
+            if record["horizon_days"] == horizon_days
+            and earliest_day
+            <= _instant(record["start"], "Stored forecast start")
+            .astimezone(TALLINN)
+            .date()
+            <= latest_day
+        })
+        selected_day = delivery_date
+        if selected_day is not None and not earliest_day <= selected_day <= latest_day:
+            raise ForecastError(
+                "The forecast evolution delivery date is outside the requested "
+                "history and future bounds."
+            )
+        if selected_day is None and available_days:
+            selected_day = available_days[-1]
+
+        selected_records = []
+        if selected_day is not None:
+            selected_records = [
+                record
+                for record in self.archive.values()
+                if record["horizon_days"] == horizon_days
+                and _instant(record["start"], "Stored forecast start")
+                .astimezone(TALLINN)
+                .date()
+                == selected_day
+            ]
+        by_start: dict[str, list[dict]] = {}
+        for record in selected_records:
+            by_start.setdefault(record["start"], []).append(record)
+
+        points = []
+        comparisons = []
+        for start_text in sorted(by_start):
+            start = _instant(start_text, "Stored forecast start")
+            records = sorted(
+                by_start[start_text],
+                key=lambda item: item["issued_at"],
+            )
+            for index in range(4):
+                quarter = start + index * MARKET_INTERVAL
+                vintages = []
+                for record in records:
+                    raw = {
+                        key: _decimal(record[key], key)
+                        for key in (
+                            "p10_spot_eur_mwh",
+                            "p50_spot_eur_mwh",
+                            "p90_spot_eur_mwh",
+                        )
+                    }
+                    vintages.append({
+                        "issued_at": _instant(
+                            record["issued_at"],
+                            "Stored forecast issuance",
+                        ).astimezone(TALLINN).isoformat(),
+                        "model_trained_at": _instant(
+                            record["model_trained_at"],
+                            "Stored forecast model timestamp",
+                        ).astimezone(TALLINN).isoformat(),
+                        "archive_origin": record["archive_origin"],
+                        "prediction": {
+                            "p10_spot_eur_mwh": format(
+                                raw["p10_spot_eur_mwh"],
+                                "f",
+                            ),
+                            "p50_spot_eur_mwh": format(
+                                raw["p50_spot_eur_mwh"],
+                                "f",
+                            ),
+                            "p90_spot_eur_mwh": format(
+                                raw["p90_spot_eur_mwh"],
+                                "f",
+                            ),
+                            "p10_import_eur_kwh": forecast_import_eur_kwh(
+                                profile,
+                                raw["p10_spot_eur_mwh"],
+                                quarter,
+                            ),
+                            "p50_import_eur_kwh": forecast_import_eur_kwh(
+                                profile,
+                                raw["p50_spot_eur_mwh"],
+                                quarter,
+                            ),
+                            "p90_import_eur_kwh": forecast_import_eur_kwh(
+                                profile,
+                                raw["p90_spot_eur_mwh"],
+                                quarter,
+                            ),
+                        },
+                    })
+                points.append({
+                    "start": quarter.astimezone(TALLINN).isoformat(),
+                    "end": (
+                        quarter + MARKET_INTERVAL
+                    ).astimezone(TALLINN).isoformat(),
+                    "horizon_days": horizon_days,
+                    "revision_count": len(vintages),
+                    "first_retained": vintages[0],
+                    "latest_retained": vintages[-1],
+                    "vintages": vintages,
+                })
+                published = (
+                    published_prices.get(quarter)
+                    if published_prices is not None
+                    else None
+                )
+                if published is not None:
+                    official = _decimal(
+                        published,
+                        "Published household price",
+                    )
+                    first_value = _decimal(
+                        vintages[0]["prediction"]["p50_import_eur_kwh"],
+                        "First retained household forecast",
+                    )
+                    latest_value = _decimal(
+                        vintages[-1]["prediction"]["p50_import_eur_kwh"],
+                        "Latest retained household forecast",
+                    )
+                    first_error = first_value - official
+                    latest_error = latest_value - official
+                    points[-1].update({
+                        "official_import_eur_kwh": format(official, "f"),
+                        "first_retained_error_eur_kwh": format(
+                            first_error,
+                            "f",
+                        ),
+                        "latest_retained_error_eur_kwh": format(
+                            latest_error,
+                            "f",
+                        ),
+                    })
+                    comparisons.append((first_error, latest_error))
+                else:
+                    points[-1].update({
+                        "official_import_eur_kwh": None,
+                        "first_retained_error_eur_kwh": None,
+                        "latest_retained_error_eur_kwh": None,
+                    })
+
+        issuances: dict[str, dict] = {}
+        for record in selected_records:
+            issued_at = _instant(
+                record["issued_at"],
+                "Stored forecast issuance",
+            ).astimezone(TALLINN).isoformat()
+            item = issuances.setdefault(
+                issued_at,
+                {
+                    "issued_at": issued_at,
+                    "model_trained_at": _instant(
+                        record["model_trained_at"],
+                        "Stored forecast model timestamp",
+                    ).astimezone(TALLINN).isoformat(),
+                    "delivery_hours": 0,
+                    "delivery_intervals": 0,
+                    "contains_migrated_latest_only": False,
+                },
+            )
+            item["delivery_hours"] += 1
+            item["delivery_intervals"] += 4
+            item["contains_migrated_latest_only"] = (
+                item["contains_migrated_latest_only"]
+                or record["archive_origin"] == ARCHIVE_ORIGIN_MIGRATED
+            )
+
+        contains_migrated = any(
+            record["archive_origin"] == ARCHIVE_ORIGIN_MIGRATED
+            for record in selected_records
+        )
+        tracking_active_for_full_horizon = False
+        if (
+            selected_day is not None
+            and self.vintage_tracking_started_at is not None
+        ):
+            tracking_required_start, _ = market_bounds(
+                selected_day - timedelta(days=horizon_days)
+            )
+            tracking_active_for_full_horizon = (
+                _instant(
+                    self.vintage_tracking_started_at,
+                    "Vintage tracking timestamp",
+                )
+                <= tracking_required_start
+            )
+        expected_intervals = 0
+        if selected_day is not None:
+            selected_start, selected_end = market_bounds(selected_day)
+            expected_intervals = int(
+                (selected_end - selected_start) / MARKET_INTERVAL
+            )
+        warnings = []
+        if selected_day is None or not selected_records:
+            warnings.append(
+                "No retained forecast vintages match the requested delivery date "
+                "and horizon."
+            )
+        if contains_migrated:
+            warnings.append(
+                "Older forecast revisions were overwritten before vintage "
+                "tracking was enabled; the first retained value is not the "
+                "original provider issuance."
+            )
+        if selected_records and not tracking_active_for_full_horizon:
+            warnings.append(
+                "Vintage tracking was not active for the complete D-{} capture "
+                "window; the first retained value is only the earliest available "
+                "record.".format(horizon_days)
+            )
+
+        first_mae = None
+        latest_mae = None
+        first_bias = None
+        latest_bias = None
+        mae_change = None
+        improved_intervals = 0
+        worsened_intervals = 0
+        unchanged_intervals = 0
+        movement = "unavailable"
+        if comparisons:
+            with localcontext() as context:
+                context.prec = 80
+                first_mae_value = sum(
+                    abs(first) for first, _ in comparisons
+                ) / len(comparisons)
+                latest_mae_value = sum(
+                    abs(latest) for _, latest in comparisons
+                ) / len(comparisons)
+                first_bias_value = sum(
+                    first for first, _ in comparisons
+                ) / len(comparisons)
+                latest_bias_value = sum(
+                    latest for _, latest in comparisons
+                ) / len(comparisons)
+                mae_change_value = latest_mae_value - first_mae_value
+            first_mae = format(first_mae_value, "f")
+            latest_mae = format(latest_mae_value, "f")
+            first_bias = format(first_bias_value, "f")
+            latest_bias = format(latest_bias_value, "f")
+            mae_change = format(mae_change_value, "f")
+            for first_error, latest_error in comparisons:
+                if abs(latest_error) < abs(first_error):
+                    improved_intervals += 1
+                elif abs(latest_error) > abs(first_error):
+                    worsened_intervals += 1
+                else:
+                    unchanged_intervals += 1
+            if latest_mae_value < first_mae_value:
+                movement = "improved"
+            elif latest_mae_value > first_mae_value:
+                movement = "worsened"
+            else:
+                movement = "unchanged"
+
+        ordered_issuances = [
+            issuances[key] for key in sorted(issuances)
+        ]
+        return {
+            "schema_version": 2,
+            "view": "evolution",
+            "source": FORECAST_URL,
+            "advisory_only": True,
+            "timezone": "Europe/Tallinn",
+            "currency": "EUR",
+            "interval_minutes": 15,
+            "price_basis": "household_all_in_import_including_applicable_vat",
+            "forecast_basis": "raw_wholesale_p10_p50_p90_plus_household_tariff",
+            "fixed_fees": "excluded",
+            "history_days": history_days,
+            "horizon_days": horizon_days,
+            "include_future_days": include_future_days,
+            "delivery_date": (
+                selected_day.isoformat() if selected_day is not None else None
+            ),
+            "available_delivery_dates": [
+                item.isoformat() for item in available_days
+            ],
+            "as_of": now.astimezone(TALLINN).isoformat(),
+            "expected_intervals": expected_intervals,
+            "available_intervals": len(points),
+            "complete_delivery_coverage": (
+                expected_intervals > 0 and len(points) == expected_intervals
+            ),
+            "retained_issuance_count": len(ordered_issuances),
+            "first_retained_issued_at": (
+                ordered_issuances[0]["issued_at"]
+                if ordered_issuances else None
+            ),
+            "latest_retained_issued_at": (
+                ordered_issuances[-1]["issued_at"]
+                if ordered_issuances else None
+            ),
+            "vintage_tracking_started_at": self.vintage_tracking_started_at,
+            "tracking_active_for_full_horizon": (
+                tracking_active_for_full_horizon
+            ),
+            "contains_migrated_latest_only": contains_migrated,
+            "comparison_intervals": len(comparisons),
+            "first_retained_mae_eur_kwh": first_mae,
+            "latest_retained_mae_eur_kwh": latest_mae,
+            "first_retained_bias_eur_kwh": first_bias,
+            "latest_retained_bias_eur_kwh": latest_bias,
+            "mae_change_eur_kwh": mae_change,
+            "movement": movement,
+            "improved_intervals": improved_intervals,
+            "worsened_intervals": worsened_intervals,
+            "unchanged_intervals": unchanged_intervals,
+            "issuances": ordered_issuances,
+            "intervals": points,
+            "profile_id": profile.id,
+            "profile_version": profile.version,
+            "profile_sha256": profile.sha256,
+            "archive": {
+                "retention_days": ARCHIVE_RETENTION_DAYS,
+                "record_count": len(self.archive),
+                "delivery_hour_count": self._delivery_hour_count(),
+                "migrated_latest_only_records": self._migrated_record_count(),
+                "sampling": (
+                    "All distinct provider issuances are returned "
+                    "chronologically per delivery hour and provider horizon day."
+                ),
+            },
+            "warnings": warnings,
         }
 
     async def async_response(
@@ -766,6 +1236,7 @@ class HouseholdPriceForecastCoordinator(
         history_days: int,
         horizon_days: int,
         include_future_days: int = 0,
+        delivery_date: date | None = None,
     ) -> dict:
         if view == "current":
             if self.data is None:
@@ -806,17 +1277,32 @@ class HouseholdPriceForecastCoordinator(
                 )
             response["archive"]["record_count"] = len(self.archive)
             return response
-        if view != "archive":
-            raise ServiceValidationError("Choose current or archive forecast view.")
+        if view not in ("archive", "evolution"):
+            raise ServiceValidationError(
+                "Choose current, archive, or evolution forecast view."
+            )
         try:
             profile = await self.hass.async_add_executor_job(self._profile)
-            return await self.hass.async_add_executor_job(
-                self._archive_response,
+            response_method = (
+                self._archive_response
+                if view == "archive"
+                else self._evolution_response
+            )
+            arguments = [
                 profile,
                 dt_util.utcnow().astimezone(UTC),
                 history_days,
                 horizon_days,
                 include_future_days,
+            ]
+            if view == "evolution":
+                arguments.extend([
+                    delivery_date,
+                    self._published_prices(dt_util.utcnow().astimezone(UTC)),
+                ])
+            return await self.hass.async_add_executor_job(
+                response_method,
+                *arguments,
             )
-        except PricingError as error:
+        except (ForecastError, PricingError) as error:
             raise ServiceValidationError(str(error)) from error
