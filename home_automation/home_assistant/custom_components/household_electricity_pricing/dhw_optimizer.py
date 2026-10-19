@@ -58,8 +58,9 @@ STORE_KEY_SUFFIX = "dhw_optimizer"
 NOTIFICATION_ID = DOMAIN + "_dhw_optimizer_fault"
 DECISION_HISTORY_LIMIT = 96
 HEATING_DURATION_LIMIT = 20
-POLICY_REVISION = 3
+POLICY_REVISION = 4
 MINIMUM_TARGET_DWELL = timedelta(minutes=30)
+RECENT_DECISIONS_ATTRIBUTE_LIMIT = 4
 
 
 def _number(value: object, label: str) -> float:
@@ -681,6 +682,7 @@ class DhwOptimizer:
             hass, STORE_VERSION, f"{DOMAIN}.{entry.entry_id}.{STORE_KEY_SUFFIX}", private=True
         )
         self.lock = asyncio.Lock()
+        self.extreme_protection = None
         self.mode = DHW_MODE_SHADOW
         self.decision: DhwDecision | None = None
         self.listeners: list[Callable[[], None]] = []
@@ -721,7 +723,32 @@ class DhwOptimizer:
             "last_qualified_opportunity_at": None,
         }
 
-    def _reset_policy_evidence(self) -> None:
+    def _reset_policy_evidence(
+        self,
+        *,
+        preserve_qualification: bool = False,
+    ) -> None:
+        preserved = (
+            {
+                key: self.state[key]
+                for key in (
+                    "shadow_days",
+                    "heating_durations",
+                    "cycle_started_at",
+                    "cycle_start_temperature",
+                    "last_temperature",
+                    "last_observed_at",
+                    "confirmed_writes",
+                    "pilot_started_at",
+                    "deadline_checks",
+                    "qualified_opportunity_count",
+                    "last_qualified_opportunity_plan_id",
+                    "last_qualified_opportunity_at",
+                )
+            }
+            if preserve_qualification
+            else {}
+        )
         self.state.update({
             "policy_revision": POLICY_REVISION,
             "last_policy_target": None,
@@ -752,6 +779,7 @@ class DhwOptimizer:
             "last_qualified_opportunity_plan_id": None,
             "last_qualified_opportunity_at": None,
         })
+        self.state.update(preserved)
 
     async def async_start(self) -> None:
         stored = await self.store.async_load()
@@ -764,7 +792,9 @@ class DhwOptimizer:
                 if key in stored:
                     self.state[key] = stored[key]
             if stored_revision != POLICY_REVISION:
-                self._reset_policy_evidence()
+                self._reset_policy_evidence(
+                    preserve_qualification=stored_revision == 3,
+                )
         self.unsubscribers.append(self.coordinator.async_add_listener(self._schedule_evaluation))
         self.unsubscribers.append(
             async_track_time_interval(
@@ -797,6 +827,15 @@ class DhwOptimizer:
     def _notify_listeners(self) -> None:
         for listener in tuple(self.listeners):
             listener()
+
+    @callback
+    def set_extreme_protection(self, protection) -> None:
+        self.extreme_protection = protection
+
+    def _extreme_block_reason(self, now: datetime) -> str | None:
+        if self.extreme_protection is None:
+            return None
+        return self.extreme_protection.ordinary_control_block_reason(now)
 
     @callback
     def _schedule_evaluation(self) -> None:
@@ -989,6 +1028,8 @@ class DhwOptimizer:
         local_day = now.astimezone(TALLINN).date().isoformat()
         if self.mode == DHW_MODE_SHADOW and local_day not in self.state["shadow_days"]:
             self.state["shadow_days"] = (self.state["shadow_days"] + [local_day])[-30:]
+        if observation.override_reason is not None:
+            return
         temperature = observation.tank_temperature
         target = observation.target_temperature
         if temperature is None or target is None:
@@ -1133,6 +1174,15 @@ class DhwOptimizer:
             try:
                 status = await self.devices.get_daikin_status()
                 observation = self._observation(status)
+                block_reason = self._extreme_block_reason(observed_at)
+                if (
+                    block_reason is not None
+                    and observation.override_reason is None
+                ):
+                    observation = replace(
+                        observation,
+                        override_reason=block_reason,
+                    )
                 self._update_learning(observed_at, observation)
                 if (
                     observation.tank_temperature is not None
@@ -1252,6 +1302,8 @@ class DhwOptimizer:
             or target == observation.target_temperature
         ):
             return
+        if self._extreme_block_reason(now) is not None:
+            return
         last_write = _instant(self.state.get("last_write_at"))
         if (
             not decision.urgent
@@ -1261,7 +1313,11 @@ class DhwOptimizer:
             return
         try:
             result = await self.devices.control_daikin(
-                {"operation": "hot_water_target", "value": target},
+                {
+                    "operation": "hot_water_target",
+                    "value": target,
+                    "expected_previous": observation.target_temperature,
+                },
                 Context(),
             )
         except (HomeAssistantError, TimeoutError) as error:
@@ -1353,9 +1409,16 @@ class DhwOptimizer:
             raise HomeAssistantError(
                 "The optimizer does not own the current DHW target; it was preserved."
             )
+        block_reason = self._extreme_block_reason(dt_util.utcnow())
+        if block_reason is not None:
+            raise HomeAssistantError(block_reason)
         try:
             result = await self.devices.control_daikin(
-                {"operation": "hot_water_target", "value": self.policy.normal_target},
+                {
+                    "operation": "hot_water_target",
+                    "value": self.policy.normal_target,
+                    "expected_previous": current,
+                },
                 Context(),
             )
         except (HomeAssistantError, TimeoutError) as error:
@@ -1480,7 +1543,12 @@ class DhwOptimizer:
             "state": "starting",
             "reason": "The optimizer has not completed its first evaluation.",
         }
-        recent_decisions = list(self.state["decision_history"][-24:])
+        recent_event_window = list(self.state["decision_history"][-24:])
+        recent_decisions = list(
+            self.state["decision_history"][
+                -RECENT_DECISIONS_ATTRIBUTE_LIMIT:
+            ]
+        )
         deadline_checks = self.state["deadline_checks"]
         pilot_started = _instant(self.state.get("pilot_started_at"))
         result.update({
@@ -1503,10 +1571,12 @@ class DhwOptimizer:
                 value is False for value in deadline_checks.values()
             ),
             "recent_recovery_events": sum(
-                record.get("state") == "recovery" for record in recent_decisions
+                record.get("state") == "recovery"
+                for record in recent_event_window
             ),
             "recent_override_events": sum(
-                record.get("state") == "override" for record in recent_decisions
+                record.get("state") == "override"
+                for record in recent_event_window
             ),
             "fault": self.state["fault"],
             "manual_override": self.state["manual_override"],
@@ -1522,6 +1592,9 @@ class DhwOptimizer:
             ],
             "minimum_target_dwell_minutes": int(
                 MINIMUM_TARGET_DWELL.total_seconds() // 60
+            ),
+            "extreme_price_block_reason": self._extreme_block_reason(
+                dt_util.utcnow()
             ),
             "recent_decisions": recent_decisions,
             "policy": {

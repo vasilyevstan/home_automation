@@ -695,6 +695,109 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await created_coordinator.async_shutdown()
 
+    async def test_extreme_protection_starts_before_heating_optimizers(self):
+        callbacks = []
+        old_coordinator = self.coordinator
+        self.pricing_entry = entry(
+            DOMAIN,
+            "pricing",
+            {
+                **self.pricing_entry.data,
+                "daikin_config_entry": "daikin",
+            },
+            ConfigEntryState.SETUP_IN_PROGRESS,
+        )
+        self.entries["pricing"] = self.pricing_entry
+        self.entries["daikin"] = entry(
+            "daikin_altherma",
+            "daikin",
+            {},
+        )
+        starts = []
+
+        def component(name, **extra):
+            async def start():
+                starts.append(name)
+
+            return SimpleNamespace(
+                async_start=AsyncMock(side_effect=start),
+                async_stop=AsyncMock(),
+                **extra,
+            )
+
+        optimizer = component(
+            "optimizer",
+            set_extreme_protection=Mock(),
+        )
+        floor = component(
+            "floor",
+            set_extreme_protection=Mock(),
+        )
+        extreme = component("extreme")
+        forecast = SimpleNamespace(
+            async_load=AsyncMock(),
+            async_shutdown=AsyncMock(),
+        )
+        devices = SimpleNamespace(
+            solar_entry=None,
+            daikin_entry="daikin",
+        )
+        try:
+            with (
+                patch.object(
+                    self.integration,
+                    "HouseholdPriceForecastCoordinator",
+                    return_value=forecast,
+                ),
+                patch.object(
+                    self.integration,
+                    "EnergyDevices",
+                    return_value=devices,
+                ),
+                patch.object(
+                    self.integration,
+                    "DhwOptimizer",
+                    return_value=optimizer,
+                ),
+                patch.object(
+                    self.integration,
+                    "FloorHeatingShadow",
+                    return_value=floor,
+                ),
+                patch.object(
+                    self.integration,
+                    "ExtremePriceProtection",
+                    return_value=extreme,
+                ),
+                patch.object(
+                    ConfigEntry,
+                    "async_on_unload",
+                    side_effect=lambda callback: callbacks.append(callback),
+                ),
+            ):
+                self.assertTrue(
+                    await self.integration.async_setup_entry(
+                        self.hass,
+                        self.pricing_entry,
+                    )
+                )
+            self.coordinator = self.pricing_entry.runtime_data
+            self.assertEqual(starts, ["extreme", "optimizer", "floor"])
+            optimizer.set_extreme_protection.assert_called_once_with(extreme)
+            floor.set_extreme_protection.assert_called_once_with(extreme)
+            self.assertTrue(
+                await self.integration.async_unload_entry(
+                    self.hass,
+                    self.pricing_entry,
+                )
+            )
+        finally:
+            for callback in reversed(callbacks):
+                result = callback()
+                if inspect.isawaitable(result):
+                    await result
+            await old_coordinator.async_shutdown()
+
     async def test_api_registration_failure_cleans_platforms_and_runtime(self):
         callbacks = []
         created_coordinator = None

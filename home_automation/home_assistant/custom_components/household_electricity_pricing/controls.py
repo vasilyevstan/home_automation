@@ -1198,9 +1198,15 @@ class EnergyDevices:
             heating, water = await self.daikin_snapshot(api)
             operation = args["operation"]
             value = args["value"]
+            effective = None
             if operation == "hot_water_target":
                 if water["states"].get("WeatherDependentState") is not False:
                     raise HomeAssistantError("Weather-dependent hot-water control is active or unknown.")
+                if water.get("operations", {}).get("Power") != "on":
+                    raise HomeAssistantError("Hot-water target changes require the DHW circuit to be on.")
+                powerful = water.get("operations", {}).get("powerful")
+                if powerful not in (0, 0.0, "0", "0.0", False):
+                    raise HomeAssistantError("Daikin powerful/hygiene-like operation is active.")
                 profile = api.water_tank_target_temp_config
                 if not profile or profile.get("settable") is not True:
                     raise HomeAssistantError("The native hot-water target is not settable.")
@@ -1209,12 +1215,21 @@ class EnergyDevices:
                 selected = water
                 target = self.entity(entry.entry_id, "water_heater")
                 domain, service, data = "water_heater", "set_temperature", {"temperature": requested}
+                effective = await self.daikin_resource(
+                    api,
+                    {"function/DomesticHotWaterTank", "function/DomesticHotWater"},
+                    "Operation/TargetTemperature",
+                )
             elif operation == "heating_offset":
                 control_mode = await self.daikin_resource(
                     api, {"function/SpaceHeating"}, "UnitStatus/ControlModeState"
                 )
                 if control_mode != "LWT control":
                     raise HomeAssistantError("Heating-offset changes require freshly verified LWT control.")
+                if heating.get("operations", {}).get("Power") != "on":
+                    raise HomeAssistantError("Heating-offset changes require the space-heating circuit to be on.")
+                if heating.get("states", {}).get("TargetTemperatureOverruledState") not in (None, False):
+                    raise HomeAssistantError("Daikin is temporarily overriding the space-heating target.")
                 native_key = "LeavingWaterTemperatureOffsetHeating"
                 profile = api.device.climate_control.unit.operation_config.get(native_key)
                 if not profile or profile.get("settable") is not True:
@@ -1234,9 +1249,36 @@ class EnergyDevices:
                 if not isinstance(profile, list) or requested not in profile:
                     raise HomeAssistantError("The native circuit enable operation is not settable.")
                 if operation == "hot_water_enabled":
+                    if water["states"].get("WeatherDependentState") is not False:
+                        raise HomeAssistantError("Weather-dependent hot-water control is active or unknown.")
+                    powerful = water.get("operations", {}).get("powerful")
+                    if powerful not in (0, 0.0, "0", "0.0", False):
+                        raise HomeAssistantError("Daikin powerful/hygiene-like operation is active.")
+                    configured_target = water.get("operations", {}).get(
+                        "DomesticHotWaterTemperatureHeating"
+                    )
+                    effective = await self.daikin_resource(
+                        api,
+                        {"function/DomesticHotWaterTank", "function/DomesticHotWater"},
+                        "Operation/TargetTemperature",
+                    )
+                    if configured_target is None or effective != configured_target:
+                        raise HomeAssistantError(
+                            "The configured hot-water target and effective target "
+                            "differ or are unknown."
+                        )
                     target = self.entity(entry.entry_id, "water_heater")
                     domain, service, data = "water_heater", "set_operation_mode", {"operation_mode": "on" if value else "off"}
                 else:
+                    control_mode = await self.daikin_resource(
+                        api,
+                        {"function/SpaceHeating"},
+                        "UnitStatus/ControlModeState",
+                    )
+                    if control_mode != "LWT control":
+                        raise HomeAssistantError("Heating circuit changes require freshly verified LWT control.")
+                    if heating.get("states", {}).get("TargetTemperatureOverruledState") not in (None, False):
+                        raise HomeAssistantError("Daikin is temporarily overriding the space-heating target.")
                     target = self.entity(entry.entry_id, "switch")
                     domain, service, data = "switch", "turn_on" if value else "turn_off", {}
             else:
@@ -1248,18 +1290,40 @@ class EnergyDevices:
                 previous = number(previous, "Previous native setting", profile["minValue"], profile["maxValue"], profile["stepValue"])
             elif previous not in ("on", "standby"):
                 raise HomeAssistantError("The previous circuit enable state is unknown.")
+            if operation == "hot_water_target" and effective != previous:
+                raise HomeAssistantError(
+                    "The configured hot-water target and effective target differ; "
+                    "no write was sent."
+                )
+            expected_previous = None
+            if "expected_previous" in args:
+                expected_previous = args["expected_previous"]
+                if operation in ("hot_water_target", "heating_offset"):
+                    expected_previous = number(
+                        expected_previous,
+                        "Expected previous native setting",
+                        profile["minValue"],
+                        profile["maxValue"],
+                        profile["stepValue"],
+                    )
+                elif expected_previous not in ("on", "standby"):
+                    raise HomeAssistantError(
+                        "Expected previous circuit state must be on or standby."
+                    )
+                if expected_previous != previous:
+                    raise HomeAssistantError(
+                        "Fresh Daikin state changed from the caller's expected "
+                        "previous setting; no write was sent."
+                    )
             if previous == requested:
                 if operation == "hot_water_target":
-                    effective = await self.daikin_resource(
-                        api, {"function/DomesticHotWaterTank", "function/DomesticHotWater"},
-                        "Operation/TargetTemperature",
-                    )
                     if effective != requested:
                         raise HomeAssistantError("The configured target matches, but its effective target does not; no write was sent.")
                 return {"changed": False, "operation": operation, "previous": previous, "confirmed": previous}
             record = {
                 "request_id": str(uuid4()), "device": "daikin", "operation": operation,
                 "entity_id": target, "previous": previous, "requested": requested,
+                "expected_previous": expected_previous,
             }
             await self.record("prepared", record)
             try:

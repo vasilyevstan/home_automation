@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import math
@@ -49,6 +49,7 @@ from .const import (
     FLOOR_PRICE_PERCENT,
     FLOOR_ROOM_TEMPERATURE_MAX_AGE_MINUTES,
     FLOOR_SHADOW_MODE,
+    FLOOR_SHIFT_DELTA,
     FLOOR_WINDOW_MINUTES,
 )
 from .controls import EnergyDevices, FLAGS
@@ -65,8 +66,9 @@ from .dhw_optimizer import (
 
 STORE_VERSION = 1
 STORE_KEY_SUFFIX = "floor_heating_shadow"
-POLICY_REVISION = 3
+POLICY_REVISION = 4
 DECISION_HISTORY_LIMIT = 96
+RECENT_DECISIONS_ATTRIBUTE_LIMIT = 4
 
 
 def _number(value: object) -> float | None:
@@ -156,6 +158,7 @@ class FloorHeatingPolicy:
     minimum_offset: float = FLOOR_MIN_OFFSET
     neutral_offset: float = FLOOR_NEUTRAL_OFFSET
     preheat_offset: float = FLOOR_PREHEAT_OFFSET
+    shift_delta: float = FLOOR_SHIFT_DELTA
     comfort_floor: float = FLOOR_COMFORT_FLOOR
     preheat_ceiling: float = FLOOR_PREHEAT_CEILING
     maximum_outdoor_temperature: float = FLOOR_MAX_OUTDOOR_TEMPERATURE
@@ -169,8 +172,14 @@ class FloorHeatingPolicy:
     def __post_init__(self) -> None:
         if not self.minimum_offset <= self.neutral_offset < self.preheat_offset:
             raise HomeAssistantError("Floor offsets must satisfy minimum <= neutral < preheat.")
-        if self.minimum_offset < -2 or self.preheat_offset > 1:
-            raise HomeAssistantError("The initial floor Shadow must remain inside -2°C to +1°C.")
+        if self.minimum_offset < -6 or self.preheat_offset > 4:
+            raise HomeAssistantError(
+                "The revised floor Shadow must remain inside -6°C to +4°C."
+            )
+        if self.shift_delta != 4:
+            raise HomeAssistantError(
+                "The revised floor Shadow uses one meaningful 4°C overlay."
+            )
         if self.comfort_floor >= self.preheat_ceiling:
             raise HomeAssistantError("The floor comfort threshold must be below the preheat ceiling.")
         if self.window_minutes <= 0 or self.window_minutes % 15:
@@ -450,14 +459,14 @@ def plan_floor_heating(
     if not policy.minimum_offset <= observation.actual_offset <= policy.preheat_offset:
         return decision(
             "yield",
-            "The native/manual LWT offset is outside the initial -2°C to +1°C Shadow envelope.",
+            "The native/manual LWT offset is outside the revised -6°C to +4°C Shadow envelope.",
             observation.actual_offset,
         )
     if observation.indoor_temperature <= policy.comfort_floor:
         return decision(
             "comfort_guard",
             "Indoor temperature is at the 20°C guard; no price-driven setback is proposed.",
-            policy.neutral_offset,
+            max(observation.actual_offset, policy.neutral_offset),
         )
     if observation.external_influence_reason is not None:
         return decision(
@@ -505,15 +514,20 @@ def plan_floor_heating(
             )
         if observation.indoor_temperature >= policy.preheat_ceiling:
             return decision(
-                "preheat",
-                "Use the observed 0°C envelope in the cheap block; the room is too warm to score +1°C.",
-                policy.neutral_offset,
+                "preheat_limited",
+                "The paired cheap block is active, but the room is already at or "
+                "above 21°C; preserve the native offset instead of adding heat.",
+                observation.actual_offset,
             )
+        proposed = min(
+            policy.preheat_offset,
+            observation.actual_offset + policy.shift_delta,
+        )
         return decision(
             "preheat",
-            "The current quarter is inside the selected cheap block; 0°C is the primary proposal and +1°C is scored separately.",
-            policy.neutral_offset,
-            aggressive_candidate_offset=policy.preheat_offset,
+            "The current quarter is inside the selected cheap block; apply one "
+            "bounded +4°C LWT-offset overlay relative to the fresh native offset.",
+            proposed,
         )
     if plan.peak_window.start <= now_utc < plan.peak_window.end:
         if not gate:
@@ -522,10 +536,15 @@ def plan_floor_heating(
                 "The cheap-to-peak all-in price advantage does not pass both materiality gates.",
                 observation.actual_offset,
             )
+        proposed = max(
+            policy.minimum_offset,
+            observation.actual_offset - policy.shift_delta,
+        )
         return decision(
             "coast",
-            "The current quarter is inside the paired expensive block; -2°C stays within the observed native envelope.",
-            policy.minimum_offset,
+            "The current quarter is inside the paired expensive block; apply one "
+            "bounded -4°C LWT-offset overlay relative to the fresh native offset.",
+            proposed,
         )
     return decision(
         "hold",
@@ -583,6 +602,8 @@ class FloorHeatingShadow:
             private=True,
         )
         self.lock = asyncio.Lock()
+        self.started = False
+        self.extreme_protection = None
         self.decision: FloorHeatingDecision | None = None
         self.listeners: list[Callable[[], None]] = []
         self.unsubscribers: list[Callable[[], None]] = []
@@ -617,6 +638,7 @@ class FloorHeatingShadow:
             for key in self.state:
                 if key in stored:
                     self.state[key] = stored[key]
+        self.started = True
         self.unsubscribers.append(
             self.coordinator.async_add_listener(self._schedule_evaluation)
         )
@@ -643,6 +665,7 @@ class FloorHeatingShadow:
         await self.async_evaluate()
 
     async def async_stop(self) -> None:
+        self.started = False
         for unsubscribe in self.unsubscribers:
             unsubscribe()
         self.unsubscribers.clear()
@@ -675,7 +698,12 @@ class FloorHeatingShadow:
             self.external_influences[source] = reason
         else:
             self.external_influences.pop(source, None)
-        self._schedule_evaluation()
+        if self.started:
+            self._schedule_evaluation()
+
+    @callback
+    def set_extreme_protection(self, protection) -> None:
+        self.extreme_protection = protection
 
     @callback
     def _schedule_evaluation(self) -> None:
@@ -888,7 +916,7 @@ class FloorHeatingShadow:
         ]
         if (
             active_peak_end is None
-            and decision.state == "preheat"
+            and decision.state in {"preheat", "preheat_limited"}
             and decision.plan is not None
         ):
             self.state["candidate_cycle_started_at"] = now.isoformat()
@@ -990,6 +1018,20 @@ class FloorHeatingShadow:
             try:
                 status = await self.devices.get_daikin_status()
                 observation = self._observation(status, observed_at)
+                if (
+                    observation.override_reason is None
+                    and self.extreme_protection is not None
+                ):
+                    block_reason = (
+                        self.extreme_protection.ordinary_control_block_reason(
+                            observed_at
+                        )
+                    )
+                    if block_reason is not None:
+                        observation = replace(
+                            observation,
+                            override_reason=block_reason,
+                        )
                 planned = self._stored_plan(observed_at)
                 dhw_decision = (
                     self.dhw_optimizer.decision
@@ -1137,11 +1179,15 @@ class FloorHeatingShadow:
             "native_minimum_offset_c": FLOOR_NATIVE_MIN_OFFSET,
             "native_maximum_offset_c": FLOOR_NATIVE_MAX_OFFSET,
             "primary_candidate_minimum_offset_c": self.policy.minimum_offset,
-            "primary_candidate_maximum_offset_c": self.policy.neutral_offset,
+            "primary_candidate_maximum_offset_c": self.policy.preheat_offset,
             "configured_aggressive_candidate_offset_c": self.policy.preheat_offset,
             "minimum_offset_c": self.policy.minimum_offset,
             "neutral_offset_c": self.policy.neutral_offset,
             "preheat_offset_c": self.policy.preheat_offset,
+            "shift_delta_c": self.policy.shift_delta,
+            "offset_policy": (
+                "fresh_native_offset_plus_or_minus_4c_bounded_to_minus6_plus4"
+            ),
             "comfort_floor_c": self.policy.comfort_floor,
             "preheat_ceiling_c": self.policy.preheat_ceiling,
             "window_minutes": self.policy.window_minutes,
@@ -1167,8 +1213,9 @@ class FloorHeatingShadow:
             "pilot_eligible": False,
             "pilot_eligibility_reason": (
                 "Write control remains disabled until at least 14 observed days, "
-                "five complete candidate cycles, thermal-lag review and explicit "
-                "room-comfort bounds are approved."
+                "five clean revision-4 candidate cycles, thermal-lag review, "
+                "controlled offset commissioning and explicit room-comfort "
+                "bounds are approved."
             ),
             "solar_dispatch_available": False,
             "solar_dispatch_reason": (
@@ -1176,6 +1223,8 @@ class FloorHeatingShadow:
                 "cannot prove household surplus."
             ),
             **self.room_temperature_details,
-            "recent_decisions": self.state["decision_history"][-12:],
+            "recent_decisions": self.state["decision_history"][
+                -RECENT_DECISIONS_ATTRIBUTE_LIMIT:
+            ],
         })
         return result

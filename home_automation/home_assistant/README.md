@@ -528,8 +528,11 @@ recovery. A later 49°C reading therefore does not incorrectly re-enter recovery
 for a plan that already succeeded; comfort and readiness guards still apply.
 Ordinary 45/50°C cost-driven transitions use a 30-minute minimum dwell, while
 comfort, readiness, incomplete-data and lease-expiry exits bypass it. Each
-policy revision clears prior qualification evidence so changed Shadow behavior
-must earn a new observation period.
+policy revision that changes scheduling values or qualification semantics clears
+prior evidence so changed Shadow behavior must earn a new observation period.
+Revision 4 changes arbitration and write safety without changing the DHW
+schedule, so it preserves revision-3 day, cycle and readiness evidence while
+clearing the anchored plan and current decision.
 
 The options flow validates every target against the selected Daikin's native
 range and step. On the verified BRP069A62 installation that range is 30–55°C in
@@ -556,10 +559,13 @@ visible in the UI.
 One shared `EnergyDevices` instance serializes optimizer and explicit MCP writes.
 The controller yields to circuit standby, powerful/hygiene-like operation,
 weather-dependent control, active/unknown safety flags, configured/effective
-target mismatch, and external target changes. It only modifies a target it owns.
-An uncertain write latches the optimizer in fault, creates a persistent
-notification, and requires a fresh read plus explicit resume; there is no
-automatic retry, inversion, or rollback.
+target mismatch, external target changes, and Extreme Price Protection priority.
+Before every automatic target transition, the writer repeats the relevant
+manufacturer-state checks and requires the exact fresh target to match the
+controller's expected previous value. It only modifies a target it owns. An
+uncertain write latches the optimizer in fault, creates a persistent notification,
+and requires a fresh read plus explicit resume; there is no automatic retry,
+inversion, or rollback.
 
 The integration exposes an optimizer status sensor with current/proposed
 targets, decision reason, selected price window, readiness deadline, price-gate
@@ -567,6 +573,8 @@ evidence, lease, learning counters and recent decisions; a mode select; and
 explicit resume and return-to-normal buttons. Return-to-normal pauses scheduling
 before requesting an ownership-aware 50°C restore. Whole-unit electrical energy
 is unavailable, so reported price opportunity is not measured kWh or savings.
+Recorder-facing status attributes expose only the four most recent decisions;
+24 internal events still feed the compact recovery and override counters.
 
 The dedicated `Hot water price opportunity` sensor is Recorder-safe and keeps
 the current anchored plan's highest-cost comparable-block average minus its
@@ -606,15 +614,19 @@ credited only after the paired peak ends without room-HVAC, comfort, override,
 missing-input or DHW-priority contamination.
 
 The verified Daikin surface supports a native **-10°C to +10°C** weather-curve
-offset. That capability is not a safe optimization envelope by itself. The
-first Shadow keeps its primary candidates inside the already observed native
-schedule:
+offset. That capability is not a safe optimization envelope by itself. Floor
+policy revision 4 evaluates one meaningful **4°C relative overlay**, bounded to
+an initial **-6°C to +4°C** Shadow envelope:
 
-| Candidate | Initial meaning |
-| --- | --- |
-| -2°C | Coast during the paired expensive block when the room is above the comfort guard |
-| 0°C | Move the existing neutral period into the paired cheap block |
-| +1°C | Separately reported aggressive preheat candidate, only with room-temperature headroom and useful heating conditions |
+| Fresh native offset | Cheap-block proposal | Paired peak proposal |
+| ---: | ---: | ---: |
+| -2°C | +2°C | -6°C |
+| 0°C | +4°C | -4°C |
+
+Other fresh native offsets use the same `native ± 4°C` rule and clamp at the
+revision-4 bounds. The old separate +1°C aggressive candidate is retained only
+as a compatibility field in historical decision data; it is no longer the
+policy.
 
 The evaluator requires complete canonical all-in coverage through the end of
 the current Tallinn delivery day. It may also use a later local day only when
@@ -625,9 +637,10 @@ quarters are never forecast or zero-filled. Within that evidence it pairs a
 two-hour cheap block with a later two-hour expensive block no more than eight
 hours away, and requires the same €0.05/kWh and 20% materiality gates as the
 DHW policy. It yields to safety/override states, non-LWT control, circuit
-standby, missing temperatures and offsets outside the initial Shadow envelope.
-At or below the 20°C indoor guard it proposes 0°C rather than a price-driven
-setback. At or above 21°C it suppresses the separate +1°C candidate.
+standby, missing temperatures and offsets outside the revision-4 envelope. At
+or below the 20°C indoor guard it removes a negative offset without lowering an
+already warmer native setting. At or above 21°C it records `preheat_limited` and
+preserves the native offset instead of adding heat.
 
 DHW comfort, readiness and preheat states have compressor priority. A
 conflicting floor preheat candidate is recorded as deferred rather than assumed
@@ -636,8 +649,10 @@ electrical energy are unavailable, so solar-driven floor-heating dispatch
 remains disabled and the sensor reports price opportunity rather than measured
 kWh or euro savings. The separate bounded inverter-curtailment controller does
 not make the floor evaluator solar-aware.
-Promotion remains ineligible until at least 14 observed days, five complete
-candidate cycles, thermal-lag review and explicit room-comfort bounds exist.
+Promotion remains ineligible until at least 14 observed days, five clean
+revision-4 candidate cycles, thermal-lag review, controlled offset commissioning,
+and explicit room-comfort bounds exist. Revision-4 evidence starts from zero
+because the numerical floor policy changed.
 
 The dedicated `Floor heating price opportunity` sensor records the paired peak
 average minus cheap-block average in EUR per shifted kWh. Its compact attributes
@@ -645,7 +660,8 @@ identify the anchored pair, candidate status, contamination state and
 qualified-plan count, while Recorder supplies the historical series. It does
 not turn aggregate household import into heat-pump energy. Estimated or realized
 euros remain unavailable until electrical energy can be attributed to the
-paired floor-heating action.
+paired floor-heating action. The main floor status sensor exposes only four
+recent decisions to stay below Recorder's attribute-size limit.
 
 ## Extreme price protection
 
@@ -699,7 +715,15 @@ uncertain, and confirmed separately. The combined shutdown is never atomic.
 No-op commands are suppressed. An uncertain stop or restore faults the
 controller, raises a critical alert and is never retried, inverted or rolled
 back automatically. Resume after review first requires fresh Daikin and climate
-state.
+state. Every Daikin stop, restore and commissioning transition also binds the
+exact expected previous `on` or `standby` state so a queued stale decision
+cannot overwrite a newer device or user change.
+
+Extreme Price Protection starts before both heating optimizers and has explicit
+arbitration priority. DHW and floor optimization suspend while the breaker is
+faulted, owns any protected load, lacks the current canonical price in Armed
+mode, or is inside a published €1.50/kWh block. This startup order reconciles
+persisted catastrophic-price ownership before ordinary heating evaluates.
 
 Per-load ownership stores the prior state, published block identity and lease.
 Only a circuit confirmed as breaker-owned standby is re-enabled. Only a climate

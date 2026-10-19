@@ -375,6 +375,14 @@ class ExtremePriceProtectionTests(base.HAComponentTests):
             floor or SimpleNamespace(set_external_influence=Mock()),
         )
 
+    def test_missing_daikin_circuits_keep_power_observation_shape(self):
+        protection = self.runtime(SimpleNamespace())
+        observation = protection._daikin_observation({}, self.now)
+        self.assertIsNone(observation["water_enabled"])
+        self.assertIsNone(observation["water_power"])
+        self.assertIsNone(observation["heating_enabled"])
+        self.assertIsNone(observation["heating_power"])
+
     async def test_runtime_shadow_is_strictly_zero_write(self):
         self.hass.states.async_set(
             "climate.bedroom",
@@ -415,6 +423,33 @@ class ExtremePriceProtectionTests(base.HAComponentTests):
         devices.control_daikin.assert_not_awaited()
         devices.control_climate.assert_not_awaited()
         self.assertLess(len(json.dumps(protection.attributes)), 16000)
+
+    def test_ordinary_heating_arbitration_uses_current_price_and_ownership(self):
+        protection = self.runtime(SimpleNamespace())
+        protection.mode = self.const.EXTREME_PRICE_MODE_ARMED
+        with patch.object(
+            self.module,
+            "published_intervals",
+            return_value=self.intervals(self.now, ["1.5"]),
+        ):
+            reason = protection.ordinary_control_block_reason(self.now)
+        self.assertIn("priority", reason)
+
+        with patch.object(
+            self.module,
+            "published_intervals",
+            return_value=self.intervals(self.now, ["0.2"]),
+        ):
+            self.assertIsNone(
+                protection.ordinary_control_block_reason(self.now)
+            )
+        protection.state["ownership"] = {
+            self.module.LOAD_HOT_WATER: {"block_id": "synthetic"}
+        }
+        self.assertIn(
+            "owns",
+            protection.ordinary_control_block_reason(self.now),
+        )
 
     async def test_partial_and_early_restore_alerts_are_explicit(self):
         devices = SimpleNamespace()
@@ -726,7 +761,11 @@ class ExtremePriceProtectionTests(base.HAComponentTests):
         )
         self.assertEqual(
             devices.control_daikin.await_args_list[0].args[0],
-            {"operation": "hot_water_enabled", "value": True},
+            {
+                "operation": "hot_water_enabled",
+                "value": True,
+                "expected_previous": "standby",
+            },
         )
 
     async def test_commissioning_replay_can_replace_uneventful_live_days(self):

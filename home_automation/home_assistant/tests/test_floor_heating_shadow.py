@@ -73,9 +73,10 @@ class FloorHeatingShadowTests(base.HAComponentTests):
         return self.module.FloorHeatingObservation(**values)
 
     def test_policy_distinguishes_native_range_from_candidate_envelope(self):
-        self.assertEqual(self.policy.minimum_offset, -2)
+        self.assertEqual(self.policy.minimum_offset, -6)
         self.assertEqual(self.policy.neutral_offset, 0)
-        self.assertEqual(self.policy.preheat_offset, 1)
+        self.assertEqual(self.policy.preheat_offset, 4)
+        self.assertEqual(self.policy.shift_delta, 4)
         self.assertEqual(self.module.FLOOR_NATIVE_MIN_OFFSET, -10)
         self.assertEqual(self.module.FLOOR_NATIVE_MAX_OFFSET, 10)
 
@@ -102,8 +103,8 @@ class FloorHeatingShadowTests(base.HAComponentTests):
             planned=initial.plan,
         )
         self.assertEqual(preheat.state, "preheat")
-        self.assertEqual(preheat.proposed_offset, 0)
-        self.assertEqual(preheat.aggressive_candidate_offset, 1)
+        self.assertEqual(preheat.proposed_offset, 2)
+        self.assertIsNone(preheat.aggressive_candidate_offset)
 
         coast = self.module.plan_floor_heating(
             now=start + timedelta(hours=18),
@@ -113,7 +114,47 @@ class FloorHeatingShadowTests(base.HAComponentTests):
             planned=initial.plan,
         )
         self.assertEqual(coast.state, "coast")
-        self.assertEqual(coast.proposed_offset, -2)
+        self.assertEqual(coast.proposed_offset, -4)
+
+    def test_four_degree_overlay_is_bounded_and_warm_room_suppresses_preheat(self):
+        start = datetime.fromisoformat("2026-10-17T00:00:00+00:00")
+        prices = self.intervals(start)
+        initial = self.module.plan_floor_heating(
+            now=start,
+            policy=self.policy,
+            observation=self.observation(),
+            intervals=prices,
+        )
+        bounded_preheat = self.module.plan_floor_heating(
+            now=start + timedelta(hours=12),
+            policy=self.policy,
+            observation=self.observation(actual_offset=2),
+            intervals=prices,
+            planned=initial.plan,
+        )
+        self.assertEqual(bounded_preheat.proposed_offset, 4)
+
+        bounded_coast = self.module.plan_floor_heating(
+            now=start + timedelta(hours=18),
+            policy=self.policy,
+            observation=self.observation(actual_offset=-4),
+            intervals=prices,
+            planned=initial.plan,
+        )
+        self.assertEqual(bounded_coast.proposed_offset, -6)
+
+        warm = self.module.plan_floor_heating(
+            now=start + timedelta(hours=12),
+            policy=self.policy,
+            observation=self.observation(
+                actual_offset=-2,
+                indoor_temperature=21,
+            ),
+            intervals=prices,
+            planned=initial.plan,
+        )
+        self.assertEqual(warm.state, "preheat_limited")
+        self.assertEqual(warm.proposed_offset, -2)
 
     def test_comfort_and_dhw_priority_override_price_candidate(self):
         start = datetime.fromisoformat("2026-10-17T00:00:00+00:00")
@@ -161,11 +202,11 @@ class FloorHeatingShadowTests(base.HAComponentTests):
         external = self.module.plan_floor_heating(
             now=start,
             policy=self.policy,
-            observation=self.observation(actual_offset=-5),
+            observation=self.observation(actual_offset=-7),
             intervals=self.intervals(start),
         )
         self.assertEqual(external.state, "yield")
-        self.assertEqual(external.proposed_offset, -5)
+        self.assertEqual(external.proposed_offset, -7)
         self.assertIn("Shadow envelope", external.reason)
 
     def test_complete_current_delivery_day_does_not_require_partial_tomorrow(self):
@@ -480,6 +521,7 @@ class FloorHeatingShadowTests(base.HAComponentTests):
             self.assertTrue(shadow.attributes["shadow_zero_writes"])
             self.assertEqual(shadow.attributes["native_minimum_offset_c"], -10)
             self.assertEqual(shadow.attributes["native_maximum_offset_c"], 10)
+            self.assertEqual(shadow.attributes["shift_delta_c"], 4)
             sensor = self.sensor_module.FloorHeatingShadowSensor(
                 shadow, entry.entry_id
             )
@@ -487,6 +529,43 @@ class FloorHeatingShadowTests(base.HAComponentTests):
             self.assertEqual(
                 sensor.extra_state_attributes["confirmed_writes"], 0
             )
+            self.assertLess(
+                len(json.dumps(sensor.extra_state_attributes)),
+                16000,
+            )
+        finally:
+            await shadow.async_stop()
+
+    async def test_extreme_price_arbitration_yields_before_floor_evidence(self):
+        await self.refresh()
+        self.hass.states.async_set(
+            "sensor.room_temperature",
+            "20.5",
+            {"unit_of_measurement": "°C"},
+        )
+        devices = SimpleNamespace(
+            get_daikin_status=AsyncMock(return_value=self._runtime_status()),
+            control_daikin=AsyncMock(),
+        )
+        shadow = self.module.FloorHeatingShadow(
+            self.hass,
+            self._runtime_entry(["sensor.room_temperature"]),
+            self.coordinator,
+            devices,
+            None,
+        )
+        shadow.set_extreme_protection(
+            SimpleNamespace(
+                ordinary_control_block_reason=lambda _now: (
+                    "Extreme price protection has priority."
+                )
+            )
+        )
+        await shadow.async_start()
+        try:
+            self.assertEqual(shadow.decision.state, "yield")
+            self.assertIn("priority", shadow.decision.reason)
+            devices.control_daikin.assert_not_awaited()
         finally:
             await shadow.async_stop()
 
