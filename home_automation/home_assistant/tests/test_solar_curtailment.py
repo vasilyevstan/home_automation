@@ -317,6 +317,18 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
                 "pmax_w": 8000.0,
             },
         )
+        self.assertEqual(
+            controller.attributes["configured_limit_equivalent_w"],
+            4000.0,
+        )
+        self.assertEqual(
+            controller.attributes["active_limit_equivalent_w"],
+            4000.0,
+        )
+        self.assertEqual(
+            controller.attributes["requested_limit_equivalent_w"],
+            4000.0,
+        )
 
     async def test_watt_mode_is_preserved(self):
         self.status.update(
@@ -366,6 +378,29 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.device_writes), 2)
         self.assertEqual(self.device_writes[-1]["value"], 100.0)
         self.assertIsNone(controller.state["ownership"])
+        history = controller.operation_history
+        self.assertEqual(
+            [
+                (item["operation"], item["phase"], item["success"])
+                for item in history
+            ],
+            [
+                ("acquire", "verified", True),
+                ("restore", "verified", True),
+            ],
+        )
+        self.assertEqual(
+            history[0]["previous"]["configured"],
+            100.0,
+        )
+        self.assertEqual(
+            history[0]["confirmed"]["configured"],
+            50.0,
+        )
+        self.assertEqual(
+            history[1]["confirmed"]["configured"],
+            100.0,
+        )
 
     async def test_profile_change_restores_exact_original(self):
         controller = self.controller()

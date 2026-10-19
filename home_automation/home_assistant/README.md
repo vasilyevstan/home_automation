@@ -516,6 +516,15 @@ value fields are limited to cost per avoided exported kWh and elapsed eligible
 or owned minutes. Without fresh signed grid power it never reports curtailed
 kWh, zero-export performance, or estimated/realized euro savings.
 
+Three Recorder-safe power sensors expose the configured inverter limit, active
+inverter limit, and current controller request in equivalent watts. Percentage
+mode is converted with the bound inverter Pmax; watt mode is preserved. The
+controller also keeps a bounded private history of its last 12 cap/restore
+operations so the compact Energy control activity sensor can distinguish
+verified solar commands, pre-dispatch no-command outcomes, and uncertain
+post-dispatch results. The activity entity retains at most 24 deduplicated
+cross-controller events from the latest 24 hours.
+
 ## Domestic-hot-water price optimizer
 
 Selecting a Daikin entry also creates a deterministic HA-native DHW optimizer.

@@ -12,7 +12,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfTemperature
+from homeassistant.const import UnitOfPower, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -94,12 +94,29 @@ async def async_setup_entry(
                 entry.entry_id,
             )
         )
+        entities.extend(
+            (
+                SolarConfiguredPowerLimitSensor(
+                    solar_curtailment,
+                    entry.entry_id,
+                ),
+                SolarActivePowerLimitSensor(
+                    solar_curtailment,
+                    entry.entry_id,
+                ),
+                SolarControllerPowerRequestSensor(
+                    solar_curtailment,
+                    entry.entry_id,
+                ),
+            )
+        )
     activity_controllers = [
         controller
         for controller in (
             optimizer,
             floor_shadow,
             extreme_protection,
+            solar_curtailment,
         )
         if controller is not None
     ]
@@ -109,6 +126,7 @@ async def async_setup_entry(
                 optimizer,
                 floor_shadow,
                 extreme_protection,
+                solar_curtailment,
                 entry.entry_id,
             )
         )
@@ -383,11 +401,13 @@ class EnergyControlActivitySensor(SensorEntity):
         optimizer,
         floor_shadow,
         extreme_protection,
+        solar_curtailment,
         entry_id: str,
     ) -> None:
         self.optimizer = optimizer
         self.floor_shadow = floor_shadow
         self.extreme_protection = extreme_protection
+        self.solar_curtailment = solar_curtailment
         self._attr_unique_id = entry_id + "_energy_control_activity"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry_id)},
@@ -400,6 +420,7 @@ class EnergyControlActivitySensor(SensorEntity):
             self.optimizer,
             self.floor_shadow,
             self.extreme_protection,
+            self.solar_curtailment,
         ):
             if controller is not None:
                 self.async_on_remove(
@@ -422,6 +443,20 @@ class EnergyControlActivitySensor(SensorEntity):
         before = "—" if actual is None else f"{actual}°C"
         after = "—" if proposed is None else f"{proposed}°C"
         return f"{label} {before} → {after}"
+
+    @staticmethod
+    def _solar_limit(value: object) -> str:
+        if not isinstance(value, dict):
+            return "—"
+        configured = value.get("configured")
+        if configured is None:
+            return "—"
+        suffix = "%" if value.get("mode") == "percent" else " W"
+        try:
+            display = f"{float(configured):g}"
+        except (TypeError, ValueError):
+            display = str(configured)
+        return f"{display}{suffix}"
 
     def _events(self) -> list[dict]:
         now = dt_util.utcnow().astimezone(timezone.utc)
@@ -569,6 +604,54 @@ class EnergyControlActivitySensor(SensorEntity):
                     ),
                 })
 
+        if self.solar_curtailment is not None:
+            for record in self.solar_curtailment.operation_history:
+                observed_at = self._timestamp(record.get("at"))
+                if observed_at is None or observed_at < cutoff:
+                    continue
+                phase = str(record.get("phase") or "unknown")
+                success = record.get("success") is True
+                if success:
+                    kind = "verified_command"
+                    result = (
+                        "Guarded inverter command confirmed by native Huawei "
+                        "read-back."
+                    )
+                elif "post_dispatch" in phase:
+                    kind = "uncertain_command"
+                    result = (
+                        "The inverter command outcome is uncertain and "
+                        "requires fresh-state review."
+                    )
+                else:
+                    kind = "no_command"
+                    result = "No inverter command was sent."
+                operation = str(record.get("operation") or "review")
+                events.append({
+                    "observed_at": observed_at.isoformat(),
+                    "system": "Solar",
+                    "kind": kind,
+                    "state": phase,
+                    "change": (
+                        "Limit {} → {}".format(
+                            self._solar_limit(record.get("previous")),
+                            self._solar_limit(record.get("confirmed")),
+                        )
+                        if success
+                        else (
+                            "Apply controller cap"
+                            if operation == "acquire"
+                            else "Restore original limit"
+                        )
+                    ),
+                    "reason": (
+                        record.get("reason")
+                        or record.get("error")
+                        or operation.replace("_", " ").title()
+                    ),
+                    "result": result,
+                })
+
         events.sort(key=lambda item: item["observed_at"])
         deduplicated = []
         last_signature_by_system = {}
@@ -587,7 +670,7 @@ class EnergyControlActivitySensor(SensorEntity):
                 continue
             last_signature_by_system[event["system"]] = signature
             deduplicated.append(event)
-        return deduplicated[-12:]
+        return deduplicated[-24:]
 
     @property
     def native_value(self) -> str:
@@ -599,6 +682,7 @@ class EnergyControlActivitySensor(SensorEntity):
         events = self._events()
         return {
             "window_hours": 24,
+            "event_limit": 24,
             "events": events,
             "verified_command_count": sum(
                 event["kind"] == "verified_command" for event in events
@@ -608,6 +692,9 @@ class EnergyControlActivitySensor(SensorEntity):
             ),
             "no_command_count": sum(
                 event["kind"] == "no_command" for event in events
+            ),
+            "uncertain_command_count": sum(
+                event["kind"] == "uncertain_command" for event in events
             ),
         }
 
@@ -686,4 +773,91 @@ class SolarCurtailmentOpportunitySensor(OptimizationOpportunitySensor):
             controller,
             entry_id,
             "solar_curtailment_price_opportunity",
+        )
+
+
+class SolarPowerLimitSensor(SensorEntity):
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 0
+
+    def __init__(
+        self,
+        controller,
+        entry_id: str,
+        unique_suffix: str,
+        attribute: str,
+    ) -> None:
+        self.controller = controller
+        self.attribute = attribute
+        self._attr_unique_id = entry_id + "_" + unique_suffix
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)},
+            name=NAME,
+            manufacturer="home_automation",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            self.controller.async_add_listener(
+                self.async_write_ha_state
+            )
+        )
+
+    @property
+    def available(self) -> bool:
+        return self.controller.attributes.get(self.attribute) is not None
+
+    @property
+    def native_value(self) -> float | None:
+        value = self.controller.attributes.get(self.attribute)
+        return float(value) if value is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        attributes = self.controller.attributes
+        return {
+            "native_limit_mode": attributes.get("configured_limit_mode"),
+            "inverter_pmax_w": attributes.get("pmax_w"),
+        }
+
+
+class SolarConfiguredPowerLimitSensor(SolarPowerLimitSensor):
+    _attr_name = "Solar configured power limit"
+    _attr_icon = "mdi:solar-power-variant"
+
+    def __init__(self, controller, entry_id: str) -> None:
+        super().__init__(
+            controller,
+            entry_id,
+            "solar_configured_power_limit",
+            "configured_limit_equivalent_w",
+        )
+
+
+class SolarActivePowerLimitSensor(SolarPowerLimitSensor):
+    _attr_name = "Solar active power limit"
+    _attr_icon = "mdi:solar-power"
+
+    def __init__(self, controller, entry_id: str) -> None:
+        super().__init__(
+            controller,
+            entry_id,
+            "solar_active_power_limit",
+            "active_limit_equivalent_w",
+        )
+
+
+class SolarControllerPowerRequestSensor(SolarPowerLimitSensor):
+    _attr_name = "Solar controller power request"
+    _attr_icon = "mdi:transmission-tower-export"
+
+    def __init__(self, controller, entry_id: str) -> None:
+        super().__init__(
+            controller,
+            entry_id,
+            "solar_controller_power_request",
+            "requested_limit_equivalent_w",
         )
