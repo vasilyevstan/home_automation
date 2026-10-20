@@ -41,16 +41,19 @@ from .const import (
     DEFAULT_DHW_PRICE_DELTA,
     DEFAULT_DHW_PRICE_PERCENT,
     DEFAULT_DHW_SOFT_TARGET,
+    DHW_FINAL_TOPUP_MINUTES,
     DHW_MODE_PAUSED,
     DHW_MODE_READINESS,
     DHW_MODE_SAFE,
     DHW_MODE_SHADOW,
     DHW_MODE_SOFT,
     DHW_MODES,
+    DHW_POST_DELIVERY_REARM_C,
+    DHW_POST_READINESS_HOLD_MINUTES,
     DOMAIN,
     EVENT_DHW_DECISION,
 )
-from .controls import EnergyDevices, FLAGS
+from .controls import DaikinPreDispatchConflict, EnergyDevices, FLAGS
 from .coordinator import HouseholdPriceCoordinator
 
 
@@ -59,8 +62,12 @@ STORE_KEY_SUFFIX = "dhw_optimizer"
 NOTIFICATION_ID = DOMAIN + "_dhw_optimizer_fault"
 DECISION_HISTORY_LIMIT = 96
 HEATING_DURATION_LIMIT = 20
-POLICY_REVISION = 5
+POLICY_REVISION = 6
 MINIMUM_TARGET_DWELL = timedelta(minutes=30)
+POST_READINESS_HOLD = timedelta(
+    minutes=DHW_POST_READINESS_HOLD_MINUTES
+)
+FINAL_TOPUP_WINDOW = timedelta(minutes=DHW_FINAL_TOPUP_MINUTES)
 RECENT_DECISIONS_ATTRIBUTE_LIMIT = 4
 READINESS_SUCCESS = "success"
 READINESS_CONSUMED = "consumed"
@@ -331,6 +338,30 @@ def next_readiness(now: datetime, policy: DhwPolicy) -> datetime:
     raise HomeAssistantError("Could not resolve the next DHW readiness time.")
 
 
+def previous_readiness(now: datetime, policy: DhwPolicy) -> datetime:
+    local_now = now.astimezone(TALLINN)
+    candidates = []
+    for day_offset in (-1, 0):
+        day = local_now.date() + timedelta(days=day_offset)
+        for ready in policy.readiness_times:
+            candidate = datetime.combine(day, ready, tzinfo=TALLINN)
+            if candidate <= local_now:
+                candidates.append(candidate)
+    if not candidates:
+        raise HomeAssistantError(
+            "Could not resolve the previous DHW readiness time."
+        )
+    return max(candidates)
+
+
+def post_readiness_hold_until(
+    now: datetime, policy: DhwPolicy
+) -> datetime | None:
+    ready_at = previous_readiness(now, policy)
+    hold_until = ready_at + POST_READINESS_HOLD
+    return hold_until if now.astimezone(TALLINN) < hold_until else None
+
+
 def published_intervals(coordinator: HouseholdPriceCoordinator) -> tuple[PriceInterval, ...]:
     snapshot = coordinator.data
     if snapshot is None:
@@ -473,9 +504,14 @@ def plan_dhw(
     recovery_latched: bool = False,
     recovery_reason: str | None = None,
     preheat_completed: bool = False,
+    readiness_delivered: bool = False,
+    final_topup_used: bool = False,
+    final_topup_active: bool = False,
 ) -> DhwDecision:
     if now.utcoffset() is None:
         raise HomeAssistantError("DHW planning time must include a UTC offset.")
+    if mode == DHW_MODE_SOFT:
+        mode = DHW_MODE_SAFE
     if mode not in DHW_MODES:
         raise HomeAssistantError("Unknown DHW optimizer mode.")
     deadline = next_readiness(now, policy)
@@ -500,7 +536,7 @@ def plan_dhw(
         policy.price_delta,
         policy.price_percent,
     )
-    allow_write = mode in (DHW_MODE_READINESS, DHW_MODE_SAFE, DHW_MODE_SOFT)
+    allow_write = mode in (DHW_MODE_READINESS, DHW_MODE_SAFE)
 
     def decision(
         state: str,
@@ -547,10 +583,36 @@ def plan_dhw(
     remaining = deadline.astimezone(UTC) - now.astimezone(UTC)
     if remaining <= timedelta(minutes=heating_minutes):
         if observation.tank_temperature < policy.normal_target:
+            if (
+                readiness_delivered
+                and observation.tank_temperature
+                > DHW_POST_DELIVERY_REARM_C
+                and (
+                    remaining > FINAL_TOPUP_WINDOW
+                    or (
+                        final_topup_used
+                        and not final_topup_active
+                    )
+                )
+            ):
+                return decision(
+                    "readiness_hold",
+                    "Measured readiness was already delivered. Hold 50°C "
+                    "unless the tank reaches the 48°C re-arm threshold or "
+                    "one final top-up is needed inside the last 45 minutes.",
+                    policy.normal_target,
+                    urgent=True,
+                )
             return decision(
-                "readiness_charge",
-                "The readiness deadline is inside the conservative heating allowance; "
-                "request 55°C only until the measured tank reaches 50°C.",
+                (
+                    "readiness_final_topup"
+                    if readiness_delivered
+                    and remaining <= FINAL_TOPUP_WINDOW
+                    else "readiness_charge"
+                ),
+                "The readiness deadline is inside the conservative heating "
+                "allowance; request 55°C only until the measured tank reaches "
+                "50°C.",
                 policy.preheat_target,
                 urgent=True,
             )
@@ -575,6 +637,15 @@ def plan_dhw(
         return decision(
             "recovery",
             "Tank temperature reached the 45°C comfort threshold; price shifting is bypassed.",
+            policy.normal_target,
+            urgent=True,
+        )
+    hold_until = post_readiness_hold_until(now, policy)
+    if hold_until is not None:
+        return decision(
+            "usage_hold",
+            "The two-hour post-readiness demand hold keeps the normal 50°C "
+            "target and blocks price-driven coasting.",
             policy.normal_target,
             urgent=True,
         )
@@ -633,27 +704,6 @@ def plan_dhw(
             policy.normal_target,
         )
 
-    effective_mode = DHW_MODE_SAFE if mode == DHW_MODE_SHADOW else mode
-    if effective_mode == DHW_MODE_SOFT:
-        if lease_expires is not None:
-            if lease_expires <= now_utc:
-                return decision(
-                    "normal",
-                    "The four-hour soft-standby lease expired.",
-                    policy.normal_target,
-                    urgent=True,
-                )
-            return decision(
-                "soft_standby",
-                "The cost gate remains active inside the bounded 30°C soft-standby lease.",
-                policy.soft_target,
-            )
-        if observation.tank_temperature >= policy.normal_target:
-            return decision(
-                "soft_standby",
-                "The cost gate is active and the tank is warm enough to start a bounded lease.",
-                policy.soft_target,
-            )
     return decision(
         "coast",
         "The cost gate is active; allow natural cooling while Daikin enforces the 45°C target.",
@@ -737,8 +787,11 @@ class DhwOptimizer:
             "shadow_days": [],
             "readiness_pilot_days": [],
             "heating_durations": [],
+            "readiness_topup_durations": [],
             "cycle_started_at": None,
             "cycle_start_temperature": None,
+            "topup_started_at": None,
+            "topup_start_temperature": None,
             "last_temperature": None,
             "last_observed_at": None,
             "decision_history": [],
@@ -751,6 +804,9 @@ class DhwOptimizer:
             "deadline_checks": {},
             "readiness_window_peaks": {},
             "readiness_rapid_draws": {},
+            "readiness_deadline_samples": {},
+            "readiness_final_topups": {},
+            "readiness_final_topup_active": {},
             "qualified_opportunity_count": 0,
             "last_qualified_opportunity_plan_id": None,
             "last_qualified_opportunity_at": None,
@@ -776,8 +832,11 @@ class DhwOptimizer:
             "shadow_days": [],
             "readiness_pilot_days": [],
             "heating_durations": [],
+            "readiness_topup_durations": [],
             "cycle_started_at": None,
             "cycle_start_temperature": None,
+            "topup_started_at": None,
+            "topup_start_temperature": None,
             "last_temperature": None,
             "last_observed_at": None,
             "decision_history": [],
@@ -790,6 +849,9 @@ class DhwOptimizer:
             "deadline_checks": {},
             "readiness_window_peaks": {},
             "readiness_rapid_draws": {},
+            "readiness_deadline_samples": {},
+            "readiness_final_topups": {},
+            "readiness_final_topup_active": {},
             "qualified_opportunity_count": 0,
             "last_qualified_opportunity_plan_id": None,
             "last_qualified_opportunity_at": None,
@@ -800,16 +862,37 @@ class DhwOptimizer:
         if isinstance(stored, dict):
             stored_revision = stored.get("policy_revision")
             mode = stored.get("mode")
-            if mode in DHW_MODES:
+            if mode == DHW_MODE_SOFT:
+                self.mode = DHW_MODE_SAFE
+            elif mode in DHW_MODES:
                 self.mode = mode
             for key in self.state:
                 if key in stored:
                     self.state[key] = stored[key]
-            if stored_revision != POLICY_REVISION:
+            if stored_revision == 5:
+                self.state["policy_revision"] = POLICY_REVISION
+                self.state["lease_expires"] = None
+                self._clear_price_plan()
+                checks = dict(self.state.get("deadline_checks", {}))
+                rapid_draws = self.state.get("readiness_rapid_draws", {})
+                peaks = self.state.get("readiness_window_peaks", {})
+                for key, outcome in tuple(checks.items()):
+                    peak = peaks.get(key)
+                    if (
+                        outcome == READINESS_SUCCESS
+                        and key in rapid_draws
+                        and isinstance(peak, dict)
+                        and _raw_number(peak.get("temperature"))
+                        is not None
+                        and _raw_number(peak.get("temperature"))
+                        >= self.policy.normal_target
+                    ):
+                        checks[key] = READINESS_CONSUMED
+                self.state["deadline_checks"] = checks
+            elif stored_revision != POLICY_REVISION:
                 write_capable_mode = self.mode in (
                     DHW_MODE_READINESS,
                     DHW_MODE_SAFE,
-                    DHW_MODE_SOFT,
                 )
                 self._reset_policy_evidence()
                 if write_capable_mode:
@@ -894,20 +977,7 @@ class DhwOptimizer:
 
     @property
     def soft_ready(self) -> bool:
-        started = _instant(self.state.get("pilot_started_at"))
-        checks = self.state["deadline_checks"]
-        return (
-            started is not None
-            and dt_util.utcnow() - started.astimezone(UTC) >= timedelta(days=7)
-            and self.state["safe_pilot_confirmed_writes"] >= 10
-            and not self.state["fault"]
-            and any(value in READINESS_USABLE for value in checks.values())
-            and all(
-                value in READINESS_DELIVERED
-                for value in checks.values()
-                if value in READINESS_USABLE
-            )
-        )
+        return False
 
     @property
     def heating_minutes(self) -> int:
@@ -917,7 +987,7 @@ class DhwOptimizer:
             if isinstance(value, (int, float)) and math.isfinite(float(value))
         )
         if len(values) < 5:
-            return self.policy.initial_heat_minutes
+            return max(120, self.policy.initial_heat_minutes)
         index = max(0, math.ceil(len(values) * 0.9) - 1)
         learned = math.ceil((values[index] + 15) / 15) * 15
         return max(45, min(120, learned))
@@ -1080,47 +1150,90 @@ class DhwOptimizer:
         checks = dict(self.state["deadline_checks"])
         peaks = dict(self.state["readiness_window_peaks"])
         rapid_draws = dict(self.state["readiness_rapid_draws"])
-        for ready in self.policy.readiness_times:
-            ready_at = datetime.combine(local.date(), ready, tzinfo=TALLINN)
-            key = ready_at.isoformat()
-            final_start = ready_at - timedelta(minutes=self.heating_minutes)
-            check_end = ready_at + timedelta(minutes=15)
-            if temperature is not None and final_start <= local < check_end:
-                peak_record = peaks.get(key)
-                previous_peak = (
-                    _raw_number(peak_record.get("temperature"))
-                    if isinstance(peak_record, dict)
-                    else None
+        samples = dict(self.state["readiness_deadline_samples"])
+        for day_offset in (-1, 0):
+            day = local.date() + timedelta(days=day_offset)
+            for ready in self.policy.readiness_times:
+                ready_at = datetime.combine(day, ready, tzinfo=TALLINN)
+                key = ready_at.isoformat()
+                final_start = ready_at - timedelta(
+                    minutes=self.heating_minutes
                 )
-                peak_at = (
-                    _instant(peak_record.get("observed_at"))
-                    if isinstance(peak_record, dict)
-                    else None
-                )
-                if previous_peak is None or temperature >= previous_peak:
-                    previous_peak = temperature
-                    peak_at = now
-                    peaks[key] = {
+                check_end = ready_at + timedelta(minutes=15)
+                if (
+                    temperature is not None
+                    and final_start <= local < check_end
+                ):
+                    peak_record = peaks.get(key)
+                    previous_peak = (
+                        _raw_number(peak_record.get("temperature"))
+                        if isinstance(peak_record, dict)
+                        else None
+                    )
+                    peak_at = (
+                        _instant(peak_record.get("observed_at"))
+                        if isinstance(peak_record, dict)
+                        else None
+                    )
+                    if previous_peak is None or temperature >= previous_peak:
+                        previous_peak = temperature
+                        peak_at = now
+                        peaks[key] = {
+                            "temperature": temperature,
+                            "observed_at": now.isoformat(),
+                        }
+                    since_peak = (
+                        now - peak_at.astimezone(UTC)
+                        if peak_at is not None
+                        else None
+                    )
+                    if (
+                        last_temperature is not None
+                        and last_observed is not None
+                        and timedelta(0)
+                        <= now - last_observed.astimezone(UTC)
+                        <= timedelta(minutes=15)
+                        and since_peak is not None
+                        and timedelta(0)
+                        <= since_peak
+                        <= timedelta(minutes=15)
+                        and previous_peak - temperature >= 3
+                    ):
+                        rapid_draws[key] = now.isoformat()
+                if (
+                    ready_at <= local < check_end
+                    and key not in samples
+                ):
+                    samples[key] = {
                         "temperature": temperature,
+                        "target": target,
+                        "override_reason": observation.override_reason,
                         "observed_at": now.isoformat(),
                     }
-                since_peak = (
-                    now - peak_at.astimezone(UTC)
-                    if peak_at is not None
+                if local < check_end or key in checks:
+                    continue
+                if (
+                    key not in samples
+                    and key not in peaks
+                    and key not in rapid_draws
+                ):
+                    continue
+                sample = samples.get(key)
+                sample_temperature = (
+                    _raw_number(sample.get("temperature"))
+                    if isinstance(sample, dict)
                     else None
                 )
-                if (
-                    last_temperature is not None
-                    and last_observed is not None
-                    and timedelta(0)
-                    <= now - last_observed.astimezone(UTC)
-                    <= timedelta(minutes=15)
-                    and since_peak is not None
-                    and timedelta(0) <= since_peak <= timedelta(minutes=15)
-                    and previous_peak - temperature >= 3
-                ):
-                    rapid_draws[key] = now.isoformat()
-            if ready_at <= local < check_end and key not in checks:
+                sample_target = (
+                    _raw_number(sample.get("target"))
+                    if isinstance(sample, dict)
+                    else None
+                )
+                sample_override = (
+                    sample.get("override_reason")
+                    if isinstance(sample, dict)
+                    else None
+                )
                 peak_record = peaks.get(key)
                 peak = (
                     _raw_number(peak_record.get("temperature"))
@@ -1128,19 +1241,20 @@ class DhwOptimizer:
                     else None
                 )
                 if (
-                    observation.override_reason is not None
-                    or temperature is None
-                    or target is None
+                    sample_override is not None
+                    or sample_temperature is None
+                    or sample_target is None
                 ):
                     outcome = READINESS_UNAVAILABLE
-                elif temperature >= self.policy.normal_target:
-                    outcome = READINESS_SUCCESS
                 elif key in rapid_draws and (
-                    peak is not None and peak >= self.policy.normal_target
+                    peak is not None
+                    and peak >= self.policy.normal_target
                 ):
                     outcome = READINESS_CONSUMED
                 elif key in rapid_draws:
                     outcome = READINESS_CONTAMINATED
+                elif sample_temperature >= self.policy.normal_target:
+                    outcome = READINESS_SUCCESS
                 else:
                     outcome = READINESS_FAILURE
                 checks[key] = outcome
@@ -1153,23 +1267,29 @@ class DhwOptimizer:
                     self.state["recovery_latched"] = True
                     if outcome == READINESS_CONSUMED:
                         self.state["recovery_reason"] = (
-                            f"The {ready.strftime('%H:%M')} readiness target was "
-                            "measured before a rapid draw; hold 50°C while recovering."
+                            f"The {ready.strftime('%H:%M')} readiness target "
+                            "was delivered before a rapid draw; hold 50°C "
+                            "while recovering."
                         )
                     elif outcome == READINESS_CONTAMINATED:
                         self.state["recovery_reason"] = (
-                            f"A rapid draw obscured the {ready.strftime('%H:%M')} "
-                            "readiness check; hold 50°C while recovering."
+                            f"A rapid draw obscured the "
+                            f"{ready.strftime('%H:%M')} readiness check; hold "
+                            "50°C while recovering."
                         )
                     else:
                         self.state["recovery_reason"] = (
-                            f"The {ready.strftime('%H:%M')} readiness deadline was "
-                            f"missed at {temperature:g}°C; hold 50°C until recovery completes."
+                            f"The {ready.strftime('%H:%M')} readiness deadline "
+                            f"was missed at {sample_temperature:g}°C; hold "
+                            "50°C until recovery completes."
                         )
         self.state["deadline_checks"] = checks
         self.state["readiness_window_peaks"] = dict(list(peaks.items())[-30:])
         self.state["readiness_rapid_draws"] = dict(
             list(rapid_draws.items())[-30:]
+        )
+        self.state["readiness_deadline_samples"] = dict(
+            list(samples.items())[-30:]
         )
         if (
             observation.override_reason is not None
@@ -1177,7 +1297,36 @@ class DhwOptimizer:
             or target is None
         ):
             return
+        active_final_topups = dict(
+            self.state["readiness_final_topup_active"]
+        )
+        completed_final_topups = dict(
+            self.state["readiness_final_topups"]
+        )
+        for key in tuple(active_final_topups):
+            deadline = _instant(key)
+            if deadline is None or now.astimezone(UTC) > deadline.astimezone(UTC):
+                active_final_topups.pop(key, None)
+            elif temperature >= self.policy.normal_target:
+                active_final_topups.pop(key, None)
+                completed_final_topups[key] = now.isoformat()
+        self.state["readiness_final_topup_active"] = dict(
+            list(active_final_topups.items())[-30:]
+        )
+        self.state["readiness_final_topups"] = dict(
+            list(completed_final_topups.items())[-30:]
+        )
         cycle_start = _instant(self.state.get("cycle_started_at"))
+        topup_start = _instant(self.state.get("topup_started_at"))
+        if topup_start is not None and temperature >= self.policy.normal_target:
+            duration = (now - topup_start).total_seconds() / 60
+            if 5 <= duration <= 120:
+                self.state["readiness_topup_durations"] = (
+                    self.state["readiness_topup_durations"]
+                    + [round(duration, 1)]
+                )[-HEATING_DURATION_LIMIT:]
+            self.state["topup_started_at"] = None
+            self.state["topup_start_temperature"] = None
         if (
             cycle_start is None
             and temperature <= self.policy.floor_target
@@ -1202,6 +1351,17 @@ class DhwOptimizer:
                 self.state["cycle_start_temperature"] = None
         self.state["last_temperature"] = temperature
         self.state["last_observed_at"] = now.isoformat()
+
+    def _readiness_delivered(self, deadline: datetime) -> bool:
+        peak_record = self.state["readiness_window_peaks"].get(
+            deadline.isoformat()
+        )
+        peak = (
+            _raw_number(peak_record.get("temperature"))
+            if isinstance(peak_record, dict)
+            else None
+        )
+        return peak is not None and peak >= self.policy.normal_target
 
     def _record_decision(self, now: datetime, decision: DhwDecision) -> None:
         previous = self.decision
@@ -1340,6 +1500,17 @@ class DhwOptimizer:
                     preheat_completed=(
                         self.state.get("planned_window_completed_at") is not None
                     ),
+                    readiness_delivered=self._readiness_delivered(deadline),
+                    final_topup_used=bool(
+                        self.state["readiness_final_topups"].get(
+                            deadline.isoformat()
+                        )
+                    ),
+                    final_topup_active=bool(
+                        self.state[
+                            "readiness_final_topup_active"
+                        ].get(deadline.isoformat())
+                    ),
                 )
                 if (
                     planned_window is None
@@ -1421,6 +1592,26 @@ class DhwOptimizer:
         decision: DhwDecision,
     ) -> None:
         target = decision.desired_target
+        final_topup_key = (
+            decision.deadline.isoformat()
+            if (
+                decision.allow_write
+                and decision.state == "readiness_final_topup"
+                and decision.deadline is not None
+            )
+            else None
+        )
+        if (
+            final_topup_key is not None
+            and target == observation.target_temperature
+            and target == self.policy.preheat_target
+            and self.state.get("last_owned_target") == target
+        ):
+            active = dict(self.state["readiness_final_topup_active"])
+            active[final_topup_key] = now.isoformat()
+            self.state["readiness_final_topup_active"] = dict(
+                list(active.items())[-30:]
+            )
         if (
             not decision.allow_write
             or target is None
@@ -1446,6 +1637,8 @@ class DhwOptimizer:
                 },
                 Context(),
             )
+        except DaikinPreDispatchConflict:
+            return
         except (HomeAssistantError, TimeoutError) as error:
             self.state["fault"] = (
                 "A guarded DHW command failed and may have applied. "
@@ -1462,6 +1655,12 @@ class DhwOptimizer:
         if confirmed != target:
             self.state["fault"] = "The guarded DHW command returned an unexpected confirmation."
             return
+        if final_topup_key is not None:
+            active = dict(self.state["readiness_final_topup_active"])
+            active[final_topup_key] = now.isoformat()
+            self.state["readiness_final_topup_active"] = dict(
+                list(active.items())[-30:]
+            )
         self.state["last_owned_target"] = target
         self.state["last_write_at"] = now.isoformat()
         changed = int(result.get("changed") is True)
@@ -1472,11 +1671,23 @@ class DhwOptimizer:
             self.state["readiness_pilot_confirmed_writes"] += changed
         if self.mode == DHW_MODE_SAFE:
             self.state["safe_pilot_confirmed_writes"] += changed
-        if target == self.policy.soft_target:
-            self.state["lease_expires"] = (now + self.policy.max_lease).isoformat()
-        else:
-            self.state["lease_expires"] = None
-        if self.mode in (DHW_MODE_SAFE, DHW_MODE_SOFT) and self.state["pilot_started_at"] is None:
+        self.state["lease_expires"] = None
+        if (
+            changed
+            and decision.state
+            in ("readiness_charge", "readiness_final_topup")
+            and observation.tank_temperature is not None
+            and observation.tank_temperature > self.policy.floor_target
+            and self.state["topup_started_at"] is None
+        ):
+            self.state["topup_started_at"] = now.isoformat()
+            self.state["topup_start_temperature"] = (
+                observation.tank_temperature
+            )
+        if (
+            self.mode == DHW_MODE_SAFE
+            and self.state["pilot_started_at"] is None
+        ):
             self.state["pilot_started_at"] = now.isoformat()
         if self.state["decision_history"]:
             self.state["decision_history"][-1]["write_sent"] = bool(result.get("changed"))
@@ -1502,15 +1713,6 @@ class DhwOptimizer:
                 "with no genuine failure, and at least two confirmed readiness-pilot "
                 "writes."
             )
-        if (
-            mode == DHW_MODE_SOFT
-            and not self.soft_ready
-            and not approval
-            and not owner_approved
-        ):
-            raise HomeAssistantError(
-                "Soft standby requires the completed seven-day safe pilot and ten confirmed writes."
-            )
         if owner_approved:
             status = await self.devices.get_daikin_status()
             observation = self._observation(status)
@@ -1531,7 +1733,6 @@ class DhwOptimizer:
         if mode in (DHW_MODE_PAUSED, DHW_MODE_SHADOW) and previous in (
             DHW_MODE_READINESS,
             DHW_MODE_SAFE,
-            DHW_MODE_SOFT,
         ):
             await self.async_return_to_normal(evaluate=False, pause=False)
         if (
@@ -1541,13 +1742,12 @@ class DhwOptimizer:
             self.state["readiness_pilot_started_at"] = (
                 dt_util.utcnow().astimezone(UTC).isoformat()
             )
-        if mode != DHW_MODE_SOFT:
-            self.state["lease_expires"] = None
+        self.state["lease_expires"] = None
         await self._save()
         await self.async_evaluate()
 
     async def async_activate_full_control(self) -> None:
-        await self.async_set_mode(DHW_MODE_SOFT, owner_approved=True)
+        await self.async_set_mode(DHW_MODE_SAFE, owner_approved=True)
 
     async def async_resume(self) -> None:
         await self.devices.get_daikin_status()
@@ -1595,6 +1795,9 @@ class DhwOptimizer:
                 },
                 Context(),
             )
+        except DaikinPreDispatchConflict:
+            await self._save()
+            raise
         except (HomeAssistantError, TimeoutError) as error:
             self.state["fault"] = (
                 "Return to normal failed and may have applied; inspect fresh state. " + str(error)
@@ -1734,9 +1937,13 @@ class DhwOptimizer:
             "readiness_pilot_days": len(self.state["readiness_pilot_days"]),
             "qualification_days": len(qualification_days),
             "usable_heating_cycles": len(self.state["heating_durations"]),
+            "usable_readiness_topups": len(
+                self.state["readiness_topup_durations"]
+            ),
             "heating_duration_minutes": self.heating_minutes,
             "shadow_ready": self.shadow_ready,
-            "soft_standby_ready": self.soft_ready,
+            "soft_standby_ready": False,
+            "automatic_soft_standby_enabled": False,
             "confirmed_writes": self.state["confirmed_writes"],
             "readiness_pilot_confirmed_writes": self.state[
                 "readiness_pilot_confirmed_writes"
@@ -1797,6 +2004,10 @@ class DhwOptimizer:
             "minimum_target_dwell_minutes": int(
                 MINIMUM_TARGET_DWELL.total_seconds() // 60
             ),
+            "post_readiness_hold_minutes": DHW_POST_READINESS_HOLD_MINUTES,
+            "post_delivery_rearm_c": DHW_POST_DELIVERY_REARM_C,
+            "final_topup_window_minutes": DHW_FINAL_TOPUP_MINUTES,
+            "readiness_evidence_delay_minutes": 15,
             "extreme_price_block_reason": self._extreme_block_reason(
                 dt_util.utcnow()
             ),

@@ -189,6 +189,30 @@ class FloorHeatingShadowTests(base.HAComponentTests):
         self.assertTrue(deferred.compressor_conflict)
         self.assertEqual(deferred.proposed_offset, 0)
 
+        satisfied = self.module.plan_floor_heating(
+            now=start + timedelta(hours=12),
+            policy=self.policy,
+            observation=self.observation(),
+            intervals=prices,
+            planned=initial.plan,
+            dhw_state="readiness",
+            dhw_proposed_target=50,
+        )
+        self.assertNotEqual(satisfied.state, "deferred")
+        self.assertFalse(satisfied.compressor_conflict)
+
+        readiness_charge = self.module.plan_floor_heating(
+            now=start + timedelta(hours=12),
+            policy=self.policy,
+            observation=self.observation(),
+            intervals=prices,
+            planned=initial.plan,
+            dhw_state="readiness_charge",
+            dhw_proposed_target=55,
+        )
+        self.assertEqual(readiness_charge.state, "deferred")
+        self.assertTrue(readiness_charge.compressor_conflict)
+
     def test_missing_prices_and_external_offsets_never_create_actions(self):
         start = datetime.fromisoformat("2026-10-17T00:00:00+00:00")
         incomplete = self.module.plan_floor_heating(
@@ -737,7 +761,7 @@ class FloorHeatingShadowTests(base.HAComponentTests):
         )
         self.assertEqual(devices.control_daikin.await_count, 1)
 
-    async def test_external_offset_change_relinquishes_ownership(self):
+    async def test_accepted_native_schedule_change_relinquishes_ownership(self):
         shadow = self.module.FloorHeatingShadow(
             self.hass,
             self._runtime_entry([]),
@@ -763,18 +787,62 @@ class FloorHeatingShadowTests(base.HAComponentTests):
         )
 
         normalized = shadow._normalize_owned_decision(
+            start,
             self.observation(actual_offset=0),
             decision,
         )
 
-        self.assertEqual(normalized.state, "yield")
+        self.assertEqual(normalized.state, "schedule_learning_hold")
         self.assertEqual(normalized.proposed_offset, 0)
+        self.assertEqual(shadow.mode, self.const.FLOOR_MODE_ACTIVE)
+        self.assertIsNone(shadow.state["ownership"])
+        self.assertIsNone(shadow.state["manual_override"])
+        self.assertIsNotNone(
+            shadow.state["schedule_learning_hold_until"]
+        )
+        self.assertTrue(shadow.state["candidate_cycle_contaminated"])
+        self.assertEqual(
+            shadow.state["native_schedule_transitions"][-1][
+                "classification"
+            ],
+            "accepted_schedule_transition",
+        )
+
+    async def test_unexpected_owned_change_fails_to_shadow(self):
+        shadow = self.module.FloorHeatingShadow(
+            self.hass,
+            self._runtime_entry([]),
+            self.coordinator,
+            SimpleNamespace(),
+            None,
+        )
+        shadow.mode = self.const.FLOOR_MODE_ACTIVE
+        shadow.state["ownership"] = {
+            "baseline_offset": -2,
+            "target_offset": 2,
+            "phase": "preheat",
+            "acquired_at": self.now.isoformat(),
+            "updated_at": self.now.isoformat(),
+        }
+        delivery_day = date(2026, 10, 20)
+        start, _end = self.module.market_bounds(delivery_day)
+        decision = self.module.plan_floor_heating(
+            now=start,
+            policy=self.policy,
+            observation=self.observation(actual_offset=-1),
+            intervals=self.delivery_day_intervals(delivery_day),
+        )
+
+        normalized = shadow._normalize_owned_decision(
+            start,
+            self.observation(actual_offset=-1),
+            decision,
+        )
+
+        self.assertEqual(normalized.state, "yield")
         self.assertEqual(shadow.mode, self.const.FLOOR_MODE_SHADOW)
         self.assertIsNone(shadow.state["ownership"])
-        self.assertIn(
-            "preserved",
-            shadow.state["manual_override"],
-        )
+        self.assertIn("unexpectedly", shadow.state["manual_override"])
 
     async def test_uncertain_restore_reconciles_at_baseline_without_replay(self):
         self.hass.states.async_set(
@@ -841,6 +909,44 @@ class FloorHeatingShadowTests(base.HAComponentTests):
         self.assertIsNone(shadow.state["ownership"])
         self.assertIsNone(shadow.state["fault"])
         self.assertEqual(devices.control_daikin.await_count, 1)
+
+    async def test_pre_dispatch_conflict_clears_pending_without_fault(self):
+        devices = SimpleNamespace(
+            control_daikin=AsyncMock(
+                side_effect=self.module.DaikinPreDispatchConflict(
+                    "Synthetic expected-previous conflict."
+                )
+            ),
+        )
+        shadow = self.module.FloorHeatingShadow(
+            self.hass,
+            self._runtime_entry([]),
+            self.coordinator,
+            devices,
+            None,
+        )
+        shadow.mode = self.const.FLOOR_MODE_ACTIVE
+        shadow._save = AsyncMock()
+
+        with patch.object(
+            self.module.persistent_notification,
+            "async_create",
+        ) as notify:
+            confirmed = await shadow._dispatch_offset(
+                now=self.now.astimezone(self.module.UTC),
+                previous=-2,
+                target=2,
+                baseline=-2,
+                phase="preheat",
+                restoring=False,
+            )
+
+        self.assertFalse(confirmed)
+        self.assertIsNone(shadow.state["pending_operation"])
+        self.assertIsNone(shadow.state["fault"])
+        self.assertIsNone(shadow.state["ownership"])
+        devices.control_daikin.assert_awaited_once()
+        notify.assert_not_called()
 
     async def test_mode_change_restores_exact_owned_baseline(self):
         self.hass.states.async_set(
@@ -951,6 +1057,94 @@ class FloorHeatingShadowTests(base.HAComponentTests):
             self.assertEqual(shadow.mode, self.const.FLOOR_MODE_ACTIVE)
             self.assertIn("uncertain outcome", shadow.state["fault"])
             self.assertEqual(shadow.decision.state, "fault")
+            devices.control_daikin.assert_not_awaited()
+        finally:
+            await shadow.async_stop()
+
+    async def test_revision_five_migration_preserves_owned_offset_for_review(self):
+        devices = SimpleNamespace(
+            get_daikin_status=AsyncMock(
+                return_value=self._runtime_status()
+            ),
+            control_daikin=AsyncMock(),
+        )
+        shadow = self.module.FloorHeatingShadow(
+            self.hass,
+            self._runtime_entry([]),
+            self.coordinator,
+            devices,
+            None,
+        )
+        stored = {
+            **shadow.state,
+            "policy_revision": 5,
+            "mode": self.const.FLOOR_MODE_ACTIVE,
+            "ownership": {
+                "baseline_offset": -2,
+                "target_offset": 2,
+                "phase": "preheat",
+                "acquired_at": self.now.isoformat(),
+                "updated_at": self.now.isoformat(),
+            },
+        }
+        shadow.store = SimpleNamespace(
+            async_load=AsyncMock(return_value=stored),
+            async_save=AsyncMock(),
+        )
+
+        await shadow.async_start()
+        try:
+            self.assertEqual(shadow.mode, self.const.FLOOR_MODE_SHADOW)
+            self.assertEqual(
+                shadow.state["ownership"]["target_offset"],
+                2,
+            )
+            self.assertIn(
+                "Ownership was preserved",
+                shadow.state["fault"],
+            )
+            devices.control_daikin.assert_not_awaited()
+        finally:
+            shadow.state["ownership"] = None
+            await shadow.async_stop()
+
+    async def test_revision_five_migration_preserves_pending_operation(self):
+        devices = SimpleNamespace(
+            get_daikin_status=AsyncMock(
+                return_value=self._runtime_status()
+            ),
+            control_daikin=AsyncMock(),
+        )
+        shadow = self.module.FloorHeatingShadow(
+            self.hass,
+            self._runtime_entry([]),
+            self.coordinator,
+            devices,
+            None,
+        )
+        pending = {
+            "previous_offset": -2,
+            "target_offset": 2,
+            "baseline_offset": -2,
+            "phase": "preheat",
+            "restoring": False,
+            "prepared_at": self.now.isoformat(),
+        }
+        shadow.store = SimpleNamespace(
+            async_load=AsyncMock(return_value={
+                **shadow.state,
+                "policy_revision": 5,
+                "mode": self.const.FLOOR_MODE_ACTIVE,
+                "pending_operation": pending,
+            }),
+            async_save=AsyncMock(),
+        )
+
+        await shadow.async_start()
+        try:
+            self.assertEqual(shadow.mode, self.const.FLOOR_MODE_SHADOW)
+            self.assertEqual(shadow.state["pending_operation"], pending)
+            self.assertIn("uncertain outcome", shadow.state["fault"])
             devices.control_daikin.assert_not_awaited()
         finally:
             await shadow.async_stop()

@@ -53,7 +53,7 @@ FORECAST_STALE_SECONDS = 3 * 60 * 60
 FORECAST_UPDATE_INTERVAL = timedelta(hours=1)
 ARCHIVE_RETENTION_DAYS = 90
 STORE_VERSION = 1
-ARCHIVE_SCHEMA_VERSION = 2
+ARCHIVE_SCHEMA_VERSION = 3
 STORE_KEY_SUFFIX = "price_forecast"
 HOUR = timedelta(hours=1)
 ARCHIVE_ORIGIN_OBSERVED = "observed_vintage"
@@ -329,6 +329,7 @@ class HouseholdPriceForecastCoordinator(
             private=True,
         )
         self.archive: dict[str, dict] = {}
+        self.official_schedules: dict[str, dict] = {}
         self.vintage_tracking_started_at: str | None = None
         self.refresh_error: str | None = None
 
@@ -341,7 +342,7 @@ class HouseholdPriceForecastCoordinator(
             LOGGER.warning("Stored household price forecasts are invalid; archive reset.")
             return
         schema_version = stored.get("schema_version", 1)
-        if schema_version not in (1, ARCHIVE_SCHEMA_VERSION):
+        if schema_version not in (1, 2, ARCHIVE_SCHEMA_VERSION):
             LOGGER.warning(
                 "Stored household price forecast schema %s is unsupported; "
                 "archive reset.",
@@ -365,21 +366,48 @@ class HouseholdPriceForecastCoordinator(
                         "Stored forecast records conflict for one issuance."
                     )
                 archive[key] = record
-            if schema_version == ARCHIVE_SCHEMA_VERSION:
-                tracking_started = _instant(
-                    stored.get("vintage_tracking_started_at"),
-                    "Stored vintage tracking timestamp",
+            if schema_version in (2, ARCHIVE_SCHEMA_VERSION):
+                stored_tracking = stored.get("vintage_tracking_started_at")
+                tracking_started = (
+                    _instant(
+                        stored_tracking,
+                        "Stored vintage tracking timestamp",
+                    )
+                    if stored_tracking is not None
+                    else None
                 )
             else:
                 tracking_started = dt_util.utcnow().astimezone(UTC)
+            schedules = {}
+            if schema_version == ARCHIVE_SCHEMA_VERSION:
+                stored_schedules = stored.get("official_schedules", [])
+                if not isinstance(stored_schedules, list):
+                    raise ForecastError(
+                        "Stored official price schedules must be an array."
+                    )
+                for item in stored_schedules:
+                    schedule = self._validated_official_schedule(item)
+                    delivery_date = schedule["delivery_date"]
+                    previous = schedules.get(delivery_date)
+                    if previous is not None and previous != schedule:
+                        raise ForecastError(
+                            "Stored official price schedules conflict for one "
+                            "delivery date."
+                        )
+                    schedules[delivery_date] = schedule
         except ForecastError as error:
             LOGGER.warning("Stored household price forecasts are invalid: %s", error)
             self.archive = {}
+            self.official_schedules = {}
             self.vintage_tracking_started_at = None
             return
         self.archive = archive
-        self.vintage_tracking_started_at = tracking_started.isoformat()
-        if schema_version == 1:
+        self.official_schedules = schedules
+        self.vintage_tracking_started_at = (
+            tracking_started.isoformat()
+            if tracking_started is not None else None
+        )
+        if schema_version != ARCHIVE_SCHEMA_VERSION:
             await self._save_archive()
 
     def _profile(self) -> PricingProfile:
@@ -547,11 +575,22 @@ class HouseholdPriceForecastCoordinator(
             key: evolution[key]
             for key in (
                 "delivery_date",
+                "horizons_included",
                 "retained_issuance_count",
                 "first_retained_issued_at",
                 "latest_retained_issued_at",
                 "tracking_active_for_full_horizon",
                 "contains_migrated_latest_only",
+                "expected_intervals",
+                "available_intervals",
+                "complete_delivery_coverage",
+                "partial_delivery_coverage",
+                "official_intervals",
+                "complete_official_coverage",
+                "partial_official_coverage",
+                "matched_intervals",
+                "complete_matched_coverage",
+                "partial_matched_coverage",
                 "comparison_intervals",
                 "first_retained_mae_eur_kwh",
                 "latest_retained_mae_eur_kwh",
@@ -607,10 +646,11 @@ class HouseholdPriceForecastCoordinator(
                 "record_count": len(self.archive),
                 "delivery_hour_count": self._delivery_hour_count(),
                 "migrated_latest_only_records": self._migrated_record_count(),
+                "official_schedule_count": len(self.official_schedules),
                 "vintage_tracking_started_at": self.vintage_tracking_started_at,
                 "sampling": (
-                    "All distinct provider issuances are retained per delivery "
-                    "hour and provider horizon day."
+                    "Distinct issuances observed by hourly polling are retained "
+                    "per delivery hour and provider horizon day."
                 ),
             },
             "warnings": warnings,
@@ -664,6 +704,107 @@ class HouseholdPriceForecastCoordinator(
             "archive_origin": origin,
         }
 
+    @staticmethod
+    def _validated_official_schedule(schedule: object) -> dict:
+        if not isinstance(schedule, dict):
+            raise ForecastError("Stored official price schedule must be an object")
+        delivery_text = schedule.get("delivery_date")
+        if not isinstance(delivery_text, str):
+            raise ForecastError(
+                "Stored official price delivery date must be an ISO date"
+            )
+        try:
+            delivery_day = date.fromisoformat(delivery_text)
+        except ValueError as error:
+            raise ForecastError(
+                "Stored official price delivery date must be an ISO date"
+            ) from error
+        start, end = market_bounds(delivery_day)
+        expected = int((end - start) / MARKET_INTERVAL)
+        stored_expected = schedule.get("expected_intervals")
+        if (
+            isinstance(stored_expected, bool)
+            or not isinstance(stored_expected, int)
+            or stored_expected != expected
+        ):
+            raise ForecastError(
+                "Stored official price interval count does not match the "
+                "Tallinn delivery day"
+            )
+        profile = {}
+        for key in ("profile_id", "profile_version", "profile_sha256"):
+            value = schedule.get(key)
+            if not isinstance(value, str) or not value:
+                raise ForecastError(
+                    "Stored official price schedule has invalid profile "
+                    "provenance"
+                )
+            profile[key] = value
+        rows = schedule.get("intervals")
+        if not isinstance(rows, list):
+            raise ForecastError(
+                "Stored official price schedule intervals must be an array"
+            )
+        intervals = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ForecastError(
+                    "Stored official price interval must be an object"
+                )
+            quarter = _instant(
+                row.get("start"),
+                "Stored official price start",
+            )
+            if (
+                not start <= quarter < end
+                or (quarter - start) % MARKET_INTERVAL != timedelta(0)
+            ):
+                raise ForecastError(
+                    "Stored official price is outside its Tallinn delivery day"
+                )
+            value = _decimal(
+                row.get("import_eur_kwh"),
+                "Stored official household price",
+            )
+            key = quarter.isoformat()
+            if key in intervals:
+                raise ForecastError(
+                    "Stored official price schedule contains duplicate quarters"
+                )
+            intervals[key] = {
+                "start": key,
+                "import_eur_kwh": format(value, "f"),
+            }
+        available = len(intervals)
+        if available > expected:
+            raise ForecastError(
+                "Stored official price schedule has too many intervals"
+            )
+        stored_available = schedule.get("available_intervals")
+        if (
+            isinstance(stored_available, bool)
+            or not isinstance(stored_available, int)
+            or stored_available != available
+        ):
+            raise ForecastError(
+                "Stored official price availability count is invalid"
+            )
+        complete = available == expected
+        if schedule.get("complete") is not complete:
+            raise ForecastError(
+                "Stored official price completeness flag is invalid"
+            )
+        return {
+            "delivery_date": delivery_day.isoformat(),
+            "expected_intervals": expected,
+            "available_intervals": available,
+            "complete": complete,
+            **profile,
+            "intervals": [
+                intervals[key] for key in sorted(intervals)
+            ],
+        }
+
     def _delivery_hour_count(self) -> int:
         return len({
             (record["start"], record["horizon_days"])
@@ -675,6 +816,97 @@ class HouseholdPriceForecastCoordinator(
             record["archive_origin"] == ARCHIVE_ORIGIN_MIGRATED
             for record in self.archive.values()
         )
+
+    def _official_schedule_from_window(
+        self,
+        snapshot: object,
+        window: object,
+    ) -> dict | None:
+        rows = [
+            {
+                "start": _instant(
+                    point.start,
+                    "Published price",
+                ).isoformat(),
+                "import_eur_kwh": format(
+                    _decimal(
+                        point.import_eur_kwh,
+                        "Published household price",
+                    ),
+                    "f",
+                ),
+            }
+            for point in window.prices
+        ]
+        if not rows:
+            return None
+        return self._validated_official_schedule({
+            "delivery_date": window.delivery_date,
+            "expected_intervals": window.expected_intervals,
+            "available_intervals": len(rows),
+            "complete": len(rows) == window.expected_intervals,
+            "profile_id": snapshot.profile_id,
+            "profile_version": snapshot.profile_version,
+            "profile_sha256": snapshot.profile_sha256,
+            "intervals": rows,
+        })
+
+    def _capture_official_schedules(self, now: datetime) -> bool:
+        changed = False
+        data = self.price_coordinator.data
+        if data is not None and data.contains(now):
+            for window in (data.today, data.tomorrow):
+                current = self._official_schedule_from_window(data, window)
+                if current is None:
+                    continue
+                previous = self.official_schedules.get(
+                    current["delivery_date"]
+                )
+                if (
+                    previous is not None
+                    and all(
+                        previous[key] == current[key]
+                        for key in (
+                            "profile_id",
+                            "profile_version",
+                            "profile_sha256",
+                        )
+                    )
+                ):
+                    merged = {
+                        row["start"]: row
+                        for row in previous["intervals"]
+                    }
+                    merged.update({
+                        row["start"]: row
+                        for row in current["intervals"]
+                    })
+                    current = self._validated_official_schedule({
+                        **current,
+                        "available_intervals": len(merged),
+                        "complete": (
+                            len(merged) == current["expected_intervals"]
+                        ),
+                        "intervals": list(merged.values()),
+                    })
+                if previous != current:
+                    self.official_schedules[
+                        current["delivery_date"]
+                    ] = current
+                    changed = True
+        earliest_day = (
+            now.astimezone(TALLINN).date()
+            - timedelta(days=ARCHIVE_RETENTION_DAYS)
+        )
+        expired = [
+            delivery_date
+            for delivery_date in self.official_schedules
+            if date.fromisoformat(delivery_date) < earliest_day
+        ]
+        for delivery_date in expired:
+            del self.official_schedules[delivery_date]
+            changed = True
+        return changed
 
     def _record_report(self, report: ForecastReport, now: datetime) -> bool:
         changed = False
@@ -737,16 +969,22 @@ class HouseholdPriceForecastCoordinator(
                     record["horizon_days"],
                     record["issued_at"],
                 ),
-            )
+            ),
+            "official_schedules": [
+                self.official_schedules[key]
+                for key in sorted(self.official_schedules)
+            ],
         })
 
     async def _async_update_data(self) -> HouseholdPriceForecast:
         now = dt_util.utcnow().astimezone(UTC)
+        schedules_changed = self._capture_official_schedules(now)
         try:
             profile, report, accuracy, accuracy_error = (
                 await self.hass.async_add_executor_job(self._fetch_inputs)
             )
-            if self._record_report(report, now):
+            archive_changed = self._record_report(report, now)
+            if archive_changed or schedules_changed:
                 await self._save_archive()
             published = self._published_prices(now)
             result = await self.hass.async_add_executor_job(
@@ -759,10 +997,15 @@ class HouseholdPriceForecastCoordinator(
                 published,
             )
             result.response["archive"]["record_count"] = len(self.archive)
+            result.response["archive"]["official_schedule_count"] = len(
+                self.official_schedules
+            )
             result.attributes["archive"] = result.response["archive"]
             self.refresh_error = None
             return result
         except (ForecastError, PricingError) as error:
+            if schedules_changed:
+                await self._save_archive()
             self.refresh_error = str(error)
             raise UpdateFailed(str(error)) from error
 
@@ -877,11 +1120,12 @@ class HouseholdPriceForecastCoordinator(
                 "record_count": len(self.archive),
                 "delivery_hour_count": self._delivery_hour_count(),
                 "migrated_latest_only_records": self._migrated_record_count(),
+                "official_schedule_count": len(self.official_schedules),
                 "vintage_tracking_started_at": self.vintage_tracking_started_at,
                 "sampling": (
                     "The latest retained issuance is selected per delivery hour "
                     "and provider horizon day. Use the evolution view for all "
-                    "retained vintages."
+                    "distinct issuances observed by hourly polling."
                 ),
             },
         }
@@ -895,16 +1139,30 @@ class HouseholdPriceForecastCoordinator(
         include_future_days: int,
         delivery_date: date | None,
         published_prices: dict[datetime, str] | None = None,
+        all_horizons: bool = False,
+        official_schedules: dict[str, dict] | None = None,
     ) -> dict:
         local_today = now.astimezone(TALLINN).date()
         earliest_day = local_today - timedelta(days=history_days)
         latest_day = local_today + timedelta(days=include_future_days)
+        if all_horizons and delivery_date is None:
+            raise ForecastError(
+                "Choose one delivery date when requesting all forecast "
+                "horizons."
+            )
+
+        def record_matches_horizon(record: dict) -> bool:
+            return (
+                all_horizons
+                or record["horizon_days"] == horizon_days
+            )
+
         available_days = sorted({
             _instant(record["start"], "Stored forecast start")
             .astimezone(TALLINN)
             .date()
             for record in self.archive.values()
-            if record["horizon_days"] == horizon_days
+            if record_matches_horizon(record)
             and earliest_day
             <= _instant(record["start"], "Stored forecast start")
             .astimezone(TALLINN)
@@ -925,12 +1183,87 @@ class HouseholdPriceForecastCoordinator(
             selected_records = [
                 record
                 for record in self.archive.values()
-                if record["horizon_days"] == horizon_days
+                if record_matches_horizon(record)
                 and _instant(record["start"], "Stored forecast start")
                 .astimezone(TALLINN)
                 .date()
                 == selected_day
             ]
+        horizons_included = sorted({
+            record["horizon_days"] for record in selected_records
+        })
+
+        expected_intervals = 0
+        selected_start = None
+        selected_end = None
+        if selected_day is not None:
+            selected_start, selected_end = market_bounds(selected_day)
+            expected_intervals = int(
+                (selected_end - selected_start) / MARKET_INTERVAL
+            )
+
+        official_schedule = None
+        if selected_day is not None and official_schedules is not None:
+            stored_schedule = official_schedules.get(
+                selected_day.isoformat()
+            )
+            if stored_schedule is not None:
+                official_schedule = self._validated_official_schedule(
+                    stored_schedule
+                )
+        official_prices: dict[datetime, Decimal] = {}
+        official_profile_matches: bool | None = None
+        if official_schedule is not None:
+            official_profile_matches = (
+                official_schedule["profile_id"] == profile.id
+                and official_schedule["profile_version"] == profile.version
+                and official_schedule["profile_sha256"] == profile.sha256
+            )
+            if official_profile_matches:
+                official_prices = {
+                    _instant(
+                        row["start"],
+                        "Stored official price start",
+                    ): _decimal(
+                        row["import_eur_kwh"],
+                        "Stored official household price",
+                    )
+                    for row in official_schedule["intervals"]
+                }
+        elif (
+            selected_start is not None
+            and selected_end is not None
+            and published_prices is not None
+        ):
+            official_prices = {
+                instant.astimezone(UTC): _decimal(
+                    value,
+                    "Published household price",
+                )
+                for instant, value in published_prices.items()
+                if selected_start <= instant.astimezone(UTC) < selected_end
+            }
+            official_profile_matches = True
+            official_schedule = {
+                "delivery_date": selected_day.isoformat(),
+                "expected_intervals": expected_intervals,
+                "available_intervals": len(official_prices),
+                "complete": (
+                    expected_intervals > 0
+                    and len(official_prices) == expected_intervals
+                ),
+                "profile_id": profile.id,
+                "profile_version": profile.version,
+                "profile_sha256": profile.sha256,
+                "intervals": [
+                    {
+                        "start": instant.isoformat(),
+                        "import_eur_kwh": format(value, "f"),
+                    }
+                    for instant, value in sorted(official_prices.items())
+                ],
+            }
+
         by_start: dict[str, list[dict]] = {}
         for record in selected_records:
             by_start.setdefault(record["start"], []).append(record)
@@ -941,7 +1274,13 @@ class HouseholdPriceForecastCoordinator(
             start = _instant(start_text, "Stored forecast start")
             records = sorted(
                 by_start[start_text],
-                key=lambda item: item["issued_at"],
+                key=lambda item: (
+                    _instant(
+                        item["issued_at"],
+                        "Stored forecast issuance",
+                    ),
+                    -item["horizon_days"],
+                ),
             )
             for index in range(4):
                 quarter = start + index * MARKET_INTERVAL
@@ -964,6 +1303,7 @@ class HouseholdPriceForecastCoordinator(
                             record["model_trained_at"],
                             "Stored forecast model timestamp",
                         ).astimezone(TALLINN).isoformat(),
+                        "horizon_days": record["horizon_days"],
                         "archive_origin": record["archive_origin"],
                         "prediction": {
                             "p10_spot_eur_mwh": format(
@@ -1000,22 +1340,20 @@ class HouseholdPriceForecastCoordinator(
                     "end": (
                         quarter + MARKET_INTERVAL
                     ).astimezone(TALLINN).isoformat(),
-                    "horizon_days": horizon_days,
+                    "horizon_days": (
+                        None if all_horizons else horizon_days
+                    ),
+                    "horizons_included": sorted({
+                        vintage["horizon_days"]
+                        for vintage in vintages
+                    }),
                     "revision_count": len(vintages),
                     "first_retained": vintages[0],
                     "latest_retained": vintages[-1],
                     "vintages": vintages,
                 })
-                published = (
-                    published_prices.get(quarter)
-                    if published_prices is not None
-                    else None
-                )
-                if published is not None:
-                    official = _decimal(
-                        published,
-                        "Published household price",
-                    )
+                official = official_prices.get(quarter)
+                if official is not None:
                     first_value = _decimal(
                         vintages[0]["prediction"]["p50_import_eur_kwh"],
                         "First retained household forecast",
@@ -1045,74 +1383,263 @@ class HouseholdPriceForecastCoordinator(
                         "latest_retained_error_eur_kwh": None,
                     })
 
-        issuances: dict[str, dict] = {}
+        issuance_groups: dict[tuple[datetime, int], dict] = {}
         for record in selected_records:
-            issued_at = _instant(
+            issued_utc = _instant(
                 record["issued_at"],
                 "Stored forecast issuance",
-            ).astimezone(TALLINN).isoformat()
-            item = issuances.setdefault(
-                issued_at,
+            )
+            key = (issued_utc, record["horizon_days"])
+            item = issuance_groups.setdefault(
+                key,
                 {
-                    "issued_at": issued_at,
+                    "issued_at": issued_utc.astimezone(
+                        TALLINN
+                    ).isoformat(),
                     "model_trained_at": _instant(
                         record["model_trained_at"],
                         "Stored forecast model timestamp",
                     ).astimezone(TALLINN).isoformat(),
-                    "delivery_hours": 0,
-                    "delivery_intervals": 0,
-                    "contains_migrated_latest_only": False,
+                    "horizon_days": record["horizon_days"],
+                    "records": [],
+                    "archive_origins": set(),
                 },
             )
-            item["delivery_hours"] += 1
-            item["delivery_intervals"] += 4
-            item["contains_migrated_latest_only"] = (
-                item["contains_migrated_latest_only"]
-                or record["archive_origin"] == ARCHIVE_ORIGIN_MIGRATED
+            item["records"].append(record)
+            item["archive_origins"].add(record["archive_origin"])
+
+        ordered_groups = [
+            issuance_groups[key]
+            for key in sorted(
+                issuance_groups,
+                key=lambda item: (item[0], -item[1]),
             )
+        ]
+        tracking_started = (
+            _instant(
+                self.vintage_tracking_started_at,
+                "Vintage tracking timestamp",
+            )
+            if self.vintage_tracking_started_at is not None
+            else None
+        )
+        matched_sets = []
+        for item in ordered_groups:
+            predictions = {}
+            for record in item["records"]:
+                start = _instant(
+                    record["start"],
+                    "Stored forecast start",
+                )
+                raw_p50 = _decimal(
+                    record["p50_spot_eur_mwh"],
+                    "Stored forecast p50",
+                )
+                for index in range(4):
+                    quarter = start + index * MARKET_INTERVAL
+                    value = _decimal(
+                        forecast_import_eur_kwh(
+                            profile,
+                            raw_p50,
+                            quarter,
+                        ),
+                        "Retained household forecast",
+                    )
+                    previous = predictions.get(quarter)
+                    if previous is not None and previous != value:
+                        raise ForecastError(
+                            "One retained issuance conflicts for a delivery "
+                            "quarter."
+                        )
+                    predictions[quarter] = value
+            item["predictions"] = predictions
+            matched = set(predictions) & set(official_prices)
+            item["matched"] = matched
+            matched_sets.append(matched)
+            if selected_day is not None and tracking_started is not None:
+                required_start, _ = market_bounds(
+                    selected_day - timedelta(
+                        days=item["horizon_days"]
+                    )
+                )
+                item["tracking_active_for_full_horizon"] = (
+                    tracking_started <= required_start
+                )
+            else:
+                item["tracking_active_for_full_horizon"] = False
+
+        common_matched = (
+            set.intersection(*matched_sets)
+            if matched_sets else set()
+        )
+        issuance_metrics = []
+        ordered_issuances = []
+        previous_mae_value = None
+        for item in ordered_groups:
+            origins = sorted(item["archive_origins"])
+            contains_migrated_item = (
+                ARCHIVE_ORIGIN_MIGRATED in item["archive_origins"]
+            )
+            archive_origin = (
+                origins[0] if len(origins) == 1 else "mixed"
+            )
+            errors = [
+                item["predictions"][quarter]
+                - official_prices[quarter]
+                for quarter in sorted(common_matched)
+            ]
+            mae_value = None
+            bias_value = None
+            if errors:
+                with localcontext() as context:
+                    context.prec = 80
+                    mae_value = (
+                        sum(
+                            (abs(error) for error in errors),
+                            Decimal(0),
+                        )
+                        / len(errors)
+                    )
+                    bias_value = sum(
+                        errors,
+                        Decimal(0),
+                    ) / len(errors)
+            movement_vs_previous = "unavailable"
+            mae_change_vs_previous = None
+            if (
+                previous_mae_value is not None
+                and mae_value is not None
+            ):
+                mae_change_vs_previous = (
+                    mae_value - previous_mae_value
+                )
+                if mae_value < previous_mae_value:
+                    movement_vs_previous = "improved"
+                elif mae_value > previous_mae_value:
+                    movement_vs_previous = "worsened"
+                else:
+                    movement_vs_previous = "unchanged"
+            metric = {
+                "issued_at": item["issued_at"],
+                "model_trained_at": item["model_trained_at"],
+                "horizon_days": item["horizon_days"],
+                "archive_origin": archive_origin,
+                "archive_origins": origins,
+                "contains_migrated_latest_only": contains_migrated_item,
+                "tracking_active_for_full_horizon": (
+                    item["tracking_active_for_full_horizon"]
+                ),
+                "partial_history": (
+                    contains_migrated_item
+                    or not item["tracking_active_for_full_horizon"]
+                ),
+                "available_intervals": len(item["predictions"]),
+                "matched_intervals": len(item["matched"]),
+                "common_coverage_matched_intervals": len(
+                    common_matched
+                ),
+                "complete_delivery_coverage": (
+                    expected_intervals > 0
+                    and len(item["predictions"]) == expected_intervals
+                ),
+                "partial_delivery_coverage": (
+                    len(item["predictions"]) > 0
+                    and len(item["predictions"]) != expected_intervals
+                ),
+                "complete_matched_coverage": (
+                    expected_intervals > 0
+                    and len(item["matched"]) == expected_intervals
+                ),
+                "partial_matched_coverage": (
+                    len(item["matched"]) > 0
+                    and len(item["matched"]) != expected_intervals
+                ),
+                "mae_eur_kwh": (
+                    format(mae_value, "f")
+                    if mae_value is not None else None
+                ),
+                "bias_eur_kwh": (
+                    format(bias_value, "f")
+                    if bias_value is not None else None
+                ),
+                "mae_change_vs_previous_eur_kwh": (
+                    format(mae_change_vs_previous, "f")
+                    if mae_change_vs_previous is not None else None
+                ),
+                "movement_vs_previous": movement_vs_previous,
+            }
+            issuance_metrics.append(metric)
+            ordered_issuances.append({
+                "issued_at": item["issued_at"],
+                "model_trained_at": item["model_trained_at"],
+                "horizon_days": item["horizon_days"],
+                "archive_origin": archive_origin,
+                "archive_origins": origins,
+                "delivery_hours": len(item["records"]),
+                "delivery_intervals": len(item["predictions"]),
+                "contains_migrated_latest_only": contains_migrated_item,
+                "partial_history": metric["partial_history"],
+            })
+            previous_mae_value = mae_value
 
         contains_migrated = any(
             record["archive_origin"] == ARCHIVE_ORIGIN_MIGRATED
             for record in selected_records
         )
-        tracking_active_for_full_horizon = False
-        if (
-            selected_day is not None
-            and self.vintage_tracking_started_at is not None
-        ):
-            tracking_required_start, _ = market_bounds(
-                selected_day - timedelta(days=horizon_days)
+        tracking_active_for_full_horizon = (
+            bool(ordered_groups)
+            and all(
+                item["tracking_active_for_full_horizon"]
+                for item in ordered_groups
             )
-            tracking_active_for_full_horizon = (
-                _instant(
-                    self.vintage_tracking_started_at,
-                    "Vintage tracking timestamp",
-                )
-                <= tracking_required_start
-            )
-        expected_intervals = 0
-        if selected_day is not None:
-            selected_start, selected_end = market_bounds(selected_day)
-            expected_intervals = int(
-                (selected_end - selected_start) / MARKET_INTERVAL
-            )
+        )
         warnings = []
         if selected_day is None or not selected_records:
             warnings.append(
                 "No retained forecast vintages match the requested delivery date "
-                "and horizon."
+                + (
+                    "and horizons."
+                    if all_horizons else "and horizon."
+                )
             )
         if contains_migrated:
             warnings.append(
-                "Older forecast revisions were overwritten before vintage "
-                "tracking was enabled; the first retained value is not the "
-                "original provider issuance."
+                "Migrated latest-only records are partial history; the earliest "
+                "retained value is not guaranteed to be the provider's first "
+                "issuance."
             )
         if selected_records and not tracking_active_for_full_horizon:
+            if all_horizons:
+                incomplete_horizons = sorted({
+                    item["horizon_days"]
+                    for item in ordered_groups
+                    if not item["tracking_active_for_full_horizon"]
+                })
+                warnings.append(
+                    "Vintage tracking was not active for every complete "
+                    "capture window at horizons {}; first retained values are "
+                    "only the earliest available records.".format(
+                        ", ".join(
+                            "D-{}".format(item)
+                            for item in incomplete_horizons
+                        )
+                    )
+                )
+            else:
+                warnings.append(
+                    "Vintage tracking was not active for the complete D-{} "
+                    "capture window; the first retained value is only the "
+                    "earliest available record.".format(horizon_days)
+                )
+        if official_profile_matches is False:
             warnings.append(
-                "Vintage tracking was not active for the complete D-{} capture "
-                "window; the first retained value is only the earliest available "
-                "record.".format(horizon_days)
+                "The retained official schedule uses a different pricing "
+                "profile, so no household-price comparison is reported."
+            )
+        if len(ordered_groups) > 1 and not common_matched:
+            warnings.append(
+                "Retained issuances have no common published-price coverage; "
+                "issuance movement is unavailable."
             )
 
         first_mae = None
@@ -1159,11 +1686,26 @@ class HouseholdPriceForecastCoordinator(
             else:
                 movement = "unchanged"
 
-        ordered_issuances = [
-            issuances[key] for key in sorted(issuances)
-        ]
+        available_intervals = len(points)
+        official_intervals = (
+            official_schedule["available_intervals"]
+            if official_schedule is not None else 0
+        )
+        matched_intervals = len(comparisons)
+        complete_delivery_coverage = (
+            expected_intervals > 0
+            and available_intervals == expected_intervals
+        )
+        complete_official_coverage = (
+            expected_intervals > 0
+            and official_intervals == expected_intervals
+        )
+        complete_matched_coverage = (
+            expected_intervals > 0
+            and matched_intervals == expected_intervals
+        )
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "view": "evolution",
             "source": FORECAST_URL,
             "advisory_only": True,
@@ -1174,7 +1716,11 @@ class HouseholdPriceForecastCoordinator(
             "forecast_basis": "raw_wholesale_p10_p50_p90_plus_household_tariff",
             "fixed_fees": "excluded",
             "history_days": history_days,
-            "horizon_days": horizon_days,
+            "horizon_days": (
+                None if all_horizons else horizon_days
+            ),
+            "all_horizons": all_horizons,
+            "horizons_included": horizons_included,
             "include_future_days": include_future_days,
             "delivery_date": (
                 selected_day.isoformat() if selected_day is not None else None
@@ -1184,10 +1730,25 @@ class HouseholdPriceForecastCoordinator(
             ],
             "as_of": now.astimezone(TALLINN).isoformat(),
             "expected_intervals": expected_intervals,
-            "available_intervals": len(points),
-            "complete_delivery_coverage": (
-                expected_intervals > 0 and len(points) == expected_intervals
+            "available_intervals": available_intervals,
+            "complete_delivery_coverage": complete_delivery_coverage,
+            "partial_delivery_coverage": (
+                available_intervals > 0
+                and not complete_delivery_coverage
             ),
+            "official_intervals": official_intervals,
+            "complete_official_coverage": complete_official_coverage,
+            "partial_official_coverage": (
+                official_intervals > 0
+                and not complete_official_coverage
+            ),
+            "matched_intervals": matched_intervals,
+            "complete_matched_coverage": complete_matched_coverage,
+            "partial_matched_coverage": (
+                matched_intervals > 0
+                and not complete_matched_coverage
+            ),
+            "common_coverage_matched_intervals": len(common_matched),
             "retained_issuance_count": len(ordered_issuances),
             "first_retained_issued_at": (
                 ordered_issuances[0]["issued_at"]
@@ -1202,7 +1763,7 @@ class HouseholdPriceForecastCoordinator(
                 tracking_active_for_full_horizon
             ),
             "contains_migrated_latest_only": contains_migrated,
-            "comparison_intervals": len(comparisons),
+            "comparison_intervals": matched_intervals,
             "first_retained_mae_eur_kwh": first_mae,
             "latest_retained_mae_eur_kwh": latest_mae,
             "first_retained_bias_eur_kwh": first_bias,
@@ -1213,17 +1774,44 @@ class HouseholdPriceForecastCoordinator(
             "worsened_intervals": worsened_intervals,
             "unchanged_intervals": unchanged_intervals,
             "issuances": ordered_issuances,
+            "issuance_metrics": issuance_metrics,
             "intervals": points,
             "profile_id": profile.id,
             "profile_version": profile.version,
             "profile_sha256": profile.sha256,
+            "official_schedule": {
+                "source": "Home Assistant Nord Pool EE/EUR",
+                "delivery_date": (
+                    selected_day.isoformat()
+                    if selected_day is not None else None
+                ),
+                "expected_intervals": expected_intervals,
+                "available_intervals": official_intervals,
+                "complete": complete_official_coverage,
+                "profile_id": (
+                    official_schedule["profile_id"]
+                    if official_schedule is not None else None
+                ),
+                "profile_version": (
+                    official_schedule["profile_version"]
+                    if official_schedule is not None else None
+                ),
+                "profile_sha256": (
+                    official_schedule["profile_sha256"]
+                    if official_schedule is not None else None
+                ),
+                "profile_matches_forecast_profile": (
+                    official_profile_matches
+                ),
+            },
             "archive": {
                 "retention_days": ARCHIVE_RETENTION_DAYS,
                 "record_count": len(self.archive),
                 "delivery_hour_count": self._delivery_hour_count(),
                 "migrated_latest_only_records": self._migrated_record_count(),
+                "official_schedule_count": len(self.official_schedules),
                 "sampling": (
-                    "All distinct provider issuances are returned "
+                    "Distinct issuances observed by hourly polling are returned "
                     "chronologically per delivery hour and provider horizon day."
                 ),
             },
@@ -1237,7 +1825,12 @@ class HouseholdPriceForecastCoordinator(
         horizon_days: int,
         include_future_days: int = 0,
         delivery_date: date | None = None,
+        all_horizons: bool = False,
     ) -> dict:
+        if all_horizons and view != "evolution":
+            raise ServiceValidationError(
+                "all_horizons is available only for the evolution view."
+            )
         if view == "current":
             if self.data is None:
                 await self.async_request_refresh()
@@ -1276,12 +1869,21 @@ class HouseholdPriceForecastCoordinator(
                     "shown explicitly: " + self.refresh_error
                 )
             response["archive"]["record_count"] = len(self.archive)
+            response["archive"]["official_schedule_count"] = len(
+                self.official_schedules
+            )
             return response
         if view not in ("archive", "evolution"):
             raise ServiceValidationError(
                 "Choose current, archive, or evolution forecast view."
             )
         try:
+            now = dt_util.utcnow().astimezone(UTC)
+            if (
+                view == "evolution"
+                and self._capture_official_schedules(now)
+            ):
+                await self._save_archive()
             profile = await self.hass.async_add_executor_job(self._profile)
             response_method = (
                 self._archive_response
@@ -1290,7 +1892,7 @@ class HouseholdPriceForecastCoordinator(
             )
             arguments = [
                 profile,
-                dt_util.utcnow().astimezone(UTC),
+                now,
                 history_days,
                 horizon_days,
                 include_future_days,
@@ -1298,7 +1900,9 @@ class HouseholdPriceForecastCoordinator(
             if view == "evolution":
                 arguments.extend([
                     delivery_date,
-                    self._published_prices(dt_util.utcnow().astimezone(UTC)),
+                    None,
+                    all_horizons,
+                    copy.deepcopy(self.official_schedules),
                 ])
             return await self.hass.async_add_executor_job(
                 response_method,

@@ -26,8 +26,7 @@ MODE_LABELS = {
     "paused": "Paused",
     "shadow": "Shadow (no writes)",
     "readiness_pilot": "Readiness pilot (55→50°C)",
-    "safe_target_shift": "Safe target shift",
-    "soft_standby": "Soft standby (30°C)",
+    "safe_target_shift": "Price shift (55/45/50°C)",
 }
 LABEL_MODES = {label: mode for mode, label in MODE_LABELS.items()}
 EXTREME_MODE_LABELS = {

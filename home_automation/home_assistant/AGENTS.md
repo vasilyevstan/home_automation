@@ -46,8 +46,13 @@
   publication is unavailable, never zero.
 - Keep the backward-compatible `archive` response latest-only per delivery
   hour. Use the bounded one-delivery-day `evolution` response for chronological
-  vintages, and label its first value as original only when tracking covered
-  the complete requested horizon and no migrated latest-only record is present.
+  vintages. Preserve the default single-horizon contract; `all_horizons: true`
+  combines D-1 through D-7 and reports the actual horizons included. Compute
+  per-issuance MAE, signed bias and movement only over the profile-compatible
+  quarter intersection shared by every retained issuance and the canonical
+  published schedule. Keep partial coverage and migrated evidence explicit.
+  Retain published schedules for 90 days with profile provenance; never insert
+  zero or forecast fallbacks.
 - Forecasts, p10-p90 bands and provider accuracy are advisory evidence. They
   cannot authorize heating writes, finalize bills, prove savings, or be exposed
   through an unauthenticated application endpoint. Keep the detailed payload in
@@ -65,30 +70,34 @@
   all-in price snapshot and the same shared guarded `EnergyDevices` instance.
   Default to shadow with zero writes; never let installation, setup, status
   reads, or option saves promote it.
-- Preserve the 07:00/21:00 readiness, 30/45/50/55°C ordering, native target
-  range/step validation, complete published-price requirement, sign-safe
-  absolute/relative price gate, four-hour lease, and ownership-aware restore.
+- Preserve the 07:00/21:00 readiness, manual native 30°C capability, automatic
+  45/50/55°C policy, native target range/step validation, complete
+  published-price requirement, sign-safe absolute/relative price gate, and
+  ownership-aware restore.
   Anchor one cheap and comparison block per readiness cycle; require a material
   all-in-price advantage before price-driven 55°C preheat. The separately
   selected readiness pilot may request 55°C only inside the final conservative
   heating allowance while measured tank temperature is below 50°C, must restore
-  50°C immediately when readiness is measured, and must never use 45°C coast or
-  30°C soft standby. Missing data and comfort/readiness recovery override
-  optimization. Keep recovery latched through measured 50°C,
+  50°C immediately when readiness is measured, and must never use 45°C coast.
+  Hold 50°C for two hours after both readiness deadlines; after delivery,
+  normally re-arm at 48°C and allow only one final top-up inside the last
+  45 minutes. Missing data and comfort/readiness recovery override optimization.
+  Keep recovery latched through measured 50°C,
   persist successful 50°C completion for the anchored plan so later sensor
   rounding cannot restart post-window recovery, use minimum dwell for ordinary
-  price-driven transitions, and reset promotion evidence whenever a policy
+  price-driven transitions, keep readiness evidence provisional for the
+  15-minute post-deadline observation window, learn deep-recovery and shallow
+  top-up durations separately, and reset promotion evidence whenever a policy
   revision changes those behaviors.
-- Treat 30°C as explicitly promoted soft standby, not a comfort or hygiene
-  setting. Keep the circuit enabled, never actively cool, never use boost, and
-  never hide the HA-outage residual risk. Native DHW standby/off remains out of
-  scope unless a later task supplies new evidence and policy.
+- Never select 30°C automatically or expose it as an optimizer mode. Preserve
+  it only as an explicit guarded native target. Native DHW standby/off remains
+  out of scope unless a later task supplies new evidence and policy.
 - Preserve the evidence-gated DHW promotion path, but permit a separately
   recorded owner-approved early activation when the owner explicitly requests
   full control. Do not synthesize qualification days, cycles, checks or writes.
-  Early activation changes authority only; every comfort/readiness exit,
-  four-hour lease, exact expected-previous check, manufacturer guard, ownership
-  rule and uncertain-command latch remains mandatory.
+  Early activation changes authority only; every comfort/readiness exit, exact
+  expected-previous check, manufacturer guard, ownership rule and
+  uncertain-command latch remains mandatory.
 - Manual/manufacturer changes, powerful/hygiene-like operation, safety flags,
   circuit standby, weather-dependent control, and configured/effective target
   mismatch suspend optimizer ownership. An uncertain write latches fault and
@@ -101,7 +110,7 @@
   or while a published hard-stop quarter is active.
 - Keep the floor-heating optimizer separate from DHW counters and default it to
   zero-write Shadow. The native LWT offset range is -10°C to +10°C, but
-  capability is not permission: revision 5 applies one
+  capability is not permission: revision 6 applies one
   relative 4°C overlay to the fresh native offset, bounded to -6°C through
   +4°C. At or above 21°C preserve the native offset instead of adding heat; at
   or below 20°C remove a negative offset without lowering an already warmer
@@ -109,14 +118,18 @@
   92/96/100-quarter boundaries; preserve a validated anchored pair until its
   peak ends. Require complete candidate-day all-in prices, the comfort guard,
   useful heating conditions and DHW compressor priority. Reset floor evidence
-  when this numerical policy changes and require five clean revision-5 cycles
+  when this numerical policy changes and require five clean revision-6 cycles
   before evidence-gated promotion. A separately recorded, explicit owner
   approval may activate the pilot earlier without marking that evidence passed.
-- In active floor mode, capture one fresh baseline before the first offset
+- In active floor mode, accept -2°C and 0°C as the initial native schedule
+  baselines and capture one fresh baseline before the first offset
   action, keep the owned target stable across evaluations, and restore the
   exact baseline only while current state still matches ownership. Bind every
-  dispatch to exact expected previous state and native read-back. External
-  changes cancel ownership and return to Shadow. Persist a pending operation
+  dispatch to exact expected previous state and native read-back. An accepted
+  native schedule transition while an overlay is owned releases ownership,
+  preserves the new baseline, contaminates that candidate and holds Active
+  without reapplication until the current price window ends. Unexpected or
+  unstable changes return to Shadow. Persist a pending operation
   before dispatch; any post-dispatch error faults and requires fresh-state
   reconciliation without automatic retry, inversion or rollback.
 - Use only explicitly configured, fresh occupied-room temperature entities for
@@ -205,11 +218,14 @@
   replay, elevated write capability, bound identity/Pmax, mode-preserving cap
   calculation and two stable unrestricted observations are complete; passing
   gates never selects Armed automatically.
-- Solar policy revision 1 uses exact current `export_earnings_eur_kwh`: Shadow
+- Solar policy revision 2 uses exact current `export_earnings_eur_kwh`: Shadow
   opportunity is below zero, while Armed entry is at or below -€0.010/kWh.
   Require a known contiguous negative block with at least 30 minutes remaining,
-  matching configured/active unrestricted 100% or Pmax, fresh AC active power
-  of at least 5,000 W twice at least 30 seconds apart, and a 60-second dwell.
+  matching configured/active unrestricted 100% or Pmax, `sun.sun` above the
+  horizon, fresh AC active power of at least 5,000 W twice at least 30 seconds
+  apart, and a 60-second dwell. Apply the same daylight/output gate to new
+  commissioning evidence and reset qualification immediately when either gate
+  fails.
   Preserve the current percentage/watt mode and apply at most a native-step
   4,000 W-equivalent cap. Never change inverter mode automatically.
 - Persist versioned solar state before and after dispatch through an

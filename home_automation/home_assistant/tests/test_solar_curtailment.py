@@ -31,6 +31,7 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
         self.runtime_now = datetime(
             2026, 10, 19, 8, 0, tzinfo=timezone.utc
         )
+        self.hass.states.async_set("sun.sun", "above_horizon")
         self.status = {
             "config_entry_id": "solar-entry",
             "serial": "synthetic-inverter",
@@ -329,6 +330,117 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
             controller.attributes["requested_limit_equivalent_w"],
             4000.0,
         )
+        self.assertTrue(controller.attributes["daylight_gate_passed"])
+        self.assertFalse(controller.attributes["acquisition_allowed"])
+
+    async def test_daylight_and_output_reset_acquisition_qualification(self):
+        controller = self.controller()
+        controller.mode = self.const.SOLAR_CURTAILMENT_MODE_ARMED
+        self.commission(controller)
+        self.coordinator.data = self.snapshot(
+            ["0.01", "-0.02", "-0.02", "-0.02", "0.01"]
+        )
+        start = self.runtime_now
+        self.hass.states.async_set("sun.sun", "below_horizon")
+        for seconds in (0, 30, 60):
+            await self.evaluate(
+                controller, start + timedelta(seconds=seconds)
+            )
+        self.assertEqual(controller.decision.state, "qualifying")
+        self.assertIn("above the horizon", controller.decision.reason)
+        self.assertIsNone(controller.state["qualification"])
+        self.devices.set_solar_limit.assert_not_awaited()
+
+        self.hass.states.async_set("sun.sun", "above_horizon")
+        await self.evaluate(controller, start + timedelta(seconds=90))
+        self.assertEqual(controller.decision.state, "qualifying")
+        self.assertEqual(
+            controller.state["qualification"]["sample_count"],
+            1,
+        )
+        self.status["active_power_w"] = 1000
+        await self.evaluate(controller, start + timedelta(seconds=120))
+        self.assertIsNone(controller.state["qualification"])
+        self.devices.set_solar_limit.assert_not_awaited()
+
+    def test_commissioning_stability_requires_daylight_output_and_full_dwell(self):
+        controller = self.controller()
+        self.hass.states.async_set("sun.sun", "below_horizon")
+        controller._update_commissioning_observation(
+            deepcopy(self.status),
+            self.runtime_now,
+        )
+        self.assertFalse(
+            controller.state["commissioning"][
+                "stable_unrestricted_verified"
+            ]
+        )
+
+        self.hass.states.async_set("sun.sun", "above_horizon")
+        for seconds in (0, 30):
+            status = deepcopy(self.status)
+            status["active_power_observed_at"] = (
+                self.runtime_now + timedelta(seconds=seconds)
+            ).isoformat()
+            controller._update_commissioning_observation(
+                status,
+                self.runtime_now + timedelta(seconds=seconds),
+            )
+        self.assertFalse(
+            controller.state["commissioning"][
+                "stable_unrestricted_verified"
+            ]
+        )
+        status = deepcopy(self.status)
+        status["active_power_observed_at"] = (
+            self.runtime_now + timedelta(seconds=60)
+        ).isoformat()
+        controller._update_commissioning_observation(
+            status,
+            self.runtime_now + timedelta(seconds=60),
+        )
+        self.assertTrue(
+            controller.state["commissioning"][
+                "stable_unrestricted_verified"
+            ]
+        )
+
+    async def test_revision_one_migration_requalifies_daylight_commissioning(self):
+        controller = self.controller()
+        self.commission(controller)
+        stored = {
+            "mode": self.const.SOLAR_CURTAILMENT_MODE_ARMED,
+            **deepcopy(controller.state),
+            "policy_revision": 1,
+        }
+        controller.state_file = SimpleNamespace(
+            async_load=AsyncMock(return_value=stored),
+            async_save=AsyncMock(),
+        )
+        controller.store = SimpleNamespace(
+            async_load=AsyncMock(return_value=None),
+        )
+        controller.async_evaluate = AsyncMock()
+
+        await controller.async_start()
+        try:
+            self.assertEqual(
+                controller.mode,
+                self.const.SOLAR_CURTAILMENT_MODE_SHADOW,
+            )
+            commissioning = controller.state["commissioning"]
+            self.assertFalse(
+                commissioning["stable_unrestricted_verified"]
+            )
+            self.assertIsNone(commissioning["stable_observation"])
+            self.assertEqual(
+                commissioning["daylight_state"],
+                "above_horizon",
+            )
+            self.assertEqual(commissioning["active_power_w"], 6200.0)
+            self.assertFalse(commissioning["active_power_fresh"])
+        finally:
+            await controller.async_stop()
 
     async def test_watt_mode_is_preserved(self):
         self.status.update(
@@ -401,6 +513,31 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
             history[1]["confirmed"]["configured"],
             100.0,
         )
+
+    async def test_after_sunset_zero_output_does_not_block_safe_restore(self):
+        controller = self.controller()
+        controller.mode = self.const.SOLAR_CURTAILMENT_MODE_ARMED
+        self.commission(controller)
+        self.coordinator.data = self.snapshot(
+            ["0.01", "-0.02", "-0.02", "-0.02", "0.01"]
+        )
+        start = self.runtime_now
+        for seconds in (0, 30, 60):
+            await self.evaluate(
+                controller, start + timedelta(seconds=seconds)
+            )
+        self.assertIsNotNone(controller.state["ownership"])
+
+        self.hass.states.async_set("sun.sun", "below_horizon")
+        self.status["active_power_w"] = 0
+        self.coordinator.data = self.snapshot(
+            ["0.01", "0.01", "0.01", "0.01", "0.01"]
+        )
+        await self.evaluate(controller, start + timedelta(seconds=75))
+
+        self.assertEqual(controller.decision.state, "restored")
+        self.assertIsNone(controller.state["ownership"])
+        self.assertEqual(self.device_writes[-1]["value"], 100.0)
 
     async def test_profile_change_restores_exact_original(self):
         controller = self.controller()

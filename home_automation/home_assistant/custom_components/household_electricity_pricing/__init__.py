@@ -58,6 +58,7 @@ GET_PRICE_FORECAST_SCHEMA = probatio.Schema({
         int, probatio.Range(min=0, max=7)
     ),
     probatio.Optional("delivery_date"): cv.date,
+    probatio.Optional("all_horizons", default=False): bool,
 })
 
 
@@ -135,6 +136,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             call.data["horizon_days"],
             call.data["include_future_days"],
             call.data.get("delivery_date"),
+            call.data["all_horizons"],
         )
 
     hass.services.async_register(

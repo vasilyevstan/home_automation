@@ -19,7 +19,10 @@ from uuid import uuid4
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import (
+    async_track_state_change_event,
+    async_track_time_interval,
+)
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
@@ -50,7 +53,7 @@ from .coordinator import HouseholdPriceCoordinator
 LOGGER = logging.getLogger(__name__)
 STORE_VERSION = 1
 STATE_VERSION = 1
-POLICY_REVISION = 1
+POLICY_REVISION = 2
 STORE_KEY_SUFFIX = "solar_curtailment"
 ACTIVE_POWER_MAX_AGE_SECONDS = 45
 HISTORY_LIMIT = 64
@@ -578,7 +581,7 @@ def commissioning_replay() -> dict:
 
 
 class SolarCurtailment:
-    """Deterministic policy revision 1 runtime."""
+    """Deterministic solar-curtailment runtime."""
 
     def __init__(
         self,
@@ -638,6 +641,9 @@ class SolarCurtailment:
                 "stable_unrestricted_verified": False,
                 "observed_identity": None,
                 "stable_observation": None,
+                "daylight_state": None,
+                "active_power_w": None,
+                "active_power_fresh": False,
                 "replay": None,
             },
         }
@@ -647,14 +653,14 @@ class SolarCurtailment:
         if stored is None:
             stored = await self.store.async_load()
         if isinstance(stored, dict):
-            same_revision = (
+            compatible_revision = (
                 stored.get("state_version") == STATE_VERSION
-                and stored.get("policy_revision") == POLICY_REVISION
+                and stored.get("policy_revision") in (1, POLICY_REVISION)
             )
             ownership = stored.get("ownership")
             fault = stored.get("fault")
             external_override = stored.get("external_override")
-            if same_revision:
+            if compatible_revision:
                 mode = stored.get("mode")
                 if mode in SOLAR_CURTAILMENT_MODES:
                     self.mode = mode
@@ -666,6 +672,15 @@ class SolarCurtailment:
                                 self.state[key].update(commissioning)
                         else:
                             self.state[key] = stored[key]
+                self.state["policy_revision"] = POLICY_REVISION
+                if stored.get("policy_revision") == 1:
+                    self._reset_qualification()
+                    commissioning = self.state["commissioning"]
+                    commissioning["stable_unrestricted_verified"] = False
+                    commissioning["stable_observation"] = None
+                    commissioning["daylight_state"] = None
+                    commissioning["active_power_w"] = None
+                    commissioning["active_power_fresh"] = False
             else:
                 if isinstance(ownership, dict):
                     self.state["ownership"] = ownership
@@ -683,6 +698,13 @@ class SolarCurtailment:
         await self._startup_reconcile(dt_util.utcnow())
         self.unsubscribers.append(
             self.coordinator.async_add_listener(self._schedule_evaluation)
+        )
+        self.unsubscribers.append(
+            async_track_state_change_event(
+                self.hass,
+                ("sun.sun",),
+                self._sun_changed,
+            )
         )
         self.unsubscribers.append(
             async_track_time_interval(
@@ -793,6 +815,10 @@ class SolarCurtailment:
         )
         self.evaluation_tasks.add(task)
         task.add_done_callback(self.evaluation_tasks.discard)
+
+    @callback
+    def _sun_changed(self, _event) -> None:
+        self._schedule_evaluation()
 
     @property
     def operation_history(self) -> list[dict]:
@@ -935,6 +961,14 @@ class SolarCurtailment:
             self.mode, state, reason
         )
 
+    def _decision_price(self) -> str | None:
+        value = (
+            self.last_price.export_earnings
+            if self.last_price is not None
+            else None
+        )
+        return format(value, "f") if value is not None else None
+
     def _set_persistence_fault(
         self,
         *,
@@ -956,6 +990,13 @@ class SolarCurtailment:
     def _reset_qualification(self) -> None:
         self.state["qualification"] = None
         self.state["eligible_since"] = None
+
+    def _sun_state(self) -> str | None:
+        state = self.hass.states.get("sun.sun")
+        return state.state if state is not None else None
+
+    def _daylight_available(self) -> bool:
+        return self._sun_state() == "above_horizon"
 
     def _fresh_active_power(
         self, status: dict, now: datetime
@@ -1018,6 +1059,12 @@ class SolarCurtailment:
         commissioning["mode_preservation_verified"] = (
             cap is not None and cap["mode"] == status.get("mode")
         )
+        active_power, _active_age, active_fresh = (
+            self._fresh_active_power(status, now)
+        )
+        commissioning["daylight_state"] = self._sun_state()
+        commissioning["active_power_w"] = active_power
+        commissioning["active_power_fresh"] = active_fresh
         if not (
             commissioning["write_permission_verified"]
             and commissioning["identity_verified"]
@@ -1034,6 +1081,15 @@ class SolarCurtailment:
             and isinstance(observation, dict)
             and observation.get("identity") == identity
         ):
+            return
+        if (
+            not self._daylight_available()
+            or not active_fresh
+            or active_power is None
+            or active_power < SOLAR_CURTAILMENT_OUTPUT_GATE_W
+        ):
+            commissioning["stable_observation"] = None
+            commissioning["stable_unrestricted_verified"] = False
             return
         stamp = now.astimezone(timezone.utc)
         if (
@@ -1063,7 +1119,7 @@ class SolarCurtailment:
             and first is not None
             and last is not None
             and (last - first).total_seconds()
-            >= SOLAR_CURTAILMENT_OUTPUT_SAMPLE_SECONDS
+            >= SOLAR_CURTAILMENT_QUALIFICATION_SECONDS
         )
 
     def _update_qualification(
@@ -1079,14 +1135,16 @@ class SolarCurtailment:
             "original": self._limit(status),
         }
         if (
-            not fresh
+            not self._daylight_available()
+            or not fresh
             or active_power is None
             or active_power < SOLAR_CURTAILMENT_OUTPUT_GATE_W
             or not inverter_unrestricted(status)
         ):
             self._reset_qualification()
             return False, (
-                "Fresh inverter AC active power must be at least "
+                "The sun must be above the horizon and fresh inverter AC "
+                "active power must be at least "
                 f"{SOLAR_CURTAILMENT_OUTPUT_GATE_W} W while the configured and "
                 "active original limits match and are unrestricted."
             )
@@ -1413,6 +1471,7 @@ class SolarCurtailment:
                 "phase": "post_dispatch_uncertain",
                 "success": False,
                 "block_id": block.identity,
+                "decision_price_eur_kwh": self._decision_price(),
                 "error": str(error),
                 "at": now.isoformat(),
             }
@@ -1439,6 +1498,7 @@ class SolarCurtailment:
             "previous": result.get("previous"),
             "confirmed": result.get("confirmed"),
             "block_id": block.identity,
+            "decision_price_eur_kwh": self._decision_price(),
             "audit_persisted": result.get("audit_persisted"),
             "audit_error": result.get("audit_error"),
             "at": now.isoformat(),
@@ -1631,6 +1691,7 @@ class SolarCurtailment:
                 "phase": "post_dispatch_uncertain",
                 "success": False,
                 "reason": reason,
+                "decision_price_eur_kwh": self._decision_price(),
                 "error": str(error),
                 "at": now.isoformat(),
             }
@@ -1648,6 +1709,7 @@ class SolarCurtailment:
             "previous": result.get("previous"),
             "confirmed": result.get("confirmed"),
             "reason": reason,
+            "decision_price_eur_kwh": self._decision_price(),
             "audit_persisted": result.get("audit_persisted"),
             "audit_error": result.get("audit_error"),
             "at": now.isoformat(),
@@ -2077,18 +2139,46 @@ class SolarCurtailment:
             raise HomeAssistantError(
                 "The deterministic solar policy replay failed."
             )
-        status = await self.devices.get_solar_status()
-        async with self.lock:
-            self.state["commissioning"]["replay"] = replay
-            self.state["commissioning"][
-                "policy_replay_verified"
-            ] = True
-            self.last_status = status
-            self.last_target = target_cap(status)
-            self._update_commissioning_observation(
-                status, dt_util.utcnow()
-            )
-            await self._save()
+        for sample in range(3):
+            status = await self.devices.get_solar_status()
+            observed_at = dt_util.utcnow().astimezone(timezone.utc)
+            async with self.lock:
+                self.state["commissioning"]["replay"] = replay
+                self.state["commissioning"][
+                    "policy_replay_verified"
+                ] = True
+                self.last_status = status
+                self.last_target = target_cap(status)
+                self._update_commissioning_observation(
+                    status, observed_at
+                )
+                await self._save()
+            if self.commissioning_complete:
+                break
+            if (
+                not self._daylight_available()
+                or self.state["commissioning"].get(
+                    "active_power_fresh"
+                )
+                is not True
+                or _finite_number(
+                    self.state["commissioning"].get(
+                        "active_power_w"
+                    )
+                )
+                is None
+                or _finite_number(
+                    self.state["commissioning"].get(
+                        "active_power_w"
+                    )
+                )
+                < SOLAR_CURTAILMENT_OUTPUT_GATE_W
+            ):
+                break
+            if sample < 2:
+                await asyncio.sleep(
+                    SOLAR_CURTAILMENT_OUTPUT_SAMPLE_SECONDS
+                )
         self._notify_listeners()
         if not self.commissioning_complete:
             missing = [
@@ -2345,6 +2435,8 @@ class SolarCurtailment:
                 round(active_age, 2) if active_age is not None else None
             ),
             "active_power_fresh": active_fresh,
+            "sun_state": self._sun_state(),
+            "daylight_gate_passed": self._daylight_available(),
             "inverter_config_entry_id": status.get("config_entry_id"),
             "inverter_serial": status.get("serial"),
             "pmax_w": status.get("pmax_w"),
@@ -2353,6 +2445,16 @@ class SolarCurtailment:
                 active_fresh
                 and active_power is not None
                 and active_power >= SOLAR_CURTAILMENT_OUTPUT_GATE_W
+            ),
+            "acquisition_allowed": (
+                self.mode == SOLAR_CURTAILMENT_MODE_ARMED
+                and self.commissioning_complete
+                and not self.state.get("fault")
+                and self._daylight_available()
+                and active_fresh
+                and active_power is not None
+                and active_power >= SOLAR_CURTAILMENT_OUTPUT_GATE_W
+                and inverter_unrestricted(status)
             ),
             "configured_limit_mode": status.get("mode"),
             "configured_limit": status.get("configured"),

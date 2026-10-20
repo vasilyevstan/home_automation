@@ -55,6 +55,10 @@ get_price_forecast:
     delivery_date:
       selector:
         date:
+    all_horizons:
+      default: false
+      selector:
+        boolean:
 
 quote_electricity_interval:
   fields:

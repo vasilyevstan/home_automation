@@ -66,6 +66,10 @@ class SolarExternalOverrideError(SolarPreDispatchError):
         self.status = status
 
 
+class DaikinPreDispatchConflict(HomeAssistantError):
+    """Fresh Daikin state disproved a prepared command before dispatch."""
+
+
 def number(value, label, minimum, maximum, step):
     if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
         raise HomeAssistantError(label + " must be a number, not a string or boolean.")
@@ -1281,7 +1285,7 @@ class EnergyDevices:
             elif previous not in ("on", "standby"):
                 raise HomeAssistantError("The previous circuit enable state is unknown.")
             if operation == "hot_water_target" and effective != previous:
-                raise HomeAssistantError(
+                raise DaikinPreDispatchConflict(
                     "The configured hot-water target and effective target differ; "
                     "no write was sent."
                 )
@@ -1301,14 +1305,17 @@ class EnergyDevices:
                         "Expected previous circuit state must be on or standby."
                     )
                 if expected_previous != previous:
-                    raise HomeAssistantError(
+                    raise DaikinPreDispatchConflict(
                         "Fresh Daikin state changed from the caller's expected "
                         "previous setting; no write was sent."
                     )
             if previous == requested:
                 if operation == "hot_water_target":
                     if effective != requested:
-                        raise HomeAssistantError("The configured target matches, but its effective target does not; no write was sent.")
+                        raise DaikinPreDispatchConflict(
+                            "The configured target matches, but its effective "
+                            "target does not; no write was sent."
+                        )
                 return {"changed": False, "operation": operation, "previous": previous, "confirmed": previous}
             record = {
                 "request_id": str(uuid4()), "device": "daikin", "operation": operation,

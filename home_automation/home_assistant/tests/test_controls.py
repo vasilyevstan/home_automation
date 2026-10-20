@@ -529,7 +529,7 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
             },
         ):
             with self.subTest(request=request), self.assertRaisesRegex(
-                HomeAssistantError,
+                self.controls.DaikinPreDispatchConflict,
                 "expected previous",
             ):
                 await self.devices.control_daikin(request, None)

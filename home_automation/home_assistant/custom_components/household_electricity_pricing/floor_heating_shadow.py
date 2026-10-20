@@ -57,7 +57,7 @@ from .const import (
     FLOOR_SHIFT_DELTA,
     FLOOR_WINDOW_MINUTES,
 )
-from .controls import EnergyDevices, FLAGS
+from .controls import DaikinPreDispatchConflict, EnergyDevices, FLAGS
 from .coordinator import HouseholdPriceCoordinator
 from .dhw_optimizer import (
     DhwOptimizer,
@@ -71,11 +71,15 @@ from .dhw_optimizer import (
 
 STORE_VERSION = 1
 STORE_KEY_SUFFIX = "floor_heating_shadow"
-POLICY_REVISION = 5
+POLICY_REVISION = 6
 DECISION_HISTORY_LIMIT = 96
 RECENT_DECISIONS_ATTRIBUTE_LIMIT = 4
 NOTIFICATION_ID = DOMAIN + "_floor_heating_fault"
 ACTIVE_STATES = {"preheat", "coast", "comfort_guard"}
+ACCEPTED_NATIVE_BASELINES = frozenset((-2.0, 0.0))
+NATIVE_TRANSITION_HISTORY_LIMIT = 24
+NATIVE_TRANSITION_STABILITY_WINDOW = timedelta(hours=1)
+NATIVE_TRANSITION_STABILITY_LIMIT = 3
 
 
 def _number(value: object) -> float | None:
@@ -419,7 +423,12 @@ def plan_floor_heating(
         policy.price_delta,
         policy.price_percent,
     )
-    busy = dhw_state in {"preheat", "recovery", "readiness"}
+    busy = dhw_state in {
+        "preheat",
+        "readiness_charge",
+        "readiness_final_topup",
+        "recovery",
+    }
 
     def decision(
         state: str,
@@ -642,6 +651,11 @@ class FloorHeatingShadow:
             "last_write_at": None,
             "fault": None,
             "manual_override": None,
+            "activation_hold": False,
+            "schedule_learning_hold_until": None,
+            "schedule_learning_reason": None,
+            "native_schedule_transitions": [],
+            "last_native_offset": None,
             "qualified_opportunity_count": 0,
             "last_qualified_opportunity_plan_id": None,
             "last_qualified_opportunity_at": None,
@@ -651,6 +665,7 @@ class FloorHeatingShadow:
         stored = await self.store.async_load()
         if isinstance(stored, dict) and stored.get("policy_revision") in (
             4,
+            5,
             POLICY_REVISION,
         ):
             mode = stored.get("mode")
@@ -659,14 +674,12 @@ class FloorHeatingShadow:
             for key in self.state:
                 if key in stored:
                     self.state[key] = stored[key]
-            if stored.get("policy_revision") == 4:
+            if stored.get("policy_revision") in (4, 5):
                 self.state["policy_revision"] = POLICY_REVISION
                 self.mode = FLOOR_MODE_SHADOW
-                self.state["ownership"] = None
-                self.state["pending_operation"] = None
-                self.state["last_write_at"] = None
-                self.state["fault"] = None
-                self.state["manual_override"] = None
+                self.state["activation_hold"] = False
+                self.state["schedule_learning_hold_until"] = None
+                self.state["schedule_learning_reason"] = None
             if (
                 self.state.get("pending_operation") is not None
                 and not self.state.get("fault")
@@ -674,6 +687,16 @@ class FloorHeatingShadow:
                 self.state["fault"] = (
                     "A persisted floor-offset command has an uncertain outcome. "
                     "Read fresh state, then use Resume after review."
+                )
+            elif (
+                self._ownership() is not None
+                and not self.state.get("fault")
+                and stored.get("policy_revision") in (4, 5)
+            ):
+                self.state["fault"] = (
+                    "The floor policy changed while an optimizer-owned offset "
+                    "was active. Ownership was preserved in Shadow; reconcile "
+                    "fresh native state before restoring or resuming."
                 )
         self.started = True
         self.unsubscribers.append(
@@ -975,7 +998,13 @@ class FloorHeatingShadow:
             and (
                 not evidence_eligible
                 or decision.state
-                in {"yield", "unavailable", "deferred", "comfort_guard"}
+                in {
+                    "yield",
+                    "unavailable",
+                    "deferred",
+                    "comfort_guard",
+                    "schedule_learning_hold",
+                }
             )
         ):
             self.state["candidate_cycle_contaminated"] = True
@@ -1085,6 +1114,7 @@ class FloorHeatingShadow:
 
     def _normalize_owned_decision(
         self,
+        now: datetime,
         observation: FloorHeatingObservation,
         decision: FloorHeatingDecision,
     ) -> FloorHeatingDecision:
@@ -1096,12 +1126,50 @@ class FloorHeatingShadow:
         if baseline is None or target is None:
             return decision
         if observation.actual_offset != target:
-            self.state["manual_override"] = (
-                "The native floor offset changed while the optimizer owned "
-                f"{target:g}°C. The new {observation.actual_offset:g}°C value "
-                "was preserved and automatic floor writes returned to Shadow."
+            accepted = observation.actual_offset in ACCEPTED_NATIVE_BASELINES
+            classification = (
+                "accepted_schedule_transition"
+                if accepted
+                else "unexpected_owned_change"
+            )
+            unstable = self._record_native_transition(
+                now=now,
+                previous=target,
+                current=observation.actual_offset,
+                classification=classification,
+                owned=True,
             )
             self.state["ownership"] = None
+            self.state["candidate_cycle_contaminated"] = True
+            if accepted and not unstable:
+                hold_until = self._schedule_window_end(now, decision)
+                self.state["schedule_learning_hold_until"] = (
+                    hold_until.isoformat()
+                )
+                self.state["schedule_learning_reason"] = (
+                    "Daikin's accepted native schedule changed the offset to "
+                    f"{observation.actual_offset:g}°C. The optimizer preserved "
+                    "it and will not reapply an overlay until the current "
+                    "price window ends."
+                )
+                return replace(
+                    decision,
+                    state="schedule_learning_hold",
+                    reason=str(self.state["schedule_learning_reason"]),
+                    proposed_offset=observation.actual_offset,
+                )
+            self.state["manual_override"] = (
+                "The native floor offset changed unexpectedly while the "
+                f"optimizer owned {target:g}°C. The new "
+                f"{observation.actual_offset:g}°C value was preserved and "
+                "automatic floor writes returned to Shadow."
+            )
+            if unstable:
+                self.state["manual_override"] = (
+                    "Accepted native floor offsets changed repeatedly inside "
+                    "one hour. The unstable schedule was preserved and "
+                    "automatic floor writes returned to Shadow."
+                )
             self.mode = FLOOR_MODE_SHADOW
             return replace(
                 decision,
@@ -1126,6 +1194,160 @@ class FloorHeatingShadow:
         else:
             desired = baseline
         return replace(decision, proposed_offset=desired)
+
+    def _schedule_window_end(
+        self,
+        now: datetime,
+        decision: FloorHeatingDecision,
+    ) -> datetime:
+        now_utc = now.astimezone(UTC)
+        if decision.plan is not None:
+            for window in (
+                decision.plan.cheap_window,
+                decision.plan.peak_window,
+            ):
+                if window.start <= now_utc < window.end:
+                    return window.end
+            if now_utc < decision.plan.peak_window.end:
+                return decision.plan.peak_window.end
+        return now_utc + MARKET_INTERVAL
+
+    def _record_native_transition(
+        self,
+        *,
+        now: datetime,
+        previous: float,
+        current: float,
+        classification: str,
+        owned: bool,
+    ) -> bool:
+        records = list(self.state["native_schedule_transitions"])
+        records.append({
+            "observed_at": now.isoformat(),
+            "local_time": now.astimezone(TALLINN).isoformat(),
+            "previous_offset_c": previous,
+            "native_offset_c": current,
+            "classification": classification,
+            "ownership_released": owned,
+        })
+        self.state["native_schedule_transitions"] = records[
+            -NATIVE_TRANSITION_HISTORY_LIMIT:
+        ]
+        self.state["last_native_offset"] = current
+        accepted_recent = 0
+        for record in reversed(records):
+            observed_at = _instant(record.get("observed_at"))
+            if (
+                observed_at is None
+                or now.astimezone(UTC) - observed_at.astimezone(UTC)
+                > NATIVE_TRANSITION_STABILITY_WINDOW
+            ):
+                break
+            if record.get("classification") in (
+                "accepted_schedule_transition",
+                "accepted_native_baseline",
+            ):
+                accepted_recent += 1
+        return accepted_recent >= NATIVE_TRANSITION_STABILITY_LIMIT
+
+    def _normalize_schedule_learning(
+        self,
+        now: datetime,
+        observation: FloorHeatingObservation,
+        decision: FloorHeatingDecision,
+    ) -> FloorHeatingDecision:
+        current = observation.actual_offset
+        if current is None:
+            return decision
+        previous = _number(self.state.get("last_native_offset"))
+        if previous is None:
+            self.state["last_native_offset"] = current
+        elif previous != current and self._ownership() is None:
+            accepted = current in ACCEPTED_NATIVE_BASELINES
+            unstable = self._record_native_transition(
+                now=now,
+                previous=previous,
+                current=current,
+                classification=(
+                    "accepted_native_baseline"
+                    if accepted
+                    else "unexpected_native_value"
+                ),
+                owned=False,
+            )
+            if self.mode == FLOOR_MODE_ACTIVE and (
+                not accepted or unstable
+            ):
+                self.mode = FLOOR_MODE_SHADOW
+                self.state["manual_override"] = (
+                    "The native floor schedule became unstable; its latest "
+                    "value was preserved and automatic writes returned to "
+                    "Shadow."
+                    if unstable
+                    else (
+                        f"The unowned native floor offset changed to "
+                        f"{current:g}°C outside the accepted -2/0°C schedule. "
+                        "It was preserved and automatic writes returned to "
+                        "Shadow."
+                    )
+                )
+                return replace(
+                    decision,
+                    state="yield",
+                    reason=str(self.state["manual_override"]),
+                    proposed_offset=current,
+                )
+        hold_until = _instant(
+            self.state.get("schedule_learning_hold_until")
+        )
+        if hold_until is not None:
+            if now.astimezone(UTC) < hold_until.astimezone(UTC):
+                return replace(
+                    decision,
+                    state="schedule_learning_hold",
+                    reason=str(
+                        self.state.get("schedule_learning_reason")
+                        or "The optimizer is learning the native schedule."
+                    ),
+                    proposed_offset=current,
+                )
+            self.state["schedule_learning_hold_until"] = None
+            self.state["schedule_learning_reason"] = None
+        if self.mode == FLOOR_MODE_ACTIVE and self.state["activation_hold"]:
+            self.state["activation_hold"] = False
+            if decision.state in ACTIVE_STATES:
+                hold_until = self._schedule_window_end(now, decision)
+                self.state["schedule_learning_hold_until"] = (
+                    hold_until.isoformat()
+                )
+                self.state["schedule_learning_reason"] = (
+                    "Active mode started from fresh ownerless state during a "
+                    "candidate window. The current window is observation-only."
+                )
+                return replace(
+                    decision,
+                    state="schedule_learning_hold",
+                    reason=str(self.state["schedule_learning_reason"]),
+                    proposed_offset=current,
+                )
+        if (
+            self.mode == FLOOR_MODE_ACTIVE
+            and self._ownership() is None
+            and current not in ACCEPTED_NATIVE_BASELINES
+        ):
+            self.mode = FLOOR_MODE_SHADOW
+            self.state["manual_override"] = (
+                f"The ownerless native floor offset is {current:g}°C, outside "
+                "the accepted -2/0°C schedule baselines. It was preserved and "
+                "automatic writes returned to Shadow."
+            )
+            return replace(
+                decision,
+                state="yield",
+                reason=str(self.state["manual_override"]),
+                proposed_offset=current,
+            )
+        return decision
 
     async def _dispatch_offset(
         self,
@@ -1159,6 +1381,10 @@ class FloorHeatingShadow:
                 },
                 Context(),
             )
+        except DaikinPreDispatchConflict:
+            self.state["pending_operation"] = None
+            await self._save()
+            return False
         except (HomeAssistantError, TimeoutError) as error:
             self.state["fault"] = (
                 "A guarded floor-offset command failed and may have applied. "
@@ -1188,6 +1414,7 @@ class FloorHeatingShadow:
             return False
         self.state["pending_operation"] = None
         self.state["last_write_at"] = now.isoformat()
+        self.state["last_native_offset"] = target
         self.state["confirmed_writes"] += int(
             result.get("changed") is True
         )
@@ -1313,9 +1540,16 @@ class FloorHeatingShadow:
                     )
                 else:
                     decision = self._normalize_owned_decision(
+                        observed_at,
                         observation,
                         decision,
                     )
+                    if not self.state.get("manual_override"):
+                        decision = self._normalize_schedule_learning(
+                            observed_at,
+                            observation,
+                            decision,
+                        )
                 local_day = observed_at.astimezone(TALLINN).date().isoformat()
                 if local_day not in self.state["shadow_days"]:
                     self.state["shadow_days"] = (
@@ -1370,7 +1604,7 @@ class FloorHeatingShadow:
                 "Active floor shifting requires 14 observed days, five clean "
                 "candidate cycles, or an explicit owner-approved activation."
             )
-        if owner_approved:
+        if mode == FLOOR_MODE_ACTIVE:
             status = await self.devices.get_daikin_status()
             observation = self._observation(
                 status,
@@ -1382,6 +1616,18 @@ class FloorHeatingShadow:
                 raise HomeAssistantError(
                     "A fresh native floor offset is required before activation."
                 )
+            if (
+                observation.actual_offset
+                not in ACCEPTED_NATIVE_BASELINES
+            ):
+                raise HomeAssistantError(
+                    "Owner-approved Active mode must start from a fresh "
+                    "ownerless -2°C or 0°C native schedule baseline."
+                )
+            self.state["last_native_offset"] = (
+                observation.actual_offset
+            )
+        if owner_approved:
             self.state["owner_activation_approved_at"] = (
                 dt_util.utcnow().astimezone(UTC).isoformat()
             )
@@ -1397,6 +1643,11 @@ class FloorHeatingShadow:
                 self.state["active_started_at"] = (
                     dt_util.utcnow().astimezone(UTC).isoformat()
                 )
+            if mode == FLOOR_MODE_ACTIVE:
+                self.state["activation_hold"] = True
+                self.state["ownership"] = None
+                self.state["schedule_learning_hold_until"] = None
+                self.state["schedule_learning_reason"] = None
             await self._save()
         await self.async_evaluate()
 
@@ -1506,6 +1757,18 @@ class FloorHeatingShadow:
                             or "The floor baseline restore was not confirmed."
                         )
                 elif observation.actual_offset == baseline:
+                    self.state["ownership"] = None
+                elif (
+                    observation.actual_offset
+                    in ACCEPTED_NATIVE_BASELINES
+                ):
+                    self._record_native_transition(
+                        now=observed_at,
+                        previous=target,
+                        current=observation.actual_offset,
+                        classification="accepted_schedule_transition",
+                        owned=True,
+                    )
                     self.state["ownership"] = None
                 else:
                     self.mode = FLOOR_MODE_SHADOW
@@ -1682,7 +1945,7 @@ class FloorHeatingShadow:
             "pilot_eligible": self.pilot_eligible,
             "pilot_eligibility_reason": (
                 "The evidence gate requires at least 14 observed days and five "
-                "clean revision-5 candidate cycles. Explicit owner-approved "
+                "clean revision-6 candidate cycles. Explicit owner-approved "
                 "activation is recorded separately and does not relabel the "
                 "evidence gate as passed."
             ),
@@ -1699,6 +1962,26 @@ class FloorHeatingShadow:
             "last_write_at": self.state["last_write_at"],
             "fault": self.state["fault"],
             "manual_override": self.state["manual_override"],
+            "schedule_learning_hold": (
+                _instant(self.state["schedule_learning_hold_until"])
+                is not None
+                and dt_util.utcnow().astimezone(UTC)
+                < _instant(
+                    self.state["schedule_learning_hold_until"]
+                ).astimezone(UTC)
+            ),
+            "schedule_learning_hold_until": self.state[
+                "schedule_learning_hold_until"
+            ],
+            "schedule_learning_reason": self.state[
+                "schedule_learning_reason"
+            ],
+            "accepted_native_baselines_c": sorted(
+                ACCEPTED_NATIVE_BASELINES
+            ),
+            "native_schedule_transitions": list(
+                self.state["native_schedule_transitions"][-8:]
+            ),
             "solar_dispatch_available": False,
             "solar_dispatch_reason": (
                 "Fresh signed net-grid power is unavailable; PV generation alone "
