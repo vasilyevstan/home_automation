@@ -529,13 +529,15 @@ or owned minutes. Without fresh signed grid power it never reports curtailed
 kWh, zero-export performance, or estimated/realized euro savings.
 
 Three Recorder-safe power sensors expose the configured inverter limit, active
-inverter limit, and current controller request in equivalent watts. Percentage
-mode is converted with the bound inverter Pmax; watt mode is preserved. The
-controller also keeps a bounded private history of its last 12 cap/restore
-operations so the compact Energy control activity sensor can distinguish
-verified solar commands, pre-dispatch no-command outcomes, and uncertain
-post-dispatch results that require review. The activity entity retains at most
-24 deduplicated
+inverter limit, and current controller request in equivalent watts. A fourth
+Recorder-safe relevance sensor reports `ready` only when the sun is above the
+horizon and fresh inverter output meets the 5 kW gate; otherwise it names the
+missing daylight, fresh-output, or output-level condition. Percentage mode is
+converted with the bound inverter Pmax; watt mode is preserved. The controller
+also keeps a bounded private history of its last 12 cap/restore operations so
+the compact Energy control activity sensor can distinguish verified solar
+commands, pre-dispatch no-command outcomes, and uncertain post-dispatch results
+that require review. The activity entity retains at most 24 deduplicated
 cross-controller events from the latest 24 hours.
 
 ## Domestic-hot-water price optimizer
