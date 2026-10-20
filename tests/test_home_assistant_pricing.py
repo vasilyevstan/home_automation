@@ -272,7 +272,7 @@ class HomeAssistantBundleTests(unittest.TestCase):
                     manifest["after_dependencies"], ["huawei_solar"]
                 )
                 self.assertEqual(manifest["domain"], "household_electricity_pricing")
-                self.assertEqual(manifest["version"], "0.13.0")
+                self.assertEqual(manifest["version"], "0.13.1")
                 names = archive.namelist()
                 self.assertTrue(all(name.startswith(prefix) for name in names))
                 self.assertFalse(any(

@@ -95,6 +95,12 @@ async def async_setup_entry(
                 entry.entry_id,
             )
         )
+        entities.append(
+            SolarRelevanceSensor(
+                solar_curtailment,
+                entry.entry_id,
+            )
+        )
         entities.extend(
             (
                 SolarConfiguredPowerLimitSensor(
@@ -1038,6 +1044,60 @@ class SolarCurtailmentOpportunitySensor(OptimizationOpportunitySensor):
             entry_id,
             "solar_curtailment_price_opportunity",
         )
+
+
+class SolarRelevanceSensor(SensorEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Solar relevance"
+    _attr_icon = "mdi:weather-sunny-alert"
+
+    def __init__(self, controller, entry_id: str) -> None:
+        self.controller = controller
+        self._attr_unique_id = entry_id + "_solar_relevance"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)},
+            name=NAME,
+            manufacturer="home_automation",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            self.controller.async_add_listener(
+                self.async_write_ha_state
+            )
+        )
+
+    @property
+    def native_value(self) -> str:
+        attributes = self.controller.attributes
+        daylight = attributes.get("daylight_state")
+        active_power = attributes.get("active_power_w")
+        output_gate = attributes.get("output_gate_w")
+        if daylight is None:
+            return "unavailable"
+        if daylight != "above_horizon":
+            return "waiting_for_daylight"
+        if attributes.get("active_power_fresh") is not True:
+            return "waiting_for_fresh_output"
+        if active_power is None or output_gate is None:
+            return "unavailable"
+        if float(active_power) >= float(output_gate):
+            return "ready"
+        return "waiting_for_output"
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        attributes = self.controller.attributes
+        active_power = attributes.get("active_power_w")
+        output_gate = attributes.get("output_gate_w")
+        return {
+            "ready": self.native_value == "ready",
+            "daylight_state": attributes.get("daylight_state"),
+            "active_power_w": active_power,
+            "active_power_fresh": attributes.get("active_power_fresh"),
+            "output_gate_w": output_gate,
+            "daylight_required": True,
+        }
 
 
 class SolarPowerLimitSensor(SensorEntity):

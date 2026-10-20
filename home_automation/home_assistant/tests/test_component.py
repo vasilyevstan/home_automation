@@ -642,6 +642,35 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(all(sensor.available for sensor in sensors))
 
+    def test_solar_relevance_requires_daylight_and_fresh_output_gate(self):
+        controller = SimpleNamespace(
+            attributes={
+                "daylight_state": "below_horizon",
+                "active_power_w": 6200,
+                "active_power_fresh": True,
+                "output_gate_w": 5000,
+            },
+            async_add_listener=Mock(),
+        )
+        sensor = self.sensor_module.SolarRelevanceSensor(
+            controller,
+            "pricing",
+        )
+        self.assertEqual(sensor.native_value, "waiting_for_daylight")
+        self.assertFalse(sensor.extra_state_attributes["ready"])
+
+        controller.attributes["daylight_state"] = "above_horizon"
+        controller.attributes["active_power_w"] = 4200
+        self.assertEqual(sensor.native_value, "waiting_for_output")
+
+        controller.attributes["active_power_w"] = 6200
+        controller.attributes["active_power_fresh"] = False
+        self.assertEqual(sensor.native_value, "waiting_for_fresh_output")
+
+        controller.attributes["active_power_fresh"] = True
+        self.assertEqual(sensor.native_value, "ready")
+        self.assertTrue(sensor.extra_state_attributes["ready"])
+
     async def test_owner_activation_and_floor_controls_delegate_explicitly(self):
         select_module = importlib.import_module(COMPONENT + ".select")
         button_module = importlib.import_module(COMPONENT + ".button")
@@ -893,6 +922,13 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIn(
                 "SolarCurtailmentOpportunitySensor",
+                {
+                    entity.__class__.__name__
+                    for entity in sensor_entities
+                },
+            )
+            self.assertIn(
+                "SolarRelevanceSensor",
                 {
                     entity.__class__.__name__
                     for entity in sensor_entities
