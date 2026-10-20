@@ -1070,7 +1070,7 @@ class SolarRelevanceSensor(SensorEntity):
     @property
     def native_value(self) -> str:
         attributes = self.controller.attributes
-        daylight = attributes.get("daylight_state")
+        daylight = attributes.get("sun_state")
         active_power = attributes.get("active_power_w")
         output_gate = attributes.get("output_gate_w")
         if daylight is None:
@@ -1092,7 +1092,7 @@ class SolarRelevanceSensor(SensorEntity):
         output_gate = attributes.get("output_gate_w")
         return {
             "ready": self.native_value == "ready",
-            "daylight_state": attributes.get("daylight_state"),
+            "daylight_state": attributes.get("sun_state"),
             "active_power_w": active_power,
             "active_power_fresh": attributes.get("active_power_fresh"),
             "output_gate_w": output_gate,
