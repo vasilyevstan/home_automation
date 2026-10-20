@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 import importlib
 import unittest
@@ -104,6 +104,80 @@ class PriceForecastTests(base.HAComponentTests):
         await coordinator.async_load()
         return coordinator
 
+    def add_archive_hours(
+        self,
+        coordinator,
+        delivery_day: date,
+        *,
+        issued_at: datetime,
+        horizon_days: int,
+        hour_indexes: list[int],
+        p50: Decimal,
+        archive_origin: str | None = None,
+    ):
+        start, _ = self.pricing.market_bounds(delivery_day)
+        origin = (
+            archive_origin
+            or self.module.ARCHIVE_ORIGIN_OBSERVED
+        )
+        for hour_index in hour_indexes:
+            hour = start + timedelta(hours=hour_index)
+            record = {
+                "start": hour.astimezone(self.module.UTC).isoformat(),
+                "issued_at": issued_at.astimezone(
+                    self.module.UTC
+                ).isoformat(),
+                "model_trained_at": (
+                    issued_at - timedelta(hours=6)
+                ).astimezone(self.module.UTC).isoformat(),
+                "horizon_days": horizon_days,
+                "p10_spot_eur_mwh": format(p50 - Decimal("10"), "f"),
+                "p50_spot_eur_mwh": format(p50, "f"),
+                "p90_spot_eur_mwh": format(p50 + Decimal("10"), "f"),
+                "archive_origin": origin,
+            }
+            coordinator.archive[
+                coordinator._archive_key(record)
+            ] = record
+
+    def add_official_schedule(
+        self,
+        coordinator,
+        delivery_day: date,
+        *,
+        spot: Decimal = Decimal("100"),
+    ):
+        profile = coordinator._profile()
+        start, end = self.pricing.market_bounds(delivery_day)
+        rows = []
+        current = start
+        while current < end:
+            rows.append({
+                "start": current.astimezone(
+                    self.module.UTC
+                ).isoformat(),
+                "import_eur_kwh": self.pricing.forecast_import_eur_kwh(
+                    profile,
+                    spot,
+                    current,
+                ),
+            })
+            current += self.module.MARKET_INTERVAL
+        schedule = coordinator._validated_official_schedule({
+            "delivery_date": delivery_day.isoformat(),
+            "expected_intervals": len(rows),
+            "available_intervals": len(rows),
+            "complete": True,
+            "profile_id": profile.id,
+            "profile_version": profile.version,
+            "profile_sha256": profile.sha256,
+            "intervals": rows,
+        })
+        coordinator.official_schedules[
+            delivery_day.isoformat()
+        ] = schedule
+        return schedule
+
     async def test_current_forecast_uses_all_in_prices_and_published_overlay(self):
         coordinator = await self.forecast_coordinator()
         report = self.report()
@@ -147,6 +221,10 @@ class PriceForecastTests(base.HAComponentTests):
         )
         self.assertEqual(len(response["daily_summaries"]), 7)
         self.assertEqual(len(coordinator.archive), 7 * 24)
+        self.assertIn(
+            "distinct issuances observed by hourly polling",
+            response["archive"]["sampling"].lower(),
+        )
         await coordinator.async_shutdown()
 
     async def test_forecast_archive_deduplicates_and_serves_horizon_history(self):
@@ -225,11 +303,15 @@ class PriceForecastTests(base.HAComponentTests):
             1,
             delivery_day,
         )
-        self.assertEqual(evolution["schema_version"], 2)
+        self.assertEqual(evolution["schema_version"], 3)
+        self.assertFalse(evolution["all_horizons"])
+        self.assertEqual(evolution["horizons_included"], [1])
         self.assertEqual(evolution["retained_issuance_count"], 2)
         self.assertEqual(evolution["expected_intervals"], 24 * 4)
         self.assertEqual(evolution["available_intervals"], 24 * 4)
         self.assertTrue(evolution["complete_delivery_coverage"])
+        self.assertEqual(evolution["matched_intervals"], 24 * 4)
+        self.assertTrue(evolution["complete_matched_coverage"])
         self.assertEqual(evolution["comparison_intervals"], 24 * 4)
         self.assertEqual(
             Decimal(evolution["first_retained_mae_eur_kwh"]),
@@ -247,6 +329,231 @@ class PriceForecastTests(base.HAComponentTests):
             datetime.fromisoformat(first_point["latest_retained"]["issued_at"]),
         )
         self.assertFalse(evolution["tracking_active_for_full_horizon"])
+        await coordinator.async_shutdown()
+
+    async def test_all_horizons_use_common_coverage_for_issuance_movement(self):
+        coordinator = await self.forecast_coordinator()
+        delivery_day = (
+            self.now.astimezone(self.module.TALLINN).date()
+            + timedelta(days=1)
+        )
+        delivery_start, _ = self.pricing.market_bounds(delivery_day)
+        coordinator.archive = {}
+        coordinator.vintage_tracking_started_at = (
+            delivery_start - timedelta(days=4)
+        ).astimezone(self.module.UTC).isoformat()
+        self.add_archive_hours(
+            coordinator,
+            delivery_day,
+            issued_at=delivery_start - timedelta(days=3),
+            horizon_days=3,
+            hour_indexes=[0, 1],
+            p50=Decimal("130"),
+        )
+        self.add_archive_hours(
+            coordinator,
+            delivery_day,
+            issued_at=delivery_start - timedelta(days=2),
+            horizon_days=2,
+            hour_indexes=[1],
+            p50=Decimal("150"),
+        )
+        self.add_archive_hours(
+            coordinator,
+            delivery_day,
+            issued_at=delivery_start - timedelta(days=2),
+            horizon_days=2,
+            hour_indexes=[2, 3],
+            p50=Decimal("100"),
+        )
+        self.add_archive_hours(
+            coordinator,
+            delivery_day,
+            issued_at=delivery_start - timedelta(days=1),
+            horizon_days=1,
+            hour_indexes=[1],
+            p50=Decimal("110"),
+        )
+        self.add_archive_hours(
+            coordinator,
+            delivery_day,
+            issued_at=delivery_start - timedelta(days=1),
+            horizon_days=1,
+            hour_indexes=[2],
+            p50=Decimal("100"),
+        )
+        schedule = self.add_official_schedule(
+            coordinator,
+            delivery_day,
+        )
+
+        evolution = await coordinator.async_response(
+            "evolution",
+            8,
+            1,
+            1,
+            delivery_day,
+            True,
+        )
+
+        self.assertTrue(evolution["all_horizons"])
+        self.assertIsNone(evolution["horizon_days"])
+        self.assertEqual(evolution["horizons_included"], [1, 2, 3])
+        self.assertEqual(evolution["retained_issuance_count"], 3)
+        self.assertEqual(evolution["expected_intervals"], 96)
+        self.assertEqual(evolution["available_intervals"], 16)
+        self.assertTrue(evolution["partial_delivery_coverage"])
+        self.assertEqual(evolution["official_intervals"], 96)
+        self.assertTrue(evolution["complete_official_coverage"])
+        self.assertEqual(evolution["matched_intervals"], 16)
+        self.assertEqual(
+            evolution["common_coverage_matched_intervals"],
+            4,
+        )
+
+        metrics = evolution["issuance_metrics"]
+        self.assertEqual(
+            [item["horizon_days"] for item in metrics],
+            [3, 2, 1],
+        )
+        self.assertEqual(
+            [item["available_intervals"] for item in metrics],
+            [8, 12, 8],
+        )
+        self.assertEqual(
+            [item["matched_intervals"] for item in metrics],
+            [8, 12, 8],
+        )
+        self.assertEqual(
+            [
+                item["common_coverage_matched_intervals"]
+                for item in metrics
+            ],
+            [4, 4, 4],
+        )
+        self.assertEqual(
+            [item["movement_vs_previous"] for item in metrics],
+            ["unavailable", "worsened", "improved"],
+        )
+        self.assertFalse(metrics[-1]["complete_delivery_coverage"])
+        self.assertTrue(metrics[-1]["partial_delivery_coverage"])
+        profile = coordinator._profile()
+        official = {
+            datetime.fromisoformat(row["start"]): Decimal(
+                row["import_eur_kwh"]
+            )
+            for row in schedule["intervals"]
+        }
+        common_quarters = [
+            delivery_start + timedelta(hours=1)
+            + index * self.module.MARKET_INTERVAL
+            for index in range(4)
+        ]
+        for metric, spot in zip(
+            metrics,
+            (Decimal("130"), Decimal("150"), Decimal("110")),
+            strict=True,
+        ):
+            errors = [
+                Decimal(
+                    self.pricing.forecast_import_eur_kwh(
+                        profile,
+                        spot,
+                        quarter,
+                    )
+                ) - official[quarter]
+                for quarter in common_quarters
+            ]
+            expected_mae = sum(
+                (abs(error) for error in errors),
+                Decimal(0),
+            ) / len(errors)
+            expected_bias = sum(errors, Decimal(0)) / len(errors)
+            self.assertEqual(
+                Decimal(metric["mae_eur_kwh"]),
+                expected_mae,
+            )
+            self.assertEqual(
+                Decimal(metric["bias_eur_kwh"]),
+                expected_bias,
+            )
+
+        common_point = next(
+            point
+            for point in evolution["intervals"]
+            if datetime.fromisoformat(point["start"]).astimezone(
+                self.module.UTC
+            ) == delivery_start + timedelta(hours=1)
+        )
+        self.assertEqual(
+            [item["horizon_days"] for item in common_point["vintages"]],
+            [3, 2, 1],
+        )
+        self.assertTrue(all(
+            item["archive_origin"]
+            == self.module.ARCHIVE_ORIGIN_OBSERVED
+            for item in common_point["vintages"]
+        ))
+        await coordinator.async_shutdown()
+
+    async def test_default_evolution_remains_single_horizon(self):
+        coordinator = await self.forecast_coordinator()
+        delivery_day = (
+            self.now.astimezone(self.module.TALLINN).date()
+            + timedelta(days=1)
+        )
+        delivery_start, _ = self.pricing.market_bounds(delivery_day)
+        coordinator.archive = {}
+        coordinator.vintage_tracking_started_at = (
+            delivery_start - timedelta(days=4)
+        ).astimezone(self.module.UTC).isoformat()
+        for horizon, spot in (
+            (3, Decimal("130")),
+            (2, Decimal("120")),
+            (1, Decimal("110")),
+        ):
+            self.add_archive_hours(
+                coordinator,
+                delivery_day,
+                issued_at=delivery_start - timedelta(days=horizon),
+                horizon_days=horizon,
+                hour_indexes=[0],
+                p50=spot,
+            )
+        self.add_official_schedule(coordinator, delivery_day)
+
+        evolution = await coordinator.async_response(
+            "evolution",
+            8,
+            1,
+            1,
+            delivery_day,
+        )
+
+        self.assertFalse(evolution["all_horizons"])
+        self.assertEqual(evolution["horizon_days"], 1)
+        self.assertEqual(evolution["horizons_included"], [1])
+        self.assertEqual(evolution["retained_issuance_count"], 1)
+        self.assertEqual(
+            {
+                vintage["horizon_days"]
+                for point in evolution["intervals"]
+                for vintage in point["vintages"]
+            },
+            {1},
+        )
+        with self.assertRaisesRegex(
+            self.module.ServiceValidationError,
+            "delivery date",
+        ):
+            await coordinator.async_response(
+                "evolution",
+                8,
+                1,
+                1,
+                None,
+                True,
+            )
         await coordinator.async_shutdown()
 
     async def test_same_issuance_with_changed_values_is_rejected(self):
@@ -301,6 +608,80 @@ class PriceForecastTests(base.HAComponentTests):
             saved["records"][0]["archive_origin"],
             self.module.ARCHIVE_ORIGIN_MIGRATED,
         )
+        self.assertEqual(saved["official_schedules"], [])
+        delivery_day = slot.start.astimezone(
+            self.module.TALLINN
+        ).date()
+        evolution = coordinator._evolution_response(
+            coordinator._profile(),
+            self.now,
+            8,
+            1,
+            1,
+            delivery_day,
+            coordinator._published_prices(self.now),
+        )
+        self.assertTrue(evolution["contains_migrated_latest_only"])
+        self.assertEqual(
+            evolution["issuance_metrics"][0]["archive_origin"],
+            self.module.ARCHIVE_ORIGIN_MIGRATED,
+        )
+        self.assertTrue(
+            evolution["issuance_metrics"][0]["partial_history"]
+        )
+        self.assertEqual(
+            evolution["intervals"][0]["first_retained"][
+                "archive_origin"
+            ],
+            self.module.ARCHIVE_ORIGIN_MIGRATED,
+        )
+        self.assertNotIn("original", str(evolution).lower())
+        await coordinator.async_shutdown()
+
+    async def test_version_two_archive_migrates_without_losing_origins(self):
+        coordinator = await self.forecast_coordinator()
+        report = self.report()
+        slot = report.hours[0]
+        record = {
+            "start": slot.start.astimezone(self.module.UTC).isoformat(),
+            "issued_at": report.issued_at.astimezone(
+                self.module.UTC
+            ).isoformat(),
+            "model_trained_at": report.model_trained_at.astimezone(
+                self.module.UTC
+            ).isoformat(),
+            "horizon_days": slot.horizon_days,
+            "p10_spot_eur_mwh": format(slot.p10, "f"),
+            "p50_spot_eur_mwh": format(slot.p50, "f"),
+            "p90_spot_eur_mwh": format(slot.p90, "f"),
+            "archive_origin": self.module.ARCHIVE_ORIGIN_OBSERVED,
+        }
+        tracking_started = (
+            self.now - timedelta(days=8)
+        ).astimezone(self.module.UTC).isoformat()
+        coordinator.store.async_load = AsyncMock(return_value={
+            "schema_version": 2,
+            "vintage_tracking_started_at": tracking_started,
+            "records": [record],
+        })
+        coordinator.store.async_save = AsyncMock()
+
+        await coordinator.async_load()
+
+        saved = coordinator.store.async_save.await_args.args[0]
+        self.assertEqual(
+            saved["schema_version"],
+            self.module.ARCHIVE_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            saved["records"][0]["archive_origin"],
+            self.module.ARCHIVE_ORIGIN_OBSERVED,
+        )
+        self.assertEqual(saved["official_schedules"], [])
+        self.assertEqual(
+            coordinator.vintage_tracking_started_at,
+            tracking_started,
+        )
         await coordinator.async_shutdown()
 
     async def test_sensor_summary_excludes_full_interval_payload(self):
@@ -325,6 +706,18 @@ class PriceForecastTests(base.HAComponentTests):
             sensor.extra_state_attributes["forecast_intervals"],
             6 * 24 * 4,
         )
+        summary = sensor.extra_state_attributes["evolution_summary"]
+        for key in (
+            "expected_intervals",
+            "available_intervals",
+            "complete_delivery_coverage",
+            "partial_delivery_coverage",
+            "official_intervals",
+            "matched_intervals",
+            "complete_matched_coverage",
+            "partial_matched_coverage",
+        ):
+            self.assertIn(key, summary)
         self.assertNotIn("intervals", sensor.extra_state_attributes)
         await coordinator.async_shutdown()
 
@@ -450,8 +843,159 @@ class PriceForecastTests(base.HAComponentTests):
         )
         await coordinator.async_shutdown()
 
+    async def test_evolution_handles_23_24_25_hour_delivery_days(self):
+        coordinator = await self.forecast_coordinator()
+        profile = coordinator._profile()
+        cases = (
+            (date(2026, 3, 29), 92),
+            (date(2026, 8, 3), 96),
+            (date(2026, 10, 25), 100),
+        )
+        for delivery_day, expected in cases:
+            with self.subTest(delivery_day=delivery_day):
+                coordinator.archive = {}
+                coordinator.official_schedules = {}
+                delivery_start, delivery_end = self.pricing.market_bounds(
+                    delivery_day
+                )
+                hours = int(
+                    (delivery_end - delivery_start)
+                    / self.module.HOUR
+                )
+                coordinator.vintage_tracking_started_at = (
+                    delivery_start - timedelta(days=2)
+                ).isoformat()
+                self.add_archive_hours(
+                    coordinator,
+                    delivery_day,
+                    issued_at=delivery_start - timedelta(days=1),
+                    horizon_days=1,
+                    hour_indexes=list(range(hours)),
+                    p50=Decimal("100"),
+                )
+                self.add_official_schedule(
+                    coordinator,
+                    delivery_day,
+                )
+                now = delivery_start + timedelta(hours=12)
+                evolution = coordinator._evolution_response(
+                    profile,
+                    now,
+                    1,
+                    1,
+                    0,
+                    delivery_day,
+                    None,
+                    False,
+                    coordinator.official_schedules,
+                )
+                self.assertEqual(
+                    evolution["expected_intervals"],
+                    expected,
+                )
+                self.assertEqual(
+                    evolution["available_intervals"],
+                    expected,
+                )
+                self.assertEqual(
+                    evolution["official_intervals"],
+                    expected,
+                )
+                self.assertEqual(
+                    evolution["matched_intervals"],
+                    expected,
+                )
+                self.assertTrue(
+                    evolution["complete_delivery_coverage"]
+                )
+                self.assertTrue(
+                    evolution["complete_official_coverage"]
+                )
+                self.assertTrue(
+                    evolution["complete_matched_coverage"]
+                )
+        await coordinator.async_shutdown()
+
+    async def test_official_schedule_persists_after_delivery_day_rollover(self):
+        coordinator = await self.forecast_coordinator()
+        coordinator.store.async_save = AsyncMock()
+        with (
+            patch.object(
+                self.module,
+                "fetch_forecast",
+                return_value=self.report(),
+            ),
+            patch.object(
+                self.module,
+                "fetch_accuracy",
+                return_value=self.accuracy(),
+            ),
+        ):
+            await coordinator._async_update_data()
+        payload = coordinator.store.async_save.await_args.args[0]
+        delivery_day = (
+            self.now.astimezone(self.module.TALLINN).date()
+            + timedelta(days=1)
+        )
+        stored = {
+            item["delivery_date"]: item
+            for item in payload["official_schedules"]
+        }
+        self.assertEqual(
+            payload["schema_version"],
+            self.module.ARCHIVE_SCHEMA_VERSION,
+        )
+        self.assertTrue(stored[delivery_day.isoformat()]["complete"])
+        self.assertEqual(
+            stored[delivery_day.isoformat()]["available_intervals"],
+            96,
+        )
+        self.assertEqual(
+            stored[delivery_day.isoformat()]["profile_id"],
+            self.coordinator.data.profile_id,
+        )
+        self.assertEqual(
+            stored[delivery_day.isoformat()]["profile_version"],
+            self.coordinator.data.profile_version,
+        )
+        self.assertEqual(
+            stored[delivery_day.isoformat()]["profile_sha256"],
+            self.coordinator.data.profile_sha256,
+        )
+
+        self.now += timedelta(days=2)
+        reloaded = self.module.HouseholdPriceForecastCoordinator(
+            self.hass,
+            self.pricing_entry,
+            self.coordinator,
+        )
+        reloaded.store.async_load = AsyncMock(return_value=payload)
+        reloaded.store.async_save = AsyncMock()
+        await reloaded.async_load()
+        evolution = await reloaded.async_response(
+            "evolution",
+            3,
+            1,
+            0,
+            delivery_day,
+        )
+        self.assertEqual(evolution["matched_intervals"], 96)
+        self.assertTrue(evolution["complete_matched_coverage"])
+        self.assertEqual(
+            evolution["official_schedule"]["profile_sha256"],
+            self.coordinator.data.profile_sha256,
+        )
+        self.assertTrue(
+            evolution["official_schedule"][
+                "profile_matches_forecast_profile"
+            ]
+        )
+        await reloaded.async_shutdown()
+        await coordinator.async_shutdown()
+
     async def test_provider_failure_is_explicit_update_failure(self):
         coordinator = await self.forecast_coordinator()
+        coordinator.store.async_save = AsyncMock()
         with patch.object(
             self.module,
             "fetch_forecast",
@@ -465,6 +1009,15 @@ class PriceForecastTests(base.HAComponentTests):
                 "provider offline",
             ):
                 await coordinator.async_response("current", 7, 1)
+        coordinator.store.async_save.assert_awaited_once()
+        saved = coordinator.store.async_save.await_args.args[0]
+        self.assertEqual(len(saved["official_schedules"]), 2)
+        self.assertTrue(
+            all(
+                schedule["complete"]
+                for schedule in saved["official_schedules"]
+            )
+        )
         await coordinator.async_shutdown()
 
     async def test_cached_response_discloses_failed_refresh(self):
@@ -573,6 +1126,39 @@ class PriceForecastTests(base.HAComponentTests):
         )
         self.assertEqual(evolution["delivery_date"], delivery_day.isoformat())
         self.assertEqual(evolution["retained_issuance_count"], 1)
+        self.assertFalse(evolution["all_horizons"])
+        combined = await self.hass.services.async_call(
+            base.DOMAIN,
+            "get_price_forecast",
+            {
+                "config_entry": "pricing",
+                "view": "evolution",
+                "history_days": 8,
+                "horizon_days": 1,
+                "include_future_days": 1,
+                "delivery_date": delivery_day.isoformat(),
+                "all_horizons": True,
+            },
+            blocking=True,
+            return_response=True,
+        )
+        self.assertTrue(combined["all_horizons"])
+        self.assertEqual(combined["horizons_included"], [1])
+        with self.assertRaisesRegex(
+            self.module.ServiceValidationError,
+            "evolution view",
+        ):
+            await self.hass.services.async_call(
+                base.DOMAIN,
+                "get_price_forecast",
+                {
+                    "config_entry": "pricing",
+                    "view": "archive",
+                    "all_horizons": True,
+                },
+                blocking=True,
+                return_response=True,
+            )
         self.now = datetime.fromisoformat(current["window_end"]) + timedelta(
             hours=1
         )

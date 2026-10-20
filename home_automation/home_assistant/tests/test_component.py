@@ -472,6 +472,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         "proposed_target_c": 55,
                         "state": "readiness_charge",
                         "reason": "Readiness charge.",
+                        "current_price_eur_kwh": "0.25",
                         "write_sent": True,
                     },
                     {
@@ -499,6 +500,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         "proposed_offset_c": -4,
                         "state": "coast",
                         "reason": "Expensive block.",
+                        "current_price_eur_kwh": "0.30",
                         "write_sent": False,
                     },
                     {
@@ -509,6 +511,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         "proposed_offset_c": -4,
                         "state": "coast",
                         "reason": "Expensive block.",
+                        "current_price_eur_kwh": "0.30",
                         "write_sent": False,
                     }
                 ]
@@ -548,6 +551,14 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                     },
                 },
                 {
+                    "at": (
+                        now - timedelta(minutes=5)
+                    ).isoformat(),
+                    "operation": "resume",
+                    "phase": "reviewed",
+                    "success": True,
+                },
+                {
                     "at": now.isoformat(),
                     "operation": "restore",
                     "phase": "post_dispatch_uncertain",
@@ -567,9 +578,10 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
 
         attributes = sensor.extra_state_attributes
         self.assertEqual(attributes["verified_command_count"], 2)
-        self.assertEqual(attributes["no_command_count"], 1)
+        self.assertEqual(attributes["no_command_count"], 2)
         self.assertEqual(attributes["simulation_count"], 1)
         self.assertEqual(attributes["uncertain_command_count"], 1)
+        self.assertEqual(attributes["review_required_count"], 1)
         self.assertEqual(
             [event["kind"] for event in attributes["events"]],
             [
@@ -577,10 +589,27 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                 "no_command",
                 "simulation",
                 "verified_command",
-                "uncertain_command",
+                "no_command",
+                "review_required",
             ],
         )
-        self.assertEqual(sensor.native_value, "uncertain_command")
+        resume_event = attributes["events"][-2]
+        self.assertEqual(
+            resume_event["change"],
+            "Fresh-state reconciliation",
+        )
+        self.assertEqual(
+            resume_event["result"],
+            "No inverter command was sent.",
+        )
+        self.assertEqual(sensor.native_value, "review_required")
+        self.assertEqual(
+            attributes["events"][0]["decision_price_eur_kwh"],
+            0.25,
+        )
+        self.assertEqual(attributes["events"][0]["before_value"], 50)
+        self.assertEqual(attributes["events"][0]["after_value"], 55)
+        self.assertEqual(attributes["events"][0]["unit"], "°C")
 
     def test_solar_power_limit_sensors_use_equivalent_watts(self):
         controller = SimpleNamespace(
@@ -681,6 +710,79 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(activate_dhw.available)
         await activate_dhw.async_press()
         optimizer.async_activate_full_control.assert_awaited_once()
+
+    def test_energy_control_authority_sensors_distinguish_runtime_authority(self):
+        listener = Mock()
+        activity = self.sensor_module.EnergyControlActivitySensor(
+            SimpleNamespace(
+                mode="safe_target_shift",
+                decision=SimpleNamespace(state="coast", reason="Price shift."),
+                state={"fault": None, "decision_history": []},
+                async_add_listener=listener,
+            ),
+            SimpleNamespace(
+                mode="active",
+                decision=SimpleNamespace(
+                    state="schedule_learning_hold",
+                    reason="Native schedule changed.",
+                ),
+                state={"fault": None, "decision_history": []},
+                async_add_listener=listener,
+            ),
+            SimpleNamespace(
+                mode="shadow",
+                decision=SimpleNamespace(state="clear", reason="No block."),
+                state={"fault": None, "decision_history": []},
+                async_add_listener=listener,
+            ),
+            SimpleNamespace(
+                mode="armed",
+                decision=SimpleNamespace(
+                    state="persistence_fault",
+                    reason="Review required.",
+                ),
+                state={"fault": "Synthetic fault."},
+                operation_history=[],
+                async_add_listener=listener,
+            ),
+            "pricing",
+        )
+        values = {
+            key: self.sensor_module.EnergyControlAuthoritySensor(
+                activity,
+                key,
+                name,
+                "mdi:shield-check",
+                "pricing",
+            ).native_value
+            for key, name in (
+                ("hot_water", "Hot water authority"),
+                ("floor_heating", "Floor heating authority"),
+                ("extreme_protection", "Extreme protection authority"),
+                ("solar", "Solar authority"),
+            )
+        }
+        self.assertEqual(
+            values,
+            {
+                "hot_water": "live",
+                "floor_heating": "learning",
+                "extreme_protection": "shadow",
+                "solar": "fault",
+            },
+        )
+        self.assertEqual(
+            activity._controller_authority(
+                SimpleNamespace(
+                    mode="armed",
+                    decision=SimpleNamespace(state="unavailable"),
+                    state={"fault": None},
+                ),
+                live_modes=("armed",),
+                shadow_modes=("shadow",),
+            ),
+            "unavailable",
+        )
 
     async def test_solar_only_entry_loads_sensor_select_and_button_platforms(self):
         callbacks = []

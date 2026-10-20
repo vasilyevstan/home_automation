@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import timedelta, timezone
 from decimal import Decimal
+import math
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -121,13 +122,43 @@ async def async_setup_entry(
         if controller is not None
     ]
     if activity_controllers:
-        entities.append(
-            EnergyControlActivitySensor(
-                optimizer,
-                floor_shadow,
-                extreme_protection,
-                solar_curtailment,
+        activity = EnergyControlActivitySensor(
+            optimizer,
+            floor_shadow,
+            extreme_protection,
+            solar_curtailment,
+            entry.entry_id,
+        )
+        entities.append(activity)
+        entities.extend(
+            EnergyControlAuthoritySensor(
+                activity,
+                key,
+                name,
+                icon,
                 entry.entry_id,
+            )
+            for key, name, icon in (
+                (
+                    "hot_water",
+                    "Hot water authority",
+                    "mdi:water-boiler-auto",
+                ),
+                (
+                    "floor_heating",
+                    "Floor heating authority",
+                    "mdi:heating-coil",
+                ),
+                (
+                    "extreme_protection",
+                    "Extreme protection authority",
+                    "mdi:shield-lightning",
+                ),
+                (
+                    "solar",
+                    "Solar authority",
+                    "mdi:solar-power-variant",
+                ),
             )
         )
     async_add_entities(entities)
@@ -458,6 +489,82 @@ class EnergyControlActivitySensor(SensorEntity):
             display = str(configured)
         return f"{display}{suffix}"
 
+    @staticmethod
+    def _numeric(value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if math.isfinite(result) else None
+
+    @classmethod
+    def _event_values(
+        cls,
+        before: object,
+        after: object,
+        unit: str,
+    ) -> dict:
+        return {
+            "before_value": cls._numeric(before),
+            "after_value": cls._numeric(after),
+            "unit": unit,
+        }
+
+    @staticmethod
+    def _controller_authority(
+        controller,
+        *,
+        live_modes: tuple[str, ...],
+        shadow_modes: tuple[str, ...],
+        learning_states: tuple[str, ...] = (),
+    ) -> str:
+        if controller is None:
+            return "unavailable"
+        state = getattr(getattr(controller, "decision", None), "state", None)
+        stored = getattr(controller, "state", {})
+        if isinstance(stored, dict) and stored.get("fault"):
+            return "fault"
+        if state in ("fault", "persistence_fault"):
+            return "fault"
+        if state == "unavailable":
+            return "unavailable"
+        if state in learning_states:
+            return "learning"
+        mode = getattr(controller, "mode", None)
+        if mode in shadow_modes:
+            return "shadow"
+        if mode in live_modes:
+            return "live"
+        return "blocked"
+
+    def _authorities(self) -> dict:
+        return {
+            "hot_water": self._controller_authority(
+                self.optimizer,
+                live_modes=("readiness_pilot", "safe_target_shift"),
+                shadow_modes=("shadow",),
+            ),
+            "floor_heating": self._controller_authority(
+                self.floor_shadow,
+                live_modes=("active",),
+                shadow_modes=("shadow",),
+                learning_states=("schedule_learning_hold",),
+            ),
+            "extreme_protection": self._controller_authority(
+                self.extreme_protection,
+                live_modes=("armed",),
+                shadow_modes=("shadow",),
+            ),
+            "solar": self._controller_authority(
+                self.solar_curtailment,
+                live_modes=("armed",),
+                shadow_modes=("shadow",),
+                learning_states=("qualifying",),
+            ),
+        }
+
     def _events(self) -> list[dict]:
         now = dt_util.utcnow().astimezone(timezone.utc)
         cutoff = now - timedelta(hours=24)
@@ -499,6 +606,9 @@ class EnergyControlActivitySensor(SensorEntity):
                     "observed_at": observed_at.isoformat(),
                     "system": "Hot water",
                     "kind": kind,
+                    "authority": (
+                        "shadow" if kind == "simulation" else "live"
+                    ),
                     "state": state,
                     "change": self._temperature_change(
                         record.get("actual_target_c"),
@@ -506,6 +616,15 @@ class EnergyControlActivitySensor(SensorEntity):
                         "Target",
                     ),
                     "reason": record.get("reason"),
+                    "decision_price_eur_kwh": self._numeric(
+                        record.get("current_price_eur_kwh")
+                    ),
+                    "command_source": "dhw_optimizer",
+                    **self._event_values(
+                        record.get("actual_target_c"),
+                        record.get("proposed_target_c"),
+                        "°C",
+                    ),
                     "result": (
                         "Guarded command confirmed by native Daikin read-back."
                         if write_sent
@@ -542,6 +661,15 @@ class EnergyControlActivitySensor(SensorEntity):
                             else "no_command"
                         )
                     ),
+                    "authority": (
+                        "shadow"
+                        if mode in (None, "shadow")
+                        else (
+                            "learning"
+                            if state == "schedule_learning_hold"
+                            else "live"
+                        )
+                    ),
                     "state": state,
                     "change": self._temperature_change(
                         record.get("actual_offset_c"),
@@ -549,6 +677,15 @@ class EnergyControlActivitySensor(SensorEntity):
                         "Offset",
                     ),
                     "reason": record.get("reason"),
+                    "decision_price_eur_kwh": self._numeric(
+                        record.get("current_price_eur_kwh")
+                    ),
+                    "command_source": "floor_heating_optimizer",
+                    **self._event_values(
+                        record.get("actual_offset_c"),
+                        record.get("proposed_offset_c"),
+                        "°C",
+                    ),
                     "result": (
                         "Guarded command confirmed by native Daikin read-back."
                         if write_sent
@@ -585,6 +722,11 @@ class EnergyControlActivitySensor(SensorEntity):
                         if write_sent
                         else "no_command"
                     ),
+                    "authority": (
+                        "live"
+                        if write_sent
+                        else "blocked"
+                    ),
                     "state": state,
                     "change": (
                         ", ".join(
@@ -597,6 +739,13 @@ class EnergyControlActivitySensor(SensorEntity):
                         or "No protected-load change"
                     ),
                     "reason": record.get("reason"),
+                    "decision_price_eur_kwh": self._numeric(
+                        record.get("current_price_eur_kwh")
+                    ),
+                    "command_source": "extreme_price_protection",
+                    "before_value": None,
+                    "after_value": None,
+                    "unit": None,
                     "result": (
                         "Sequential protected-load commands were confirmed."
                         if write_sent
@@ -611,14 +760,20 @@ class EnergyControlActivitySensor(SensorEntity):
                     continue
                 phase = str(record.get("phase") or "unknown")
                 success = record.get("success") is True
-                if success:
+                operation = str(record.get("operation") or "review")
+                command_confirmed = (
+                    success
+                    and phase == "verified"
+                    and operation in ("acquire", "restore")
+                )
+                if command_confirmed:
                     kind = "verified_command"
                     result = (
                         "Guarded inverter command confirmed by native Huawei "
                         "read-back."
                     )
                 elif "post_dispatch" in phase:
-                    kind = "uncertain_command"
+                    kind = "review_required"
                     result = (
                         "The inverter command outcome is uncertain and "
                         "requires fresh-state review."
@@ -626,28 +781,71 @@ class EnergyControlActivitySensor(SensorEntity):
                 else:
                     kind = "no_command"
                     result = "No inverter command was sent."
-                operation = str(record.get("operation") or "review")
                 events.append({
                     "observed_at": observed_at.isoformat(),
                     "system": "Solar",
                     "kind": kind,
+                    "authority": (
+                        "fault"
+                        if kind == "review_required"
+                        else "live"
+                    ),
                     "state": phase,
                     "change": (
                         "Limit {} → {}".format(
                             self._solar_limit(record.get("previous")),
                             self._solar_limit(record.get("confirmed")),
                         )
-                        if success
+                        if command_confirmed
                         else (
                             "Apply controller cap"
                             if operation == "acquire"
-                            else "Restore original limit"
+                            else (
+                                "Restore original limit"
+                                if operation == "restore"
+                                else "Fresh-state reconciliation"
+                            )
                         )
                     ),
                     "reason": (
                         record.get("reason")
                         or record.get("error")
                         or operation.replace("_", " ").title()
+                    ),
+                    "decision_price_eur_kwh": self._numeric(
+                        record.get("decision_price_eur_kwh")
+                    ),
+                    "command_source": "solar_curtailment",
+                    **self._event_values(
+                        (
+                            record.get("previous", {}).get(
+                                "configured"
+                            )
+                            if isinstance(
+                                record.get("previous"), dict
+                            )
+                            else None
+                        ),
+                        (
+                            record.get("confirmed", {}).get(
+                                "configured"
+                            )
+                            if isinstance(
+                                record.get("confirmed"), dict
+                            )
+                            else None
+                        ),
+                        (
+                            "%"
+                            if (
+                                isinstance(
+                                    record.get("confirmed"), dict
+                                )
+                                and record["confirmed"].get("mode")
+                                == "percent"
+                            )
+                            else "W"
+                        ),
                     ),
                     "result": result,
                 })
@@ -664,6 +862,10 @@ class EnergyControlActivitySensor(SensorEntity):
                     "change",
                     "reason",
                     "result",
+                    "authority",
+                    "before_value",
+                    "after_value",
+                    "decision_price_eur_kwh",
                 )
             )
             if last_signature_by_system.get(event["system"]) == signature:
@@ -684,6 +886,7 @@ class EnergyControlActivitySensor(SensorEntity):
             "window_hours": 24,
             "event_limit": 24,
             "events": events,
+            "authority": self._authorities(),
             "verified_command_count": sum(
                 event["kind"] == "verified_command" for event in events
             ),
@@ -693,9 +896,70 @@ class EnergyControlActivitySensor(SensorEntity):
             "no_command_count": sum(
                 event["kind"] == "no_command" for event in events
             ),
-            "uncertain_command_count": sum(
-                event["kind"] == "uncertain_command" for event in events
+            "review_required_count": sum(
+                event["kind"] == "review_required" for event in events
             ),
+            "uncertain_command_count": sum(
+                event["kind"] == "review_required" for event in events
+            ),
+        }
+
+
+class EnergyControlAuthoritySensor(SensorEntity):
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        activity: EnergyControlActivitySensor,
+        authority_key: str,
+        name: str,
+        icon: str,
+        entry_id: str,
+    ) -> None:
+        self.activity = activity
+        self.authority_key = authority_key
+        self._attr_name = name
+        self._attr_icon = icon
+        self._attr_unique_id = (
+            entry_id + "_energy_control_" + authority_key + "_authority"
+        )
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)},
+            name=NAME,
+            manufacturer="home_automation",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        for controller in (
+            self.activity.optimizer,
+            self.activity.floor_shadow,
+            self.activity.extreme_protection,
+            self.activity.solar_curtailment,
+        ):
+            if controller is not None:
+                self.async_on_remove(
+                    controller.async_add_listener(
+                        self.async_write_ha_state
+                    )
+                )
+
+    @property
+    def native_value(self) -> str:
+        return self.activity._authorities()[self.authority_key]
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        controller = {
+            "hot_water": self.activity.optimizer,
+            "floor_heating": self.activity.floor_shadow,
+            "extreme_protection": self.activity.extreme_protection,
+            "solar": self.activity.solar_curtailment,
+        }[self.authority_key]
+        decision = getattr(controller, "decision", None)
+        return {
+            "controller_mode": getattr(controller, "mode", None),
+            "controller_state": getattr(decision, "state", None),
+            "reason": getattr(decision, "reason", None),
         }
 
 

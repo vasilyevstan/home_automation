@@ -273,7 +273,8 @@ canonical published household price exist; missing or partial publication is
 not zero.
 
 Use the bounded evolution view to inspect every retained revision for one
-delivery date:
+delivery date. `all_horizons: true` combines the retained D-1 through D-7
+vintages; omit it to preserve the backward-compatible single-horizon response:
 
 ```yaml
 action: household_electricity_pricing.get_price_forecast
@@ -282,17 +283,21 @@ data:
   view: evolution
   delivery_date: "2026-10-20"
   history_days: 7
-  horizon_days: 1
-  include_future_days: 1
+  all_horizons: true
+  include_future_days: 0
 ```
 
 The response returns each quarter's chronological vintages plus the first and
-latest retained values, issuance coverage, and explicit capture-quality flags.
-It calls the first value original only when vintage tracking covered the full
-requested D-N window and no migrated latest-only record is involved. Compare
-forecast revisions with canonical household prices by exact quarter timestamp;
-do not infer missing actuals or invent revisions that were overwritten before
-vintage tracking began.
+latest retained values, horizons included, issuance coverage, and explicit
+capture-quality flags. `issuance_metrics` reports MAE, signed bias, movement and
+the common matched-quarter count for each real issuance timestamp. Those error
+metrics use only the quarter intersection shared by every retained issuance and
+the profile-compatible published schedule, so changing coverage cannot masquerade
+as forecast improvement. Partial coverage and migrated latest-only evidence
+remain explicit. The integration also retains canonical published schedules
+for 90 days with their pricing-profile provenance. Compare by exact quarter
+timestamp; do not infer missing published prices or invent revisions that were
+overwritten before vintage tracking began.
 
 A future application can call the same action through HA's authenticated REST
 service API instead of introducing a separate unauthenticated server. Use a
@@ -458,10 +463,11 @@ open-loop generation curtailment based on export economics; it is not
 zero-export control and does not infer household surplus, grid direction or
 export power.
 
-Policy revision 1 defaults to `Shadow`. `Armed` is hidden until deterministic
+Policy revision 2 defaults to `Shadow`. `Armed` is hidden until deterministic
 policy replay, elevated Huawei write capability, bound config-entry/serial/Pmax,
-mode-preserving cap calculation and two stable unrestricted observations are
-verified. Passing those gates never selects `Armed` automatically.
+mode-preserving cap calculation and two stable unrestricted daylight/output
+observations are verified. Passing those gates never selects `Armed`
+automatically.
 
 An exact negative export price is a Shadow opportunity. Armed entry additionally
 requires:
@@ -470,16 +476,20 @@ requires:
 - a known contiguous negative-price block with at least 30 minutes remaining;
 - the existing configured and active limit to match at unrestricted 100% or
   Pmax;
+- `sun.sun` to be above the horizon;
 - fresh inverter AC active power at or above 5,000 W on two observations at
   least 30 seconds apart, plus a full 60-second qualification dwell;
 - a distinct native-step **4,000 W-equivalent** target in the existing limit
   mode. An 8 kW inverter in percentage mode therefore uses 50.0%; fixed-watt
   mode uses 4,000 W. The controller never changes limit mode.
 
-One dispatched acquisition attempt is allowed per contiguous block. The lease
-ends at the earlier of two hours or the block end. Clouds or lower PV output after
-acquisition do not trigger an early restore because the cap can become
-non-binding. The exact original limit is restored on non-negative, stale or
+New qualification and commissioning evidence reset immediately at sunset,
+stale telemetry or output below 5,000 W. One dispatched acquisition attempt is
+allowed per contiguous block. The lease ends at the earlier of two hours or the
+block end. Clouds or lower PV output after acquisition do not trigger an early
+restore because the cap can become non-binding. Sunset or zero output may safely
+restore an already-owned cap; restoration does not require the acquisition
+gates. The exact original limit is also restored on non-negative, stale or
 invalid prices, profile change, lease expiry, block end, mode change or graceful
 unload.
 
@@ -524,7 +534,8 @@ mode is converted with the bound inverter Pmax; watt mode is preserved. The
 controller also keeps a bounded private history of its last 12 cap/restore
 operations so the compact Energy control activity sensor can distinguish
 verified solar commands, pre-dispatch no-command outcomes, and uncertain
-post-dispatch results. The activity entity retains at most 24 deduplicated
+post-dispatch results that require review. The activity entity retains at most
+24 deduplicated
 cross-controller events from the latest 24 hours.
 
 ## Domestic-hot-water price optimizer
@@ -540,13 +551,15 @@ The default policy is:
 | Setting | Value |
 | --- | --- |
 | Readiness deadlines | 07:00 and 21:00 Europe/Tallinn |
-| Soft-standby target | 30°C |
+| Explicit native minimum | 30°C, manual only |
 | Comfort threshold / safe coast target | 45°C |
 | Normal target | 50°C |
 | Cheap-period / final-readiness charge target | 55°C |
-| Maximum 30°C lease | 4 hours |
+| Post-readiness demand hold | 120 minutes at 50°C |
+| Delivered-readiness re-arm | 48°C |
+| Final top-up window | Last 45 minutes, once |
 | Price gate | Current all-in price at least €0.05/kWh and 20% above the selected cheap-window average |
-| Initial heating allowance | 90 minutes |
+| Initial deep-heating allowance | 120 minutes until five clean deep cycles |
 | Preheat coast horizon | 8 hours |
 
 For each readiness cycle, the optimizer anchors one cheapest contiguous
@@ -560,10 +573,15 @@ electrical energy is unavailable.
 
 The bounded readiness pilot is deliberately separate from price shifting.
 Outside the final conservative heating allowance it holds 50°C and cannot use
-45°C coast or 30°C soft standby. Inside that allowance, it requests 55°C only
+45°C coast. Automatic control never selects 30°C. Inside that allowance, it
+requests 55°C only
 while measured tank temperature remains below 50°C, then immediately restores
 the 50°C target. The higher target is a temporary request to overcome native
 target-50 hysteresis; it does not change the measured readiness requirement.
+After both readiness deadlines, a two-hour demand hold keeps the target at
+50°C so a delivery-time draw cannot immediately roll the controller into a
+price-driven coast. Once readiness has been delivered, normal charging re-arms
+at 48°C; one final top-up is permitted below 50°C during the last 45 minutes.
 
 Comfort or missed-deadline recovery is latched until the measured tank reaches
 50°C. Reaching 50°C after an anchored cheap window starts is also persisted as
@@ -571,20 +589,23 @@ completion for that readiness plan, including completion during post-window
 recovery. A later 49°C reading therefore does not incorrectly re-enter recovery
 for a plan that already succeeded; comfort and readiness guards still apply.
 Ordinary 45/50°C cost-driven transitions use a 30-minute minimum dwell, while
-comfort, readiness, incomplete-data and lease-expiry exits bypass it. Each
+comfort, readiness and incomplete-data exits bypass it. Deep-recovery and
+shallow readiness-top-up durations are learned separately. Each
 policy revision that changes scheduling values or qualification semantics clears
 prior evidence so changed Shadow behavior must earn a new observation period.
-Revision 5 adds the final-readiness 55→50°C behavior and therefore clears
-revision-4 day, cycle, readiness and write evidence. If a policy upgrade finds
-a persisted write-capable mode, it pauses and faults for explicit review rather
-than continuing under evidence earned by the previous policy.
+Revision 6 retires automatic 30°C standby. A persisted revision-5
+`soft_standby` mode migrates command-free to `safe_target_shift`, clears its
+lease and preserves measured readiness evidence. Older incompatible
+write-capable revisions still pause for explicit review.
 
 Deadline evidence distinguishes a measured success, measured readiness later
 consumed by a rapid draw, a rapid-draw-contaminated check that cannot prove
 delivery, a genuine miss, and unavailable/overridden evidence. Measured success
 and measured-then-consumed outcomes count as delivered. Contaminated and
 unavailable checks are excluded rather than silently passed or failed; a genuine
-miss blocks promotion.
+miss blocks promotion. Outcomes remain provisional through the 15-minute
+post-deadline observation window so a rapid draw can reclassify an apparent
+success as `consumed_after_delivery`.
 
 The options flow validates every target against the selected Daikin's native
 range and step. On the verified BRP069A62 installation that range is 30–55°C in
@@ -600,24 +621,19 @@ The runtime mode select provides:
   observation days, five usable heat cycles, ten delivered usable readiness
   checks with no genuine miss, and two confirmed readiness-pilot writes, permit
   guarded 55°C preheat, 45°C coast, and latched 50°C recovery targets.
-- `soft_standby`: after a validated seven-day safe pilot and ten confirmed
-  safe-pilot writes, permit the 30°C target under a persisted four-hour lease.
 - `paused`: issue no automatic targets.
 
 The evidence gates remain the normal promotion path. A separate
 `Activate full hot water control` button records an explicit owner-approved
-early activation timestamp and selects `soft_standby` without fabricating
+early activation timestamp and selects `safe_target_shift` without fabricating
 qualification days, cycles or checks. All comfort/readiness exits, target
-ownership, exact expected-previous validation, manufacturer guards, leases and
+ownership, exact expected-previous validation, manufacturer guards and
 fault latches remain unchanged. This override is intentionally auditable in
 the status attributes.
 
-The 30°C target is soft standby, not active cooling and not the comfort floor.
-It leaves the DHW circuit enabled but relies on HA to restore 50°C at the 45°C
-threshold, lease expiry, readiness lead time, incomplete data, or a failed price
-gate. A complete HA outage can leave that low target in place until HA returns,
-so the mode is never enabled automatically and its residual risk must remain
-visible in the UI.
+The native 30°C target remains available to an explicitly requested guarded
+manual write, but it is not present in the optimizer mode selector and is never
+chosen by automatic policy.
 
 One shared `EnergyDevices` instance serializes optimizer and explicit MCP writes.
 The controller yields to circuit standby, powerful/hygiene-like operation,
@@ -625,7 +641,9 @@ weather-dependent control, active/unknown safety flags, configured/effective
 target mismatch, external target changes, and Extreme Price Protection priority.
 Before every automatic target transition, the writer repeats the relevant
 manufacturer-state checks and requires the exact fresh target to match the
-controller's expected previous value. It only modifies a target it owns. An
+controller's expected previous value. A proved pre-dispatch mismatch is a
+typed no-command conflict and is reevaluated from fresh state without latching
+a false uncertain fault. It only modifies a target it owns. An
 uncertain write latches the optimizer in fault, creates a persistent notification,
 and requires a fresh read plus explicit resume; there is no automatic retry,
 inversion, or rollback.
@@ -689,7 +707,7 @@ missing-input or DHW-priority contamination.
 
 The verified Daikin surface supports a native **-10°C to +10°C** weather-curve
 offset. That capability is not a safe optimization envelope by itself. Floor
-policy revision 5 evaluates one meaningful **4°C relative overlay**, bounded to
+policy revision 6 evaluates one meaningful **4°C relative overlay**, bounded to
 an initial **-6°C to +4°C** envelope:
 
 | Fresh native offset | Cheap-block proposal | Paired peak proposal |
@@ -698,7 +716,7 @@ an initial **-6°C to +4°C** envelope:
 | 0°C | +4°C | -4°C |
 
 Other fresh native offsets use the same `native ± 4°C` rule and clamp at the
-revision-5 bounds. The old separate +1°C aggressive candidate is retained only
+revision-6 bounds. The old separate +1°C aggressive candidate is retained only
 as a compatibility field in historical decision data; it is no longer the
 policy.
 
@@ -711,7 +729,7 @@ quarters are never forecast or zero-filled. Within that evidence it pairs a
 two-hour cheap block with a later two-hour expensive block no more than eight
 hours away, and requires the same €0.05/kWh and 20% materiality gates as the
 DHW policy. It yields to safety/override states, non-LWT control, circuit
-standby, missing temperatures and offsets outside the revision-5 envelope. At
+standby, missing temperatures and offsets outside the revision-6 envelope. At
 or below the 20°C indoor guard it removes a negative offset without lowering an
 already warmer native setting. At or above 21°C it records `preheat_limited` and
 preserves the native offset instead of adding heat.
@@ -723,11 +741,19 @@ electrical energy are unavailable, so solar-driven floor-heating dispatch
 remains disabled and the sensor reports price opportunity rather than measured
 kWh or euro savings. The separate bounded inverter-curtailment controller does
 not make the floor evaluator solar-aware.
+In Active mode, fresh native -2°C and 0°C values are accepted as schedule
+baselines. If the native schedule changes between those values while an overlay
+is owned, the controller releases ownership without restoring the stale
+baseline, preserves the schedule value, contaminates the candidate cycle and
+holds further writes until the current cheap/peak window ends. Three accepted
+transitions within one hour are treated as an unstable schedule and return the
+controller to Shadow; unexpected values still fail safely to Shadow.
+
 The evidence gate remains ineligible until at least 14 observed days and five
-clean revision-5 candidate cycles. The explicit owner-approved path can select
+clean revision-6 candidate cycles. The explicit owner-approved path can select
 active mode earlier, but it does not claim that thermal-lag evidence passed.
 The numerical -6°C to +4°C envelope and 4°C overlay are unchanged from revision
-4; revision 5 adds guarded ownership and write/restore behavior.
+5; revision 6 adds native-schedule reconciliation and observation-only startup.
 
 The dedicated floor opportunity sensor changes its valuation status from
 `counterfactual` to `live_action_unattributed` in active mode. Confirmed offset

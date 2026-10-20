@@ -113,6 +113,14 @@
         "include_future_days": {
           "name": "Future delivery days",
           "description": "Archive view only: also return stored forecasts through the end of the next 0 to 7 Tallinn delivery days. Use this to retain a prediction for comparison after official prices publish."
+        },
+        "delivery_date": {
+          "name": "Delivery date",
+          "description": "Evolution view only: select one Europe/Tallinn delivery date."
+        },
+        "all_horizons": {
+          "name": "Combine provider horizons",
+          "description": "Evolution view only: combine retained D-1 through D-7 issuances for the selected delivery date. Disabled preserves the selected single horizon."
         }
       }
     },
