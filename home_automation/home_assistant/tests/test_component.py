@@ -645,7 +645,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
     def test_solar_relevance_requires_daylight_and_fresh_output_gate(self):
         controller = SimpleNamespace(
             attributes={
-                "daylight_state": "below_horizon",
+                "sun_state": "below_horizon",
                 "active_power_w": 6200,
                 "active_power_fresh": True,
                 "output_gate_w": 5000,
@@ -659,7 +659,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sensor.native_value, "waiting_for_daylight")
         self.assertFalse(sensor.extra_state_attributes["ready"])
 
-        controller.attributes["daylight_state"] = "above_horizon"
+        controller.attributes["sun_state"] = "above_horizon"
         controller.attributes["active_power_w"] = 4200
         self.assertEqual(sensor.native_value, "waiting_for_output")
 
