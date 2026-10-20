@@ -184,8 +184,10 @@
   with its native polling coordinator, not only the API's own per-device lock.
   Native Huawei service/entity writes do not share that lock: after
   authentication and prepared-audit persistence, repeat the exact
-  identity/Pmax/configured/active/active-power read immediately before dispatch
-  and reject any change. Document that the residual read-to-write race remains.
+  identity/Pmax/configured/active-limit read immediately before dispatch and
+  reject any change. Active power must be fresh for policy qualification but is
+  expected to move between reads and must not be treated as immutable device
+  state. Document that the residual read-to-write race remains.
 - Huawei writes fail closed unless the selected entry has elevated parameter
   configuration and a usable native configuration coordinator. Keep the read
   tool for read-only entries but do not advertise `SolarLimitWrite`. Every

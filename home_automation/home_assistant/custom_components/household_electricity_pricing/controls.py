@@ -36,6 +36,14 @@ from .const import (
 LOGGER = logging.getLogger(__name__)
 FLAGS = ("ErrorState", "WarningState", "EmergencyState", "InstallerState")
 SOLAR_ELEVATED_CONFIGURATION = "enable_parameter_configuration"
+SOLAR_STABLE_STATE_KEYS = (
+    "config_entry_id",
+    "serial",
+    "mode",
+    "configured",
+    "active",
+    "pmax_w",
+)
 
 
 class SolarPreDispatchError(HomeAssistantError):
@@ -926,19 +934,10 @@ class EnergyDevices:
                     )
                     if any(
                         refreshed[key] != previous[key]
-                        for key in (
-                            "config_entry_id",
-                            "serial",
-                            "mode",
-                            "configured",
-                            "active",
-                            "pmax_w",
-                            "active_power_w",
-                        )
+                        for key in SOLAR_STABLE_STATE_KEYS
                     ):
                         raise SolarPreDispatchError(
-                            "The inverter identity, Pmax, limit, or active "
-                            "power changed "
+                            "The inverter identity, Pmax, or limit changed "
                             "during authentication; read it again. No inverter "
                             "command was sent."
                         )
@@ -969,18 +968,9 @@ class EnergyDevices:
                     write_enabled=True,
                     write_permission_basis=permission_basis,
                 )
-                exact_keys = (
-                    "config_entry_id",
-                    "serial",
-                    "mode",
-                    "configured",
-                    "active",
-                    "pmax_w",
-                    "active_power_w",
-                )
                 if any(
                     immediate[key] != previous[key]
-                    for key in exact_keys
+                    for key in SOLAR_STABLE_STATE_KEYS
                 ):
                     try:
                         await self.record(
@@ -1001,7 +991,7 @@ class EnergyDevices:
                             "persisted."
                         )
                     raise SolarExternalOverrideError(
-                        "The inverter identity, Pmax, limit, or active power "
+                        "The inverter identity, Pmax, or limit "
                         "changed after the prepared audit record. This is "
                         "treated as an external override and no inverter "
                         "command was sent.",
