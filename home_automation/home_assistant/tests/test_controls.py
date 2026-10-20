@@ -392,10 +392,32 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
             await self.devices.set_solar_limit(self.solar_request())
         self.solar.set.assert_not_awaited()
 
+    async def test_solar_active_power_drift_is_observational(self):
+        original_get = self.solar.client.get.side_effect
+        active_power_reads = 0
+
+        async def moving_active_power(name):
+            nonlocal active_power_reads
+            if name == self.rn.ACTIVE_POWER:
+                active_power_reads += 1
+                return SimpleNamespace(value=6200 + active_power_reads)
+            return await original_get(name)
+
+        self.solar.client.get.side_effect = moving_active_power
+        self.solar_entry.data["username"] = "installer"
+        result = await self.devices.set_solar_limit(self.solar_request())
+        self.assertTrue(result["changed"])
+        self.assertGreaterEqual(active_power_reads, 4)
+        self.solar.set.assert_awaited_once()
+        self.assertEqual(
+            [call.args[0] for call in self.devices.record.await_args_list],
+            ["prepared", "verified"],
+        )
+
     async def test_solar_final_exact_recheck_catches_cross_integration_change(self):
         async def record(event, _record):
             if event == "prepared":
-                self.solar_state["active_power"] = 6100
+                self.solar_state.update(percent=90.0, active=900)
 
         self.devices.record.side_effect = record
         with self.assertRaisesRegex(
@@ -403,7 +425,8 @@ class EnergyControlTests(unittest.IsolatedAsyncioTestCase):
             "external override",
         ) as raised:
             await self.devices.set_solar_limit(self.solar_request())
-        self.assertEqual(raised.exception.status["active_power_w"], 6100.0)
+        self.assertEqual(raised.exception.status["configured"], 90.0)
+        self.assertEqual(raised.exception.status["active"], 90.0)
         self.solar.set.assert_not_awaited()
         self.assertEqual(
             [call.args[0] for call in self.devices.record.await_args_list],

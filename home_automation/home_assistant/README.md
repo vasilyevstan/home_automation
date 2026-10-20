@@ -425,8 +425,10 @@ The guarded writer holds Huawei's `update_lock`, which serializes against native
 polling, but Huawei's own service/entity writes do not participate in that lock.
 After authentication and durable prepared-audit persistence, the guarded writer
 therefore performs a second exact config-entry/serial/Pmax, configured/active
-limit and active-power read immediately before dispatch. Any change is treated
-as an external override and no command is sent. A native write can still race in
+limit read immediately before dispatch. Any change to those stable values is
+treated as an external override and no command is sent. AC active power is still
+read fresh for eligibility and audit evidence, but normal watt-by-watt movement
+does not represent an external limit change. A native write can still race in
 the final interval between that optimistic read and the Modbus write, so do not
 run Huawei-native limit changes concurrently with guarded control.
 
