@@ -537,8 +537,13 @@ converted with the bound inverter Pmax; watt mode is preserved. The controller
 also keeps a bounded private history of its last 12 cap/restore operations so
 the compact Energy control activity sensor can distinguish verified solar
 commands, pre-dispatch no-command outcomes, and uncertain post-dispatch results
-that require review. The activity entity retains at most 24 deduplicated
-cross-controller events from the latest 24 hours.
+that require review. Verified DHW and floor commands are also rebuilt from the
+private guarded-control audit journal, so frequent controller evaluations
+cannot erase command evidence that is still inside the rolling 24-hour window.
+The activity entity exposes a bounded command/review list separately and
+reserves the 24-item mixed display feed for those events before filling
+remaining slots with simulations and no-command context. Journal read or parse
+failures are reported explicitly.
 
 ## Domestic-hot-water price optimizer
 

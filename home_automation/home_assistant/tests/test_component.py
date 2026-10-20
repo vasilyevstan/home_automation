@@ -611,6 +611,75 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attributes["events"][0]["after_value"], 55)
         self.assertEqual(attributes["events"][0]["unit"], "°C")
 
+    async def test_energy_control_activity_preserves_audited_commands(self):
+        now = self.now
+        with tempfile.TemporaryDirectory() as directory:
+            journal_path = Path(directory) / "home_energy_control.jsonl"
+            journal_path.write_text(
+                json.dumps(
+                    {
+                        "event": "verified",
+                        "observed_at": (
+                            now - timedelta(hours=20)
+                        ).isoformat(),
+                        "operation": "heating_offset",
+                        "previous": -2.0,
+                        "requested": -6.0,
+                        "confirmed": -6.0,
+                        "request_id": "floor-command-inside-window",
+                    }
+                )
+                + "\n"
+            )
+            simulations = [
+                {
+                    "observed_at": (
+                        now - timedelta(minutes=30 - index)
+                    ).isoformat(),
+                    "state": "preheat" if index % 2 else "coast",
+                    "write_sent": False,
+                    "mode": "shadow",
+                    "actual_offset_c": 0.0,
+                    "proposed_offset_c": -4.0 if index % 2 else 4.0,
+                    "reason": f"simulation {index}",
+                    "current_price_eur_kwh": 0.1 + index / 1000,
+                }
+                for index in range(30)
+            ]
+            floor = SimpleNamespace(
+                devices=SimpleNamespace(journal=journal_path),
+                state={"decision_history": simulations},
+            )
+            activity = self.sensor_module.EnergyControlActivitySensor(
+                optimizer=None,
+                floor_shadow=floor,
+                extreme_protection=None,
+                solar_curtailment=None,
+                entry_id="pricing",
+            )
+            audit_events, errors = activity._read_verified_audit_events(
+                journal_path,
+                now - timedelta(hours=24),
+            )
+            self.assertEqual(errors, [])
+            activity._audit_events = audit_events
+
+            attrs = activity.extra_state_attributes
+            self.assertEqual(len(attrs["events"]), 24)
+            self.assertTrue(
+                any(
+                    event.get("request_id") == "floor-command-inside-window"
+                    for event in attrs["command_events"]
+                )
+            )
+            self.assertTrue(
+                any(
+                    event.get("request_id") == "floor-command-inside-window"
+                    for event in attrs["events"]
+                )
+            )
+            self.assertEqual(attrs["verified_command_count"], 1)
+
     def test_solar_power_limit_sensors_use_equivalent_watts(self):
         controller = SimpleNamespace(
             attributes={
