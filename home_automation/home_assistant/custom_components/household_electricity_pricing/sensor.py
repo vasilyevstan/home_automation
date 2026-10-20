@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import json
+import logging
 import math
+from pathlib import Path
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -23,6 +26,9 @@ from homeassistant.util import dt as dt_util
 from .const import DOMAIN, NAME
 from .coordinator import HouseholdPriceCoordinator
 from .price_forecast import HouseholdPriceForecastCoordinator
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 DESCRIPTIONS = (
@@ -429,6 +435,10 @@ class FloorRoomTemperatureSensor(SensorEntity):
 
 
 class EnergyControlActivitySensor(SensorEntity):
+    _EVENT_LIMIT = 24
+    _COMMAND_EVENT_LIMIT = 24
+    _COMMAND_KINDS = frozenset({"verified_command", "review_required"})
+
     _attr_has_entity_name = True
     _attr_name = "Energy control activity"
     _attr_icon = "mdi:timeline-check-outline"
@@ -445,6 +455,9 @@ class EnergyControlActivitySensor(SensorEntity):
         self.floor_shadow = floor_shadow
         self.extreme_protection = extreme_protection
         self.solar_curtailment = solar_curtailment
+        self._audit_events: list[dict] = []
+        self._audit_error: str | None = None
+        self._audit_refresh_task = None
         self._attr_unique_id = entry_id + "_energy_control_activity"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry_id)},
@@ -453,6 +466,8 @@ class EnergyControlActivitySensor(SensorEntity):
         )
 
     async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        await self._async_refresh_audit_events(write_state=False)
         for controller in (
             self.optimizer,
             self.floor_shadow,
@@ -461,7 +476,7 @@ class EnergyControlActivitySensor(SensorEntity):
         ):
             if controller is not None:
                 self.async_on_remove(
-                    controller.async_add_listener(self.async_write_ha_state)
+                    controller.async_add_listener(self._handle_controller_update)
                 )
 
     @staticmethod
@@ -504,6 +519,171 @@ class EnergyControlActivitySensor(SensorEntity):
         except (TypeError, ValueError):
             return None
         return result if math.isfinite(result) else None
+
+    @staticmethod
+    def _journal_path(*controllers) -> Path | None:
+        for controller in controllers:
+            journal = getattr(
+                getattr(controller, "devices", None),
+                "journal",
+                None,
+            )
+            if journal is not None:
+                return Path(journal)
+        return None
+
+    @classmethod
+    def _read_verified_audit_events(
+        cls,
+        journal_path: Path,
+        cutoff: datetime,
+    ) -> tuple[list[dict], list[str]]:
+        if not journal_path.exists():
+            return [], []
+
+        events: list[dict] = []
+        errors: list[str] = []
+        with journal_path.open(encoding="utf-8") as journal:
+            for line_number, line in enumerate(journal, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as err:
+                    errors.append(f"line {line_number}: invalid JSON ({err.msg})")
+                    continue
+                if not isinstance(record, dict):
+                    errors.append(f"line {line_number}: audit record is not an object")
+                    continue
+                operation = record.get("operation")
+                if record.get("event") != "verified" or operation not in (
+                    "hot_water_target",
+                    "heating_offset",
+                ):
+                    continue
+                timestamp = cls._timestamp(record.get("observed_at"))
+                previous = cls._numeric(record.get("previous"))
+                confirmed = cls._numeric(record.get("confirmed"))
+                if timestamp is None:
+                    errors.append(
+                        f"line {line_number}: verified {operation} has no valid "
+                        "observed_at"
+                    )
+                    continue
+                if previous is None or confirmed is None:
+                    errors.append(
+                        f"line {line_number}: verified {operation} has invalid values"
+                    )
+                    continue
+                if timestamp < cutoff:
+                    continue
+                if operation == "hot_water_target":
+                    system = "Hot water"
+                    title = "Target confirmed"
+                    label = "Target"
+                else:
+                    system = "Floor heating"
+                    title = "Offset confirmed"
+                    label = "Offset"
+                events.append(
+                    {
+                        "observed_at": timestamp.isoformat(),
+                        "system": system,
+                        "kind": "verified_command",
+                        "title": title,
+                        "state": "verified",
+                        "reason": (
+                            "Guarded Daikin command confirmed by native read-back."
+                        ),
+                        "result": "confirmed",
+                        "before_value": previous,
+                        "after_value": confirmed,
+                        "change": cls._temperature_change(
+                            previous,
+                            confirmed,
+                            label,
+                        ),
+                        "unit": "°C",
+                        "decision_price_eur_kwh": None,
+                        "command_source": "guarded_daikin_audit",
+                        "request_id": record.get("request_id"),
+                    }
+                )
+        events.sort(key=lambda event: event["observed_at"])
+        return events, errors
+
+    async def _async_refresh_audit_events(
+        self,
+        *,
+        write_state: bool = True,
+    ) -> None:
+        journal_path = self._journal_path(self.optimizer, self.floor_shadow)
+        if journal_path is None:
+            self._audit_events = []
+            self._audit_error = None
+        else:
+            cutoff = dt_util.utcnow() - timedelta(hours=24)
+            try:
+                events, errors = await self.hass.async_add_executor_job(
+                    self._read_verified_audit_events,
+                    journal_path,
+                    cutoff,
+                )
+            except (OSError, UnicodeError) as err:
+                error_message = f"{type(err).__name__}: {err}"
+                if self._audit_error != error_message:
+                    _LOGGER.error(
+                        "Unable to read the energy-control audit journal %s: %s",
+                        journal_path,
+                        err,
+                    )
+                self._audit_error = error_message
+            else:
+                self._audit_events = events
+                if errors:
+                    visible_errors = "; ".join(errors[:3])
+                    if len(errors) > 3:
+                        visible_errors += f"; plus {len(errors) - 3} more"
+                    if self._audit_error != visible_errors:
+                        _LOGGER.error(
+                            "Energy-control audit journal %s contains invalid "
+                            "records: %s",
+                            journal_path,
+                            visible_errors,
+                        )
+                    self._audit_error = visible_errors
+                else:
+                    self._audit_error = None
+        if write_state:
+            self.async_write_ha_state()
+
+    def _handle_controller_update(self) -> None:
+        self.async_write_ha_state()
+        if self._audit_refresh_task is None or self._audit_refresh_task.done():
+            self._audit_refresh_task = self.hass.async_create_task(
+                self._async_refresh_audit_events()
+            )
+
+    @classmethod
+    def _is_duplicate_command(cls, candidate: dict, events: list[dict]) -> bool:
+        candidate_timestamp = cls._timestamp(candidate.get("observed_at"))
+        if candidate_timestamp is None:
+            return False
+        for event in events:
+            if event.get("kind") != "verified_command":
+                continue
+            if event.get("system") != candidate.get("system"):
+                continue
+            if event.get("before_value") != candidate.get("before_value"):
+                continue
+            if event.get("after_value") != candidate.get("after_value"):
+                continue
+            event_timestamp = cls._timestamp(event.get("observed_at"))
+            if event_timestamp is None:
+                continue
+            if abs((event_timestamp - candidate_timestamp).total_seconds()) <= 60:
+                return True
+        return False
 
     @classmethod
     def _event_values(
@@ -571,7 +751,7 @@ class EnergyControlActivitySensor(SensorEntity):
             ),
         }
 
-    def _events(self) -> list[dict]:
+    def _event_collections(self) -> tuple[list[dict], list[dict]]:
         now = dt_util.utcnow().astimezone(timezone.utc)
         cutoff = now - timedelta(hours=24)
         events = []
@@ -856,6 +1036,17 @@ class EnergyControlActivitySensor(SensorEntity):
                     "result": result,
                 })
 
+        for audit_event in self._audit_events:
+            observed_at = self._timestamp(audit_event.get("observed_at"))
+            if (
+                observed_at is None
+                or observed_at < cutoff
+                or observed_at > now + timedelta(minutes=5)
+            ):
+                continue
+            if not self._is_duplicate_command(audit_event, events):
+                events.append(dict(audit_event))
+
         events.sort(key=lambda item: item["observed_at"])
         deduplicated = []
         last_signature_by_system = {}
@@ -878,23 +1069,55 @@ class EnergyControlActivitySensor(SensorEntity):
                 continue
             last_signature_by_system[event["system"]] = signature
             deduplicated.append(event)
-        return deduplicated[-24:]
+
+        command_events = [
+            event
+            for event in deduplicated
+            if event.get("kind") in self._COMMAND_KINDS
+        ][-self._COMMAND_EVENT_LIMIT:]
+        if len(deduplicated) <= self._EVENT_LIMIT:
+            return deduplicated, command_events
+
+        priority_events = command_events[-self._EVENT_LIMIT:]
+        priority_ids = {id(event) for event in priority_events}
+        remaining_slots = self._EVENT_LIMIT - len(priority_events)
+        context_events = (
+            [
+                event
+                for event in deduplicated
+                if id(event) not in priority_ids
+            ][-remaining_slots:]
+            if remaining_slots
+            else []
+        )
+        visible_events = sorted(
+            [*priority_events, *context_events],
+            key=lambda event: event["observed_at"],
+        )
+        return visible_events, command_events
+
+    def _events(self) -> list[dict]:
+        events, _ = self._event_collections()
+        return events
 
     @property
     def native_value(self) -> str:
-        events = self._events()
+        events, _ = self._event_collections()
         return events[-1]["kind"] if events else "no_recent_activity"
 
     @property
     def extra_state_attributes(self) -> dict:
-        events = self._events()
+        events, command_events = self._event_collections()
         return {
             "window_hours": 24,
-            "event_limit": 24,
+            "event_limit": self._EVENT_LIMIT,
+            "command_event_limit": self._COMMAND_EVENT_LIMIT,
             "events": events,
+            "command_events": command_events,
+            "audit_error": self._audit_error,
             "authority": self._authorities(),
             "verified_command_count": sum(
-                event["kind"] == "verified_command" for event in events
+                event["kind"] == "verified_command" for event in command_events
             ),
             "simulation_count": sum(
                 event["kind"] == "simulation" for event in events
@@ -903,10 +1126,10 @@ class EnergyControlActivitySensor(SensorEntity):
                 event["kind"] == "no_command" for event in events
             ),
             "review_required_count": sum(
-                event["kind"] == "review_required" for event in events
+                event["kind"] == "review_required" for event in command_events
             ),
             "uncertain_command_count": sum(
-                event["kind"] == "review_required" for event in events
+                event["kind"] == "review_required" for event in command_events
             ),
         }
 
