@@ -463,43 +463,44 @@ open-loop generation curtailment based on export economics; it is not
 zero-export control and does not infer household surplus, grid direction or
 export power.
 
-Policy revision 2 defaults to `Shadow`. `Armed` is hidden until deterministic
-policy replay, elevated Huawei write capability, bound config-entry/serial/Pmax,
-mode-preserving cap calculation and two stable unrestricted daylight/output
-observations are verified. Passing those gates never selects `Armed`
-automatically.
+Policy revision 3 is intentionally **Shadow-only**. Public modes are `Off` and
+`Shadow`; `Armed` is rejected, production acquisition authority defaults to
+disabled, and the acquisition method has its own fail-closed authority gate.
+Passing replay, identity, permission or daylight checks cannot enable writes.
+Stored revision-1/2 `Armed` state migrates to `Shadow` without a command, and an
+ownerless migration is not considered complete until an unrestricted 100% or
+Pmax native baseline is observed.
 
-An exact negative export price is a Shadow opportunity. Armed entry additionally
-requires:
+An exact negative export price creates a price opportunity, not a command. At
+night the controller records `price_only_opportunity` with `below_horizon` and
+does not calculate or expose a watt-valued proposal. A qualified daylight
+Shadow proposal additionally requires:
 
-- export earnings at or below **-€0.010/kWh**;
 - a known contiguous negative-price block with at least 30 minutes remaining;
-- the existing configured and active limit to match at unrestricted 100% or
-  Pmax;
-- `sun.sun` to be above the horizon;
-- fresh inverter AC active power at or above 5,000 W on two observations at
-  least 30 seconds apart, plus a full 60-second qualification dwell;
-- a distinct native-step **4,000 W-equivalent** target in the existing limit
-  mode. An 8 kW inverter in percentage mode therefore uses 50.0%; fixed-watt
-  mode uses 4,000 W. The controller never changes limit mode.
+- configured and active limits matching unrestricted 100% or Pmax;
+- `sun.sun` above the horizon;
+- fresh inverter AC active power at or above 5,000 W on two observations and
+  the full 60-second relevance dwell;
+- a distinct native-step **4,000 W-equivalent** counterfactual target in the
+  existing limit mode.
 
-New qualification and commissioning evidence reset immediately at sunset,
-stale telemetry or output below 5,000 W. One dispatched acquisition attempt is
-allowed per contiguous block. The lease ends at the earlier of two hours or the
-block end. Clouds or lower PV output after acquisition do not trigger an early
-restore because the cap can become non-binding. Sunset or zero output may safely
-restore an already-owned cap; restoration does not require the acquisition
-gates. The exact original limit is also restored on non-negative, stale or
-invalid prices, profile change, lease expiry, block end, mode change or graceful
-unload.
+The runtime observes the selected Huawei entry's active-power entity directly,
+with a 30-second independent timer as a backstop. Sunset, stale telemetry,
+output below 5,000 W or a restricted native limit clears qualification
+immediately. Ordinary Shadow operation sends zero inverter writes. The only
+post-sunset write path retained by revision 3 is exact restoration of a
+previously owned legacy cap; restoration remains bound to the persisted
+identity, original limit and expected current limit and never acquires new
+ownership.
 
-Ownership is stored before and after dispatch and is bound to the pricing config
-entry, inverter serial and Pmax. Startup reconciliation retains an exact target,
-clears an exact original, and treats any other limit as an external/manual
-override without writing. Controller state uses a private atomic JSON file with
-mode 0600, no-follow opens, file and directory `fsync`, and atomic replacement;
-unlike HA `Store.async_save`, serialization and disk failures propagate to the
-caller before dispatch. Legacy Store state is read only for migration.
+Legacy ownership is stored before and after dispatch and is bound to the pricing
+config entry, inverter serial and Pmax. Startup reconciliation retains an exact
+owned target for safe restoration, clears an exact original, and treats any
+other limit as an external/manual override without writing. Controller state
+uses a private atomic JSON file with mode 0600, no-follow opens, file and
+directory `fsync`, and atomic replacement; unlike HA `Store.async_save`,
+serialization and disk failures propagate to the caller before dispatch.
+Legacy Store state is read only for migration.
 
 The manifest orders setup after Huawei when that integration is present. A
 transient not-loaded/setup/retry state defers persisted-ownership reconciliation
@@ -528,22 +529,25 @@ value fields are limited to cost per avoided exported kWh and elapsed eligible
 or owned minutes. Without fresh signed grid power it never reports curtailed
 kWh, zero-export performance, or estimated/realized euro savings.
 
-Three Recorder-safe power sensors expose the configured inverter limit, active
-inverter limit, and current controller request in equivalent watts. A fourth
-Recorder-safe relevance sensor reports `ready` only when the sun is above the
-horizon and fresh inverter output meets the 5 kW gate; otherwise it names the
-missing daylight, fresh-output, or output-level condition. Percentage mode is
-converted with the bound inverter Pmax; watt mode is preserved. The controller
-also keeps a bounded private history of its last 12 cap/restore operations so
-the compact Energy control activity sensor can distinguish verified solar
-commands, pre-dispatch no-command outcomes, and uncertain post-dispatch results
-that require review. Verified DHW and floor commands are also rebuilt from the
-private guarded-control audit journal, so frequent controller evaluations
-cannot erase command evidence that is still inside the rolling 24-hour window.
-The activity entity exposes a bounded command/review list separately and
-reserves the 24-item mixed display feed for those events before filling
-remaining slots with simulations and no-command context. Journal read or parse
-failures are reported explicitly.
+Recorder-safe power sensors expose configured and active inverter limits,
+historical owned request/restore values, and the qualified Shadow proposal in
+equivalent watts. The request is unavailable during ordinary Shadow operation;
+the raw target capability is not a proposal. The relevance sensor reports
+`shadow_ready` only when daylight, fresh output, the 5 kW gate, unrestricted
+native limits, two samples and the full dwell all qualify. Percentage mode is
+converted with the bound inverter Pmax; watt mode is preserved.
+
+The Energy control activity sensor reconstructs verified rolling-24-hour
+episodes from actual transitions. Each interval ends at the next observed
+transition on the same track and retains exact duration, before/after value,
+unit, price, reason, operation and authority source. Optimizer, native schedule,
+manual/external and protection sources remain distinct. Simulations,
+counterfactual Shadow proposals, no-command outcomes and review-required
+records remain point events rather than fake instantaneous commands. Boundary
+episodes are clipped to the rolling cutoff while retaining the original
+transition timestamp. Recorder payloads are bounded to 16 visible events,
+8 command/review events and 12 episodes; journal read or parse failures are
+reported explicitly.
 
 ## Domestic-hot-water price optimizer
 
@@ -558,41 +562,49 @@ The default policy is:
 | Setting | Value |
 | --- | --- |
 | Readiness deadlines | 07:00 and 21:00 Europe/Tallinn |
-| Explicit native minimum | 30°C, manual only |
+| Explicit native minimum | 30°C on the current device; native capability minimum when 30°C is unavailable; manual only |
 | Comfort threshold / safe coast target | 45°C |
 | Normal target | 50°C |
-| Cheap-period / final-readiness charge target | 55°C |
+| Cheap-period / final-readiness requested ceiling | 50–55°C |
 | Post-readiness demand hold | 120 minutes at 50°C |
 | Delivered-readiness re-arm | 48°C |
-| Final top-up window | Last 45 minutes, once |
+| Shallow readiness allowance | p90 + 15 minutes, rounded to 15 and clamped to 30–60 minutes; currently 45 minutes |
+| Deep readiness allowance | Learned deep recovery; currently 105 minutes from retained evidence |
 | Price gate | Current all-in price at least €0.05/kWh and 20% above the selected cheap-window average |
-| Initial deep-heating allowance | 120 minutes until five clean deep cycles |
 | Preheat coast horizon | 8 hours |
 
-For each readiness cycle, the optimizer anchors one cheapest contiguous
-all-in-price block instead of selecting a new trailing block every quarter.
-It compares that block with the highest-cost feasible block of the same
-duration. The 55°C target is proposed only when that preheat opportunity passes
-the same €0.05/kWh and 20% gates; flat or low-value price shapes stay at 50°C
-outside the final readiness allowance.
+For each readiness cycle, the optimizer compares feasible contiguous all-in
+price blocks using the real household import price. Revision 8 selects the
+latest block that remains near the absolute cheapest: within both €0.01/kWh and
+10% of the cheapest average, using a €0.05 denominator floor. This avoids
+unnecessarily early storage when a similarly priced later window exists. It
+still compares the selected block with the highest-cost feasible block of the
+same duration and requires the existing absolute and relative price gates.
 This is a price opportunity per kWh, not a measured saving, because whole-Daikin
 electrical energy is unavailable.
 
 The bounded readiness pilot is deliberately separate from price shifting.
-Outside the final conservative heating allowance it holds 50°C and cannot use
-45°C coast. Automatic control never selects 30°C. Inside that allowance, it
-requests 55°C only
-while measured tank temperature remains below 50°C, then immediately restores
-the 50°C target. The higher target is a temporary request to overcome native
-target-50 hysteresis; it does not change the measured readiness requirement.
+Outside the final learned heating allowance it holds 50°C and cannot use 45°C
+coast. Automatic control never selects 30°C. A fresh 48–49°C tank without rapid
+draw or recovery uses the learned shallow allowance; stale, ≤47°C, rapid-draw
+or recovery cases retain the deep allowance. Inside the final allowance, a
+below-50°C charge is classified as `readiness_final_topup` even when it is the
+first charge of that cycle. Once started, its higher requested setpoint remains
+latched through the readiness deadline and then restores to the 50°C hold.
+The higher setpoint is a requested thermostat ceiling, not proof that the full
+tank reached that temperature.
+
+Discretionary early storage above 50°C is suppressed until passive-loss
+retention evidence qualifies with at least three clean samples across two
+readiness cycles. The adaptive target is the ceiling of
+`50°C + p90 loss rate × hours to readiness + 1°C reserve`, bounded to 55°C.
+Targets above 55°C are rejected rather than charging earlier without evidence.
 After both readiness deadlines, a two-hour demand hold keeps the target at
 50°C so a delivery-time draw cannot immediately roll the controller into a
 price-driven coast. Once readiness has been delivered, normal charging re-arms
-at 48°C; one final top-up is permitted below 50°C during the last 45 minutes.
-Once that final top-up starts, the 55°C request stays latched through the
-readiness deadline even if the measured tank first touches 50°C, then restores
-to the 50°C hold at or after the deadline. This prevents native target
-hysteresis from losing measured readiness immediately before delivery time.
+at 48°C; one final top-up is permitted below 50°C inside the learned shallow
+allowance. The latch described above prevents native target hysteresis from
+losing measured readiness immediately before delivery time.
 
 Comfort or missed-deadline recovery is latched until the measured tank reaches
 50°C. Reaching 50°C after an anchored cheap window starts is also persisted as
@@ -603,15 +615,16 @@ Ordinary 45/50°C cost-driven transitions use a 30-minute minimum dwell, while
 comfort, readiness and incomplete-data exits bypass it. Deep-recovery and
 shallow readiness-top-up durations are learned separately. Each
 policy revision that changes scheduling values or qualification semantics clears
-prior evidence so changed Shadow behavior must earn a new observation period.
+prior qualification so changed Shadow behavior must earn a new observation
+period.
 Revision 6 retires automatic 30°C standby. A persisted revision-5
 `soft_standby` mode migrates command-free to `safe_target_shift`. Revision 7
 latches a started final readiness top-up through its deadline; known revision-5
-and revision-6 state preserves the selected safe mode but resets policy
-qualification evidence and any obsolete final-top-up markers while retaining
-physical write counts, learned heating durations, owner approval and recorded
-price opportunities. Older incompatible write-capable revisions still pause
-for explicit review.
+through revision-7 state migrates to revision 8 while preserving the selected
+safe mode, physical write counts, learned deep/shallow durations, owner approval
+and recorded opportunities. Changed scheduling and retention qualification are
+reset, and obsolete final-top-up markers are cleared. Older incompatible
+write-capable revisions still pause for explicit review.
 
 Deadline evidence distinguishes a measured success, measured readiness later
 consumed by a rapid draw, a rapid-draw-contaminated check that cannot prove
@@ -624,18 +637,20 @@ success as `consumed_after_delivery`.
 
 The options flow validates every target against the selected Daikin's native
 range and step. On the verified BRP069A62 installation that range is 30–55°C in
-1°C steps; 60°C is rejected rather than clamped.
+1°C steps; 60°C is rejected rather than clamped. If the unchanged 30°C default
+is below another device's native range, the options flow stores that device's
+actual minimum instead of failing or inventing support for 30°C.
 
 The runtime mode select provides:
 
-- `shadow`: default; calculate and record the same 55/45/50°C decisions the safe
-  pilot would make, but send no device commands.
-- `readiness_pilot`: permit guarded 55→50°C target changes only inside the
-  final readiness allowance; hold 50°C at all other times.
+- `shadow`: default; calculate and record the same adaptive 50–55/45/50°C
+  decisions the safe pilot would make, but send no device commands.
+- `readiness_pilot`: permit guarded readiness-ceiling→50°C target changes only
+  inside the final learned readiness allowance; hold 50°C at all other times.
 - `safe_target_shift`: after at least seven combined Shadow/readiness-pilot
   observation days, five usable heat cycles, ten delivered usable readiness
   checks with no genuine miss, and two confirmed readiness-pilot writes, permit
-  guarded 55°C preheat, 45°C coast, and latched 50°C recovery targets.
+  guarded adaptive preheat, 45°C coast, and latched 50°C recovery targets.
 - `paused`: issue no automatic targets.
 
 The evidence gates remain the normal promotion path. A separate

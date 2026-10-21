@@ -1366,7 +1366,10 @@ class ExtremePriceProtection:
             "actions": [
                 {
                     "load_id": action.load_id,
+                    "load_type": action.load_type,
                     "operation": action.operation,
+                    "current_state": action.current_state,
+                    "proposed_state": action.proposed_state,
                 }
                 for action in decision.actions
             ],

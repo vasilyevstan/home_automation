@@ -131,10 +131,9 @@ OPTIONS_SCHEMA = probatio.Schema({
 
 
 class HouseholdPriceOptionsFlow(OptionsFlow):
-    def _validate(self, user_input: dict) -> None:
+    def _validate(self, user_input: dict) -> dict:
         if not self.config_entry.data.get(CONF_DAIKIN_ENTRY):
             raise PricingError("Select a Daikin entry before configuring the DHW optimizer.")
-        policy = DhwPolicy.from_options(user_input)
         runtime = self.hass.data.get(DOMAIN, {}).get(self.config_entry.entry_id, {})
         devices = runtime.get("devices")
         if devices is None:
@@ -143,8 +142,21 @@ class HouseholdPriceOptionsFlow(OptionsFlow):
         profile = api.water_tank_target_temp_config
         if not profile or profile.get("settable") is not True:
             raise PricingError("The native Daikin DHW target is not settable.")
+        normalized = dict(user_input)
+        if (
+            normalized.get(
+                CONF_DHW_SOFT_TARGET,
+                DEFAULT_DHW_SOFT_TARGET,
+            )
+            == DEFAULT_DHW_SOFT_TARGET
+            and float(profile["minValue"]) > DEFAULT_DHW_SOFT_TARGET
+        ):
+            normalized[CONF_DHW_SOFT_TARGET] = float(
+                profile["minValue"]
+            )
+        policy = DhwPolicy.from_options(normalized)
         for label, value in (
-            ("Soft-standby target", policy.soft_target),
+            ("Native minimum target", policy.soft_target),
             ("Comfort target", policy.floor_target),
             ("Normal target", policy.normal_target),
             ("Preheat target", policy.preheat_target),
@@ -182,18 +194,19 @@ class HouseholdPriceOptionsFlow(OptionsFlow):
                     raise PricingError(
                         f"{entity_id} is not an available climate entity."
                     )
+        return normalized
 
     async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
         errors = {}
         reason = ""
         if user_input is not None:
             try:
-                self._validate(user_input)
+                normalized = self._validate(user_input)
             except (HomeAssistantError, PricingError) as error:
                 errors["base"] = "invalid_optimizer"
                 reason = str(error)
             else:
-                return self.async_create_entry(data=user_input)
+                return self.async_create_entry(data=normalized)
         suggested = self.add_suggested_values_to_schema(
             OPTIONS_SCHEMA, user_input or self.config_entry.options
         )

@@ -23,6 +23,7 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_interval,
 )
+from homeassistant.helpers import entity_registry
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
@@ -53,11 +54,12 @@ from .coordinator import HouseholdPriceCoordinator
 LOGGER = logging.getLogger(__name__)
 STORE_VERSION = 1
 STATE_VERSION = 1
-POLICY_REVISION = 2
+POLICY_REVISION = 3
 STORE_KEY_SUFFIX = "solar_curtailment"
 ACTIVE_POWER_MAX_AGE_SECONDS = 45
 HISTORY_LIMIT = 64
 OPERATION_HISTORY_LIMIT = 12
+DECISION_HISTORY_LIMIT = 24
 STARTUP_DEPENDENCY_DEFERRAL_SECONDS = 60
 
 
@@ -612,6 +614,7 @@ class SolarCurtailment:
         self.active_evaluation_task: asyncio.Task | None = None
         self.startup_reconcile_pending = False
         self.startup_dependency_deferred_until: datetime | None = None
+        self.production_control_enabled = False
         self.mode = SOLAR_CURTAILMENT_MODE_SHADOW
         self.decision: SolarCurtailmentDecision | None = None
         self.listeners: list[Callable[[], None]] = []
@@ -619,6 +622,7 @@ class SolarCurtailment:
         self.last_price: PriceContext | None = None
         self.last_status: dict | None = None
         self.last_target: dict | None = None
+        self.solar_observation_entity_ids: tuple[str, ...] = ()
         self.state = {
             "state_version": STATE_VERSION,
             "policy_revision": POLICY_REVISION,
@@ -629,9 +633,13 @@ class SolarCurtailment:
             "suppressed_blocks": [],
             "attempted_blocks": [],
             "qualification": None,
+            "production_relevance": None,
             "eligible_since": None,
+            "shadow_blocked_reason": None,
+            "migration_blocked_reason": None,
             "last_operation": None,
             "operation_history": [],
+            "decision_history": [],
             "commissioning": {
                 "policy_replay_verified": False,
                 "write_permission_verified": False,
@@ -655,15 +663,18 @@ class SolarCurtailment:
         if isinstance(stored, dict):
             compatible_revision = (
                 stored.get("state_version") == STATE_VERSION
-                and stored.get("policy_revision") in (1, POLICY_REVISION)
+                and stored.get("policy_revision")
+                in (1, 2, POLICY_REVISION)
             )
             ownership = stored.get("ownership")
             fault = stored.get("fault")
             external_override = stored.get("external_override")
             if compatible_revision:
                 mode = stored.get("mode")
-                if mode in SOLAR_CURTAILMENT_MODES:
+                if mode == SOLAR_CURTAILMENT_MODE_OFF:
                     self.mode = mode
+                else:
+                    self.mode = SOLAR_CURTAILMENT_MODE_SHADOW
                 for key in self.state:
                     if key in stored:
                         if key == "commissioning":
@@ -673,8 +684,18 @@ class SolarCurtailment:
                         else:
                             self.state[key] = stored[key]
                 self.state["policy_revision"] = POLICY_REVISION
-                if stored.get("policy_revision") == 1:
+                if stored.get("policy_revision") in (1, 2):
                     self._reset_qualification()
+                    self.state["production_relevance"] = None
+                    if (
+                        mode == SOLAR_CURTAILMENT_MODE_ARMED
+                        and not isinstance(ownership, dict)
+                    ):
+                        self.state["migration_blocked_reason"] = (
+                            "Stored Armed mode can migrate to Shadow only after "
+                            "an ownerless unrestricted 100% or Pmax native "
+                            "baseline is observed."
+                        )
                     commissioning = self.state["commissioning"]
                     commissioning["stable_unrestricted_verified"] = False
                     commissioning["stable_observation"] = None
@@ -689,10 +710,7 @@ class SolarCurtailment:
                 if isinstance(external_override, dict):
                     self.state["external_override"] = external_override
                 self.mode = SOLAR_CURTAILMENT_MODE_SHADOW
-        if (
-            self.mode == SOLAR_CURTAILMENT_MODE_ARMED
-            and not self.commissioning_complete
-        ):
+        if self.mode == SOLAR_CURTAILMENT_MODE_ARMED:
             self.mode = SOLAR_CURTAILMENT_MODE_SHADOW
         self._state_loaded = True
         await self._startup_reconcile(dt_util.utcnow())
@@ -706,6 +724,17 @@ class SolarCurtailment:
                 self._sun_changed,
             )
         )
+        self.solar_observation_entity_ids = (
+            self._solar_observation_entities()
+        )
+        if self.solar_observation_entity_ids:
+            self.unsubscribers.append(
+                async_track_state_change_event(
+                    self.hass,
+                    self.solar_observation_entity_ids,
+                    self._inverter_observation_changed,
+                )
+            )
         self.unsubscribers.append(
             async_track_time_interval(
                 self.hass,
@@ -820,6 +849,40 @@ class SolarCurtailment:
     def _sun_changed(self, _event) -> None:
         self._schedule_evaluation()
 
+    def _solar_observation_entities(self) -> tuple[str, ...]:
+        config_entry_id = getattr(self.devices, "solar_entry", None)
+        if not isinstance(config_entry_id, str) or not config_entry_id:
+            return ()
+        registry = entity_registry.async_get(self.hass)
+        observed = []
+        for entry in entity_registry.async_entries_for_config_entry(
+            registry,
+            config_entry_id,
+        ):
+            identity = " ".join(
+                str(value)
+                for value in (
+                    getattr(entry, "entity_id", ""),
+                    getattr(entry, "unique_id", ""),
+                    getattr(entry, "original_name", ""),
+                )
+            ).lower()
+            if (
+                str(getattr(entry, "entity_id", "")).startswith(
+                    "sensor."
+                )
+                and (
+                    "active_power" in identity
+                    or "active power" in identity
+                )
+            ):
+                observed.append(entry.entity_id)
+        return tuple(sorted(set(observed)))
+
+    @callback
+    def _inverter_observation_changed(self, _event) -> None:
+        self._schedule_evaluation()
+
     @property
     def operation_history(self) -> list[dict]:
         history = [
@@ -919,8 +982,11 @@ class SolarCurtailment:
     @property
     def available_modes(self) -> tuple[str, ...]:
         if (
-            self.commissioning_complete
-            or self.mode == SOLAR_CURTAILMENT_MODE_ARMED
+            self.production_control_enabled
+            and (
+                self.commissioning_complete
+                or self.mode == SOLAR_CURTAILMENT_MODE_ARMED
+            )
         ):
             return SOLAR_CURTAILMENT_MODES
         return (
@@ -957,9 +1023,62 @@ class SolarCurtailment:
         ]
 
     def _set_decision(self, state: str, reason: str) -> None:
+        previous = self.decision
         self.decision = SolarCurtailmentDecision(
             self.mode, state, reason
         )
+        if (
+            self.production_control_enabled
+            or state
+            not in {
+                "price_only_opportunity",
+                "shadow_blocked",
+                "shadow_qualifying",
+                "shadow_qualified",
+                "migration_blocked",
+            }
+        ):
+            return
+        target = self.last_target
+        status = self.last_status or {}
+        proposed_limit_w = (
+            _equivalent_limit_w(
+                target.get("mode"),
+                target.get("value"),
+                status.get("pmax_w"),
+            )
+            if state == "shadow_qualified"
+            and isinstance(target, dict)
+            else None
+        )
+        blocked_reason = self.state.get("shadow_blocked_reason")
+        if (
+            previous is not None
+            and previous.state == state
+            and previous.reason == reason
+        ):
+            latest = self.state["decision_history"][-1:] or [{}]
+            if (
+                latest[0].get("blocked_reason") == blocked_reason
+                and latest[0].get("proposed_limit_w")
+                == proposed_limit_w
+            ):
+                return
+        record = {
+            "observed_at": dt_util.utcnow()
+            .astimezone(timezone.utc)
+            .isoformat(),
+            "mode": self.mode,
+            "state": state,
+            "reason": reason,
+            "export_earnings_eur_kwh": self._decision_price(),
+            "blocked_reason": blocked_reason,
+            "proposed_limit_w": proposed_limit_w,
+            "write_sent": False,
+        }
+        self.state["decision_history"] = (
+            self.state["decision_history"] + [record]
+        )[-DECISION_HISTORY_LIMIT:]
 
     def _decision_price(self) -> str | None:
         value = (
@@ -990,6 +1109,61 @@ class SolarCurtailment:
     def _reset_qualification(self) -> None:
         self.state["qualification"] = None
         self.state["eligible_since"] = None
+
+    def _update_production_relevance(
+        self,
+        status: dict,
+        now: datetime,
+    ) -> None:
+        active_power, _age, fresh = self._fresh_active_power(status, now)
+        identity = {
+            **self._identity(status),
+            "mode": status.get("mode"),
+            "original": self._limit(status),
+        }
+        if (
+            not self._daylight_available()
+            or not fresh
+            or active_power is None
+            or active_power < SOLAR_CURTAILMENT_OUTPUT_GATE_W
+            or not inverter_unrestricted(status)
+        ):
+            self.state["production_relevance"] = None
+            return
+        stamp = now.astimezone(timezone.utc)
+        relevance = self.state.get("production_relevance")
+        if (
+            not isinstance(relevance, dict)
+            or relevance.get("identity") != identity
+        ):
+            self.state["production_relevance"] = {
+                "identity": identity,
+                "started_at": stamp.isoformat(),
+                "last_sample_at": stamp.isoformat(),
+                "sample_count": 1,
+                "ready": False,
+            }
+            return
+        last = _instant(relevance.get("last_sample_at"))
+        if (
+            last is None
+            or (stamp - last).total_seconds()
+            >= SOLAR_CURTAILMENT_OUTPUT_SAMPLE_SECONDS
+        ):
+            relevance["last_sample_at"] = stamp.isoformat()
+            relevance["sample_count"] = (
+                int(relevance.get("sample_count", 0)) + 1
+            )
+        started = _instant(relevance.get("started_at"))
+        elapsed = (
+            (stamp - started).total_seconds()
+            if started is not None
+            else 0
+        )
+        relevance["ready"] = (
+            int(relevance.get("sample_count", 0)) >= 2
+            and elapsed >= SOLAR_CURTAILMENT_QUALIFICATION_SECONDS
+        )
 
     def _sun_state(self) -> str | None:
         state = self.hass.states.get("sun.sun")
@@ -1218,6 +1392,17 @@ class SolarCurtailment:
                 self.last_status = status
                 self.last_target = target_cap(status)
                 self._update_commissioning_observation(status, now)
+                if self.state.get("migration_blocked_reason"):
+                    if inverter_unrestricted(status):
+                        self.state["migration_blocked_reason"] = None
+                    else:
+                        self.state["shadow_blocked_reason"] = (
+                            "migration_baseline_not_unrestricted"
+                        )
+                        self._set_decision(
+                            "migration_blocked",
+                            str(self.state["migration_blocked_reason"]),
+                        )
             await self._save()
             return True
         phase = owner.get("phase")
@@ -1337,6 +1522,14 @@ class SolarCurtailment:
             self._set_decision(
                 "stopping",
                 "The integration is stopping; no inverter command was sent.",
+            )
+            return
+        if not self.production_control_enabled:
+            self._reset_qualification()
+            self._set_decision(
+                "shadow_only",
+                "Production inverter control is disabled; no inverter command "
+                "was sent.",
             )
             return
         lease_end = min(
@@ -1942,34 +2135,14 @@ class SolarCurtailment:
                 ),
             )
             return
-        if not context.valid:
-            self._reset_qualification()
-            self._set_decision(
-                "blocked",
-                context.reason
-                or "The exact current export price is unavailable.",
-            )
-            return
-        if not is_shadow_opportunity(context.export_earnings):
-            self._reset_qualification()
-            self._set_decision(
-                "idle",
-                "Net export earnings are zero or positive; no curtailment "
-                "opportunity exists.",
-            )
-            return
-        block = context.block
-        if block is None:
-            self._reset_qualification()
-            self._set_decision(
-                "blocked",
-                "The contiguous negative-export block is unavailable.",
-            )
-            return
         try:
             status = await self.devices.get_solar_status()
         except HomeAssistantError as error:
             self._reset_qualification()
+            self.state["production_relevance"] = None
+            self.state["shadow_blocked_reason"] = (
+                "inverter_status_unavailable"
+            )
             self._set_decision(
                 "blocked",
                 "Fresh inverter capability and active power are unavailable: "
@@ -1979,22 +2152,150 @@ class SolarCurtailment:
         self.last_status = status
         self.last_target = target_cap(status)
         self._update_commissioning_observation(status, now)
-        remaining = block.remaining_minutes(now)
+        self._update_production_relevance(status, now)
         if self.mode == SOLAR_CURTAILMENT_MODE_OFF:
             self._reset_qualification()
+            self.state["shadow_blocked_reason"] = "mode_off"
             self._set_decision(
                 "off",
                 "Solar curtailment is disabled.",
             )
             return
-        if self.mode == SOLAR_CURTAILMENT_MODE_SHADOW:
+        if self.state.get("migration_blocked_reason"):
+            if inverter_unrestricted(status):
+                self.state["migration_blocked_reason"] = None
+            else:
+                self._reset_qualification()
+                self.state["shadow_blocked_reason"] = (
+                    "migration_baseline_not_unrestricted"
+                )
+                self._set_decision(
+                    "migration_blocked",
+                    str(self.state["migration_blocked_reason"]),
+                )
+                return
+        if not context.valid:
             self._reset_qualification()
+            self.state["shadow_blocked_reason"] = "price_unavailable"
             self._set_decision(
-                "shadow_opportunity",
-                "Exact net export earnings are negative. Shadow mode records "
-                "the opportunity and performs zero writes.",
+                "blocked",
+                context.reason
+                or "The exact current export price is unavailable.",
             )
             return
+        if not is_shadow_opportunity(context.export_earnings):
+            self._reset_qualification()
+            self.state["shadow_blocked_reason"] = None
+            self._set_decision(
+                "idle",
+                "Net export earnings are zero or positive; no curtailment "
+                "opportunity exists.",
+            )
+            return
+        block = context.block
+        if block is None:
+            self._reset_qualification()
+            self.state["shadow_blocked_reason"] = "price_block_unavailable"
+            self._set_decision(
+                "shadow_blocked",
+                "The contiguous negative-export block is unavailable.",
+            )
+            return
+        remaining = block.remaining_minutes(now)
+        shadow_only = (
+            self.mode == SOLAR_CURTAILMENT_MODE_SHADOW
+            or not self.production_control_enabled
+        )
+        if shadow_only:
+            if not self._daylight_available():
+                self._reset_qualification()
+                self.state["shadow_blocked_reason"] = "below_horizon"
+                self._set_decision(
+                    "price_only_opportunity",
+                    "Exact net export earnings are negative, but the sun is "
+                    "below the horizon. Shadow mode records only the price "
+                    "opportunity and performs zero writes.",
+                )
+                return
+            active_power, _active_age, active_fresh = (
+                self._fresh_active_power(status, now)
+            )
+            if not active_fresh or active_power is None:
+                self._reset_qualification()
+                self.state["shadow_blocked_reason"] = "output_stale"
+                self._set_decision(
+                    "shadow_blocked",
+                    "Exact net export earnings are negative, but fresh inverter "
+                    "output is unavailable. Shadow mode performs zero writes.",
+                )
+                return
+            if active_power < SOLAR_CURTAILMENT_OUTPUT_GATE_W:
+                self._reset_qualification()
+                self.state["shadow_blocked_reason"] = "output_below_gate"
+                self._set_decision(
+                    "shadow_blocked",
+                    "Exact net export earnings are negative, but inverter "
+                    f"output is below {SOLAR_CURTAILMENT_OUTPUT_GATE_W} W. "
+                    "Shadow mode performs zero writes.",
+                )
+                return
+            if (
+                not block.end_known
+                or remaining < SOLAR_CURTAILMENT_MIN_REMAINING_MINUTES
+            ):
+                self._reset_qualification()
+                self.state["shadow_blocked_reason"] = (
+                    "insufficient_price_window"
+                )
+                self._set_decision(
+                    "shadow_blocked",
+                    "The contiguous negative-export block must have a known "
+                    "end and at least 30 minutes remaining. Shadow mode "
+                    "performs zero writes.",
+                )
+                return
+            if not inverter_unrestricted(status):
+                self._reset_qualification()
+                self.state["shadow_blocked_reason"] = (
+                    "native_limits_not_unrestricted"
+                )
+                self._set_decision(
+                    "shadow_blocked",
+                    "Configured and active native limits must match and be "
+                    "unrestricted before a Shadow proposal is qualified.",
+                )
+                return
+            target = self.last_target
+            if target is None:
+                self._reset_qualification()
+                self.state["shadow_blocked_reason"] = "proposal_non_binding"
+                self._set_decision(
+                    "shadow_blocked",
+                    "Pmax or native limit capabilities do not permit a distinct "
+                    "4,000 W-equivalent Shadow proposal.",
+                )
+                return
+            ready, qualification_reason = self._update_qualification(
+                status, block, now
+            )
+            if not ready:
+                self.state["shadow_blocked_reason"] = "qualification_dwell"
+                self._set_decision(
+                    "shadow_qualifying",
+                    qualification_reason
+                    + " Shadow mode performs zero writes.",
+                )
+                return
+            self.state["shadow_blocked_reason"] = None
+            self._set_decision(
+                "shadow_qualified",
+                "Negative export earnings, daylight, fresh high inverter "
+                "output, unrestricted native limits, and the full dwell are "
+                "qualified. This is a counterfactual proposal only; Shadow "
+                "mode performs zero writes.",
+            )
+            return
+        self.state["shadow_blocked_reason"] = None
         if block.identity in self.state["suppressed_blocks"]:
             self._reset_qualification()
             self._set_decision(
@@ -2109,6 +2410,15 @@ class SolarCurtailment:
     async def async_set_mode(self, mode: str) -> None:
         if mode not in SOLAR_CURTAILMENT_MODES:
             raise HomeAssistantError("Unknown solar curtailment mode.")
+        if (
+            mode == SOLAR_CURTAILMENT_MODE_ARMED
+            and not self.production_control_enabled
+        ):
+            raise HomeAssistantError(
+                "Armed mode is disabled. Solar control is intentionally "
+                "limited to Off and Shadow until signed grid-export telemetry "
+                "is available and separately approved."
+            )
         if (
             mode == SOLAR_CURTAILMENT_MODE_ARMED
             and not self.commissioning_complete
@@ -2279,12 +2589,16 @@ class SolarCurtailment:
             "controller": "solar_curtailment",
             "valuation_status": (
                 "live_action_unattributed"
-                if self.mode == SOLAR_CURTAILMENT_MODE_ARMED
+                if (
+                    self.production_control_enabled
+                    and self.mode == SOLAR_CURTAILMENT_MODE_ARMED
+                )
                 else "counterfactual"
             ),
             "operating_mode": self.mode,
             "shadow_zero_writes": (
-                self.mode == SOLAR_CURTAILMENT_MODE_SHADOW
+                not self.production_control_enabled
+                or self.mode == SOLAR_CURTAILMENT_MODE_SHADOW
             ),
             "opportunity_eur_per_kwh": format(value, "f"),
             "ownership": owner is not None,
@@ -2319,10 +2633,19 @@ class SolarCurtailment:
         qualification = self.state.get("qualification")
         if not isinstance(qualification, dict):
             qualification = {}
+        relevance = self.state.get("production_relevance")
+        if not isinstance(relevance, dict):
+            relevance = {}
         started = _instant(qualification.get("started_at"))
         dwell = (
             max(0, int((now - started).total_seconds()))
             if started is not None
+            else 0
+        )
+        relevance_started = _instant(relevance.get("started_at"))
+        relevance_dwell = (
+            max(0, int((now - relevance_started).total_seconds()))
+            if relevance_started is not None
             else 0
         )
         eligible_since = _instant(self.state.get("eligible_since"))
@@ -2367,7 +2690,7 @@ class SolarCurtailment:
             status.get("active"),
             status.get("pmax_w"),
         )
-        requested_limit_w = configured_limit_w
+        requested_limit_w = None
         if owner is not None:
             requested = (
                 original
@@ -2380,15 +2703,19 @@ class SolarCurtailment:
                     requested.get("configured"),
                     status.get("pmax_w"),
                 )
-        elif (
-            decision.state in ("shadow_opportunity", "qualifying")
+        qualified_proposed_limit_w = None
+        if (
+            decision.state == "shadow_qualified"
             and isinstance(target, dict)
         ):
-            requested_limit_w = _equivalent_limit_w(
+            qualified_proposed_limit_w = _equivalent_limit_w(
                 target.get("mode"),
                 target.get("value"),
                 status.get("pmax_w"),
             )
+        price_only_opportunity = (
+            export is not None and export < 0
+        )
         return {
             "mode": self.mode,
             "state": decision.state,
@@ -2436,6 +2763,9 @@ class SolarCurtailment:
             ),
             "active_power_fresh": active_fresh,
             "sun_state": self._sun_state(),
+            "inverter_observation_entities": list(
+                self.solar_observation_entity_ids
+            ),
             "daylight_gate_passed": self._daylight_available(),
             "inverter_config_entry_id": status.get("config_entry_id"),
             "inverter_serial": status.get("serial"),
@@ -2446,8 +2776,17 @@ class SolarCurtailment:
                 and active_power is not None
                 and active_power >= SOLAR_CURTAILMENT_OUTPUT_GATE_W
             ),
+            "shadow_relevance_ready": relevance.get("ready") is True,
+            "shadow_relevance_sample_count": int(
+                relevance.get("sample_count", 0)
+            ),
+            "shadow_relevance_dwell_seconds": relevance_dwell,
+            "shadow_relevance_required_seconds": (
+                SOLAR_CURTAILMENT_QUALIFICATION_SECONDS
+            ),
             "acquisition_allowed": (
-                self.mode == SOLAR_CURTAILMENT_MODE_ARMED
+                self.production_control_enabled
+                and self.mode == SOLAR_CURTAILMENT_MODE_ARMED
                 and self.commissioning_complete
                 and not self.state.get("fault")
                 and self._daylight_available()
@@ -2462,6 +2801,18 @@ class SolarCurtailment:
             "configured_limit_equivalent_w": configured_limit_w,
             "active_limit_equivalent_w": active_limit_w,
             "requested_limit_equivalent_w": requested_limit_w,
+            "qualified_proposed_limit_equivalent_w": (
+                qualified_proposed_limit_w
+            ),
+            "price_only_opportunity": price_only_opportunity,
+            "shadow_blocked_reason": (
+                self.state.get("shadow_blocked_reason")
+                if price_only_opportunity
+                else None
+            ),
+            "migration_blocked_reason": self.state.get(
+                "migration_blocked_reason"
+            ),
             "limit_minimum": status.get("limit_minimum"),
             "limit_maximum": status.get("limit_maximum"),
             "limit_step": status.get("limit_step"),
@@ -2508,12 +2859,23 @@ class SolarCurtailment:
             ),
             "available_modes": list(self.available_modes),
             "write_allowed": (
-                self.mode == SOLAR_CURTAILMENT_MODE_ARMED
+                self.production_control_enabled
+                and self.mode == SOLAR_CURTAILMENT_MODE_ARMED
                 and self.commissioning_complete
                 and not self.state.get("fault")
             ),
             "shadow_zero_writes": (
-                self.mode == SOLAR_CURTAILMENT_MODE_SHADOW
+                not self.production_control_enabled
+                or self.mode == SOLAR_CURTAILMENT_MODE_SHADOW
+            ),
+            "production_control_enabled": (
+                self.production_control_enabled
+            ),
+            "nighttime_watt_proposal_allowed": False,
+            "grid_export_meter_available": False,
+            "grid_export_meter_blocker": (
+                "Signed point-of-connection power is unavailable. Inverter "
+                "production is not household surplus or grid export."
             ),
             "policy_revision": POLICY_REVISION,
             "maximum_lease_minutes": (

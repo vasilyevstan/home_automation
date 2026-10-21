@@ -121,6 +121,10 @@ async def async_setup_entry(
                     solar_curtailment,
                     entry.entry_id,
                 ),
+                SolarQualifiedShadowProposalSensor(
+                    solar_curtailment,
+                    entry.entry_id,
+                ),
             )
         )
     activity_controllers = [
@@ -435,8 +439,9 @@ class FloorRoomTemperatureSensor(SensorEntity):
 
 
 class EnergyControlActivitySensor(SensorEntity):
-    _EVENT_LIMIT = 24
-    _COMMAND_EVENT_LIMIT = 24
+    _EVENT_LIMIT = 16
+    _COMMAND_EVENT_LIMIT = 8
+    _EPISODE_LIMIT = 12
     _COMMAND_KINDS = frozenset({"verified_command", "review_required"})
 
     _attr_has_entity_name = True
@@ -542,6 +547,7 @@ class EnergyControlActivitySensor(SensorEntity):
             return [], []
 
         events: list[dict] = []
+        episode_seeds: dict[str, dict] = {}
         errors: list[str] = []
         with journal_path.open(encoding="utf-8") as journal:
             for line_number, line in enumerate(journal, start=1):
@@ -556,59 +562,103 @@ class EnergyControlActivitySensor(SensorEntity):
                     errors.append(f"line {line_number}: audit record is not an object")
                     continue
                 operation = record.get("operation")
-                if record.get("event") != "verified" or operation not in (
-                    "hot_water_target",
-                    "heating_offset",
+                if (
+                    record.get("event") != "verified"
+                    or operation
+                    not in (
+                        "hot_water_target",
+                        "heating_offset",
+                        "hot_water_enabled",
+                        "heating_enabled",
+                    )
                 ):
                     continue
                 timestamp = cls._timestamp(record.get("observed_at"))
-                previous = cls._numeric(record.get("previous"))
-                confirmed = cls._numeric(record.get("confirmed"))
                 if timestamp is None:
                     errors.append(
                         f"line {line_number}: verified {operation} has no valid "
                         "observed_at"
                     )
                     continue
-                if previous is None or confirmed is None:
-                    errors.append(
-                        f"line {line_number}: verified {operation} has invalid values"
-                    )
-                    continue
-                if timestamp < cutoff:
-                    continue
-                if operation == "hot_water_target":
+                if operation in ("hot_water_target", "heating_offset"):
+                    previous = cls._numeric(record.get("previous"))
+                    confirmed = cls._numeric(record.get("confirmed"))
+                    if previous is None or confirmed is None:
+                        errors.append(
+                            f"line {line_number}: verified {operation} has "
+                            "invalid values"
+                        )
+                        continue
+                    unit = "°C"
+                else:
+                    previous = record.get("previous")
+                    confirmed = record.get("confirmed")
+                    if previous not in ("on", "standby") or confirmed not in (
+                        "on",
+                        "standby",
+                    ):
+                        errors.append(
+                            f"line {line_number}: verified {operation} has "
+                            "invalid circuit states"
+                        )
+                        continue
+                    unit = None
+                if operation.startswith("hot_water"):
                     system = "Hot water"
-                    title = "Target confirmed"
-                    label = "Target"
+                    title = (
+                        "Target confirmed"
+                        if operation == "hot_water_target"
+                        else "Circuit state confirmed"
+                    )
+                    label = (
+                        "Target"
+                        if operation == "hot_water_target"
+                        else "Circuit"
+                    )
                 else:
                     system = "Floor heating"
-                    title = "Offset confirmed"
-                    label = "Offset"
-                events.append(
-                    {
-                        "observed_at": timestamp.isoformat(),
-                        "system": system,
-                        "kind": "verified_command",
-                        "title": title,
-                        "state": "verified",
-                        "reason": (
-                            "Guarded Daikin command confirmed by native read-back."
-                        ),
-                        "result": "confirmed",
-                        "before_value": previous,
-                        "after_value": confirmed,
-                        "change": cls._temperature_change(
-                            previous,
-                            confirmed,
-                            label,
-                        ),
-                        "unit": "°C",
-                        "decision_price_eur_kwh": None,
-                        "command_source": "guarded_daikin_audit",
-                        "request_id": record.get("request_id"),
-                    }
+                    title = (
+                        "Offset confirmed"
+                        if operation == "heating_offset"
+                        else "Circuit state confirmed"
+                    )
+                    label = (
+                        "Offset"
+                        if operation == "heating_offset"
+                        else "Circuit"
+                    )
+                change = (
+                    cls._temperature_change(previous, confirmed, label)
+                    if unit == "°C"
+                    else f"{label} {previous} → {confirmed}"
                 )
+                event = {
+                    "observed_at": timestamp.isoformat(),
+                    "system": system,
+                    "kind": "verified_command",
+                    "title": title,
+                    "state": "verified",
+                    "reason": (
+                        "Guarded Daikin command confirmed by native read-back."
+                    ),
+                    "result": "confirmed",
+                    "before_value": previous,
+                    "after_value": confirmed,
+                    "change": change,
+                    "unit": unit,
+                    "decision_price_eur_kwh": None,
+                    "command_source": "guarded_daikin_audit",
+                    "operation": operation,
+                    "request_id": record.get("request_id"),
+                }
+                if timestamp < cutoff:
+                    episode_seeds[system + "|" + str(operation)] = {
+                        **event,
+                        "episode_seed": True,
+                    }
+                else:
+                    events.append(event)
+        events.extend(episode_seeds.values())
         events.sort(key=lambda event: event["observed_at"])
         return events, errors
 
@@ -697,6 +747,481 @@ class EnergyControlActivitySensor(SensorEntity):
             "after_value": cls._numeric(after),
             "unit": unit,
         }
+
+    @staticmethod
+    def _compact_reason(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        compact = " ".join(value.split())
+        return compact[:177] + "..." if len(compact) > 180 else compact
+
+    @classmethod
+    def _nearest_record(
+        cls,
+        records: list[dict],
+        observed_at: datetime,
+        *,
+        maximum_seconds: int = 300,
+    ) -> dict | None:
+        nearest = None
+        nearest_seconds = maximum_seconds + 1
+        for record in records:
+            record_at = cls._timestamp(record.get("observed_at"))
+            if record_at is None:
+                continue
+            distance = abs((record_at - observed_at).total_seconds())
+            if distance <= maximum_seconds and distance < nearest_seconds:
+                nearest = record
+                nearest_seconds = distance
+        return nearest
+
+    @classmethod
+    def _transition_exists(
+        cls,
+        transitions: list[dict],
+        *,
+        track: str,
+        observed_at: datetime,
+        before: object,
+        after: object,
+        tolerance_seconds: int = 60,
+    ) -> bool:
+        for transition in transitions:
+            if transition["_track"] != track:
+                continue
+            if (
+                transition["before_value"] != before
+                or transition["after_value"] != after
+            ):
+                continue
+            if (
+                abs(
+                    (
+                        transition["_observed_at"] - observed_at
+                    ).total_seconds()
+                )
+                <= tolerance_seconds
+            ):
+                return True
+        return False
+
+    def _episode_transitions(self, now: datetime) -> list[dict]:
+        transitions: list[dict] = []
+
+        def add_transition(
+            *,
+            track: str,
+            subsystem: str,
+            observed_at: datetime,
+            before: object,
+            after: object,
+            unit: str | None,
+            source: str,
+            result: str,
+            price: object,
+            reason: object,
+            operation: str,
+        ) -> None:
+            if observed_at > now + timedelta(minutes=5) or after is None:
+                return
+            if self._transition_exists(
+                transitions,
+                track=track,
+                observed_at=observed_at,
+                before=before,
+                after=after,
+            ):
+                return
+            transitions.append(
+                {
+                    "_track": track,
+                    "_observed_at": observed_at,
+                    "subsystem": subsystem,
+                    "before_value": before,
+                    "after_value": after,
+                    "unit": unit,
+                    "source": source,
+                    "result": result,
+                    "action_price_eur_kwh": self._numeric(price),
+                    "reason": self._compact_reason(reason),
+                    "operation": operation,
+                }
+            )
+
+        dhw_records = (
+            list(self.optimizer.state.get("decision_history", []))
+            if self.optimizer is not None
+            else []
+        )
+        floor_records = (
+            list(self.floor_shadow.state.get("decision_history", []))
+            if self.floor_shadow is not None
+            else []
+        )
+        protection_records = (
+            list(
+                self.extreme_protection.state.get(
+                    "decision_history",
+                    [],
+                )
+            )
+            if self.extreme_protection is not None
+            else []
+        )
+
+        for event in self._audit_events:
+            observed_at = self._timestamp(event.get("observed_at"))
+            if observed_at is None:
+                continue
+            operation = str(event.get("operation") or "")
+            if operation == "hot_water_target":
+                track = "hot_water_target"
+                subsystem = "hot_water"
+                records = dhw_records
+            elif operation == "heating_offset":
+                track = "floor_offset"
+                subsystem = "floor_heating"
+                records = floor_records
+            elif operation == "hot_water_enabled":
+                track = "hot_water_circuit"
+                subsystem = "hot_water"
+                records = protection_records
+            elif operation == "heating_enabled":
+                track = "floor_heating_circuit"
+                subsystem = "floor_heating"
+                records = protection_records
+            else:
+                continue
+            match = self._nearest_record(records, observed_at)
+            protected = (
+                operation in ("hot_water_enabled", "heating_enabled")
+                and match is not None
+                and bool(match.get("write_sent"))
+            )
+            add_transition(
+                track=track,
+                subsystem=subsystem,
+                observed_at=observed_at,
+                before=event.get("before_value"),
+                after=event.get("after_value"),
+                unit=event.get("unit"),
+                source="protection" if protected else "optimizer",
+                result="verified",
+                price=(
+                    match.get("current_price_eur_kwh")
+                    if match is not None
+                    else event.get("decision_price_eur_kwh")
+                ),
+                reason=(
+                    match.get("reason")
+                    if match is not None
+                    else event.get("reason")
+                ),
+                operation=operation,
+            )
+
+        known_dhw_target = None
+        for record in sorted(
+            dhw_records,
+            key=lambda item: item.get("observed_at") or "",
+        ):
+            observed_at = self._timestamp(record.get("observed_at"))
+            actual = self._numeric(record.get("actual_target_c"))
+            proposed = self._numeric(record.get("proposed_target_c"))
+            if observed_at is None:
+                continue
+            if known_dhw_target is None and actual is not None:
+                known_dhw_target = actual
+            if (
+                bool(record.get("write_sent"))
+                and actual is not None
+                and proposed is not None
+                and actual != proposed
+            ):
+                add_transition(
+                    track="hot_water_target",
+                    subsystem="hot_water",
+                    observed_at=observed_at,
+                    before=actual,
+                    after=proposed,
+                    unit="°C",
+                    source="optimizer",
+                    result="verified",
+                    price=record.get("current_price_eur_kwh"),
+                    reason=record.get("reason"),
+                    operation=str(record.get("state") or "target_change"),
+                )
+                known_dhw_target = proposed
+            elif (
+                actual is not None
+                and known_dhw_target is not None
+                and actual != known_dhw_target
+            ):
+                add_transition(
+                    track="hot_water_target",
+                    subsystem="hot_water",
+                    observed_at=observed_at,
+                    before=known_dhw_target,
+                    after=actual,
+                    unit="°C",
+                    source="manual_external",
+                    result="verified",
+                    price=record.get("current_price_eur_kwh"),
+                    reason=record.get("reason"),
+                    operation="observed_target_change",
+                )
+                known_dhw_target = actual
+
+        for record in floor_records:
+            if not bool(record.get("write_sent")):
+                continue
+            observed_at = self._timestamp(record.get("observed_at"))
+            before = self._numeric(record.get("actual_offset_c"))
+            after = self._numeric(record.get("proposed_offset_c"))
+            if (
+                observed_at is None
+                or before is None
+                or after is None
+                or before == after
+            ):
+                continue
+            add_transition(
+                track="floor_offset",
+                subsystem="floor_heating",
+                observed_at=observed_at,
+                before=before,
+                after=after,
+                unit="°C",
+                source="optimizer",
+                result="verified",
+                price=record.get("current_price_eur_kwh"),
+                reason=record.get("reason"),
+                operation=str(record.get("state") or "offset_change"),
+            )
+
+        if self.floor_shadow is not None:
+            for record in self.floor_shadow.state.get(
+                "native_schedule_transitions",
+                [],
+            ):
+                observed_at = self._timestamp(record.get("observed_at"))
+                before = self._numeric(record.get("previous_offset_c"))
+                after = self._numeric(record.get("native_offset_c"))
+                if (
+                    observed_at is None
+                    or before is None
+                    or after is None
+                    or before == after
+                ):
+                    continue
+                classification = str(
+                    record.get("classification") or "native_change"
+                )
+                nearest = self._nearest_record(
+                    floor_records,
+                    observed_at,
+                )
+                add_transition(
+                    track="floor_offset",
+                    subsystem="floor_heating",
+                    observed_at=observed_at,
+                    before=before,
+                    after=after,
+                    unit="°C",
+                    source=(
+                        "native_schedule"
+                        if classification.startswith("accepted_")
+                        else "manual_external"
+                    ),
+                    result="verified",
+                    price=(
+                        nearest.get("current_price_eur_kwh")
+                        if nearest is not None
+                        else None
+                    ),
+                    reason=(
+                        nearest.get("reason")
+                        if nearest is not None
+                        else classification.replace("_", " ")
+                    ),
+                    operation=classification,
+                )
+
+        command_operations = {"standby", "restore", "turn_off"}
+        for record in protection_records:
+            if not bool(record.get("write_sent")):
+                continue
+            observed_at = self._timestamp(record.get("observed_at"))
+            if observed_at is None:
+                continue
+            for action in record.get("actions") or []:
+                operation = str(action.get("operation") or "")
+                before = action.get("current_state")
+                after = action.get("proposed_state")
+                if (
+                    operation not in command_operations
+                    or after is None
+                    or before == after
+                ):
+                    continue
+                load_id = str(action.get("load_id") or "protected_load")
+                if load_id == "daikin_hot_water":
+                    subsystem = "hot_water"
+                    track = "hot_water_circuit"
+                elif load_id == "daikin_floor_heating":
+                    subsystem = "floor_heating"
+                    track = "floor_heating_circuit"
+                else:
+                    subsystem = "protection"
+                    track = "protection|" + load_id
+                add_transition(
+                    track=track,
+                    subsystem=subsystem,
+                    observed_at=observed_at,
+                    before=before,
+                    after=after,
+                    unit=None,
+                    source="protection",
+                    result="verified",
+                    price=record.get("current_price_eur_kwh"),
+                    reason=record.get("reason"),
+                    operation=load_id + ":" + operation,
+                )
+
+        if self.solar_curtailment is not None:
+            for record in self.solar_curtailment.operation_history:
+                observed_at = self._timestamp(record.get("at"))
+                operation = str(record.get("operation") or "")
+                if (
+                    observed_at is None
+                    or record.get("success") is not True
+                    or record.get("phase") != "verified"
+                    or operation not in ("acquire", "restore")
+                ):
+                    continue
+                previous = record.get("previous")
+                confirmed = record.get("confirmed")
+                if not isinstance(previous, dict) or not isinstance(
+                    confirmed,
+                    dict,
+                ):
+                    continue
+                before = self._numeric(previous.get("configured"))
+                after = self._numeric(confirmed.get("configured"))
+                if before is None or after is None or before == after:
+                    continue
+                mode = confirmed.get("mode")
+                add_transition(
+                    track="solar_limit",
+                    subsystem="solar",
+                    observed_at=observed_at,
+                    before=before,
+                    after=after,
+                    unit="%" if mode == "percent" else "W",
+                    source=(
+                        "optimizer"
+                        if operation == "acquire"
+                        else "protection"
+                    ),
+                    result="verified",
+                    price=record.get("decision_price_eur_kwh"),
+                    reason=record.get("reason") or operation,
+                    operation=operation,
+                )
+
+        transitions.sort(
+            key=lambda transition: transition["_observed_at"]
+        )
+        return transitions
+
+    def _episode_collections(
+        self,
+    ) -> tuple[list[dict], int]:
+        now = dt_util.utcnow().astimezone(timezone.utc)
+        cutoff = now - timedelta(hours=24)
+        grouped: dict[str, list[dict]] = {}
+        for transition in self._episode_transitions(now):
+            if transition["_observed_at"] > now:
+                continue
+            grouped.setdefault(transition["_track"], []).append(
+                transition
+            )
+
+        episodes = []
+        for track, transitions in grouped.items():
+            for index, transition in enumerate(transitions):
+                original_start = transition["_observed_at"]
+                next_start = (
+                    transitions[index + 1]["_observed_at"]
+                    if index + 1 < len(transitions)
+                    else None
+                )
+                effective_end = next_start or now
+                if effective_end <= cutoff:
+                    continue
+                clipped_start = max(original_start, cutoff)
+                if effective_end < clipped_start:
+                    continue
+                duration_seconds = max(
+                    0,
+                    int((effective_end - clipped_start).total_seconds()),
+                )
+                episode = {
+                    "subsystem": transition["subsystem"],
+                    "start": clipped_start.isoformat(),
+                    "end": (
+                        next_start.isoformat()
+                        if next_start is not None
+                        else None
+                    ),
+                    "duration_minutes": round(
+                        duration_seconds / 60,
+                        3,
+                    ),
+                    "before_value": transition["before_value"],
+                    "after_value": transition["after_value"],
+                    "unit": transition["unit"],
+                    "source": transition["source"],
+                    "result": transition["result"],
+                    "action_price_eur_kwh": transition[
+                        "action_price_eur_kwh"
+                    ],
+                    "reason": transition["reason"],
+                    "operation": transition["operation"],
+                    "active": next_start is None,
+                    "clipped_start": original_start < cutoff,
+                }
+                if original_start < cutoff:
+                    episode["transition_at"] = (
+                        original_start.isoformat()
+                    )
+                episodes.append(episode)
+
+        episodes.sort(key=lambda episode: episode["start"])
+        total = len(episodes)
+        if total <= self._EPISODE_LIMIT:
+            return episodes, 0
+        boundary_episodes = [
+            episode
+            for episode in episodes
+            if episode["clipped_start"]
+        ][-self._EPISODE_LIMIT :]
+        boundary_ids = {id(episode) for episode in boundary_episodes}
+        remaining_slots = self._EPISODE_LIMIT - len(boundary_episodes)
+        recent_episodes = (
+            [
+                episode
+                for episode in episodes
+                if id(episode) not in boundary_ids
+            ][-remaining_slots:]
+            if remaining_slots
+            else []
+        )
+        visible = sorted(
+            [*boundary_episodes, *recent_episodes],
+            key=lambda episode: episode["start"],
+        )
+        return visible, total - len(visible)
 
     @staticmethod
     def _controller_authority(
@@ -1035,6 +1560,64 @@ class EnergyControlActivitySensor(SensorEntity):
                     ),
                     "result": result,
                 })
+            for record in getattr(
+                self.solar_curtailment,
+                "state",
+                {},
+            ).get(
+                "decision_history",
+                [],
+            ):
+                observed_at = self._timestamp(record.get("observed_at"))
+                if observed_at is None or observed_at < cutoff:
+                    continue
+                state = str(record.get("state") or "")
+                if state not in {
+                    "price_only_opportunity",
+                    "shadow_blocked",
+                    "shadow_qualifying",
+                    "shadow_qualified",
+                    "migration_blocked",
+                }:
+                    continue
+                proposal = self._numeric(
+                    record.get("proposed_limit_w")
+                )
+                qualified = (
+                    state == "shadow_qualified"
+                    and proposal is not None
+                )
+                events.append({
+                    "observed_at": observed_at.isoformat(),
+                    "system": "Solar",
+                    "kind": (
+                        "simulation" if qualified else "no_command"
+                    ),
+                    "authority": "shadow",
+                    "state": state,
+                    "change": (
+                        f"Qualified Shadow proposal {proposal:g} W"
+                        if qualified
+                        else (
+                            "Price opportunity only"
+                            if state == "price_only_opportunity"
+                            else "No watt-valued proposal"
+                        )
+                    ),
+                    "reason": record.get("reason"),
+                    "decision_price_eur_kwh": self._numeric(
+                        record.get("export_earnings_eur_kwh")
+                    ),
+                    "price_basis": "export_earnings",
+                    "command_source": "solar_shadow",
+                    **self._event_values(
+                        None,
+                        proposal if qualified else None,
+                        "W",
+                    ),
+                    "result": "No inverter command was sent.",
+                    "blocked_reason": record.get("blocked_reason"),
+                })
 
         for audit_event in self._audit_events:
             observed_at = self._timestamp(audit_event.get("observed_at"))
@@ -1108,12 +1691,17 @@ class EnergyControlActivitySensor(SensorEntity):
     @property
     def extra_state_attributes(self) -> dict:
         events, command_events = self._event_collections()
+        episodes, truncated_episodes = self._episode_collections()
         return {
             "window_hours": 24,
             "event_limit": self._EVENT_LIMIT,
             "command_event_limit": self._COMMAND_EVENT_LIMIT,
+            "episode_limit": self._EPISODE_LIMIT,
             "events": events,
             "command_events": command_events,
+            "episodes": episodes,
+            "episode_count": len(episodes),
+            "episode_truncated_count": truncated_episodes,
             "audit_error": self._audit_error,
             "authority": self._authorities(),
             "verified_command_count": sum(
@@ -1304,8 +1892,10 @@ class SolarRelevanceSensor(SensorEntity):
             return "waiting_for_fresh_output"
         if active_power is None or output_gate is None:
             return "unavailable"
+        if attributes.get("shadow_relevance_ready"):
+            return "shadow_ready"
         if float(active_power) >= float(output_gate):
-            return "ready"
+            return "qualifying"
         return "waiting_for_output"
 
     @property
@@ -1314,12 +1904,21 @@ class SolarRelevanceSensor(SensorEntity):
         active_power = attributes.get("active_power_w")
         output_gate = attributes.get("output_gate_w")
         return {
-            "ready": self.native_value == "ready",
+            "ready": False,
+            "shadow_ready": self.native_value == "shadow_ready",
             "daylight_state": attributes.get("sun_state"),
             "active_power_w": active_power,
             "active_power_fresh": attributes.get("active_power_fresh"),
             "output_gate_w": output_gate,
             "daylight_required": True,
+            "write_authority": "shadow_only",
+            "write_allowed": attributes.get("write_allowed"),
+            "grid_export_meter_available": attributes.get(
+                "grid_export_meter_available"
+            ),
+            "grid_export_meter_blocker": attributes.get(
+                "grid_export_meter_blocker"
+            ),
         }
 
 
@@ -1407,4 +2006,17 @@ class SolarControllerPowerRequestSensor(SolarPowerLimitSensor):
             entry_id,
             "solar_controller_power_request",
             "requested_limit_equivalent_w",
+        )
+
+
+class SolarQualifiedShadowProposalSensor(SolarPowerLimitSensor):
+    _attr_name = "Solar qualified Shadow proposal"
+    _attr_icon = "mdi:weather-sunny-alert"
+
+    def __init__(self, controller, entry_id: str) -> None:
+        super().__init__(
+            controller,
+            entry_id,
+            "solar_qualified_shadow_proposal",
+            "qualified_proposed_limit_equivalent_w",
         )
