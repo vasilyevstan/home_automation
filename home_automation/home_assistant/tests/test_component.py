@@ -665,7 +665,10 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
             activity._audit_events = audit_events
 
             attrs = activity.extra_state_attributes
-            self.assertEqual(len(attrs["events"]), 24)
+            self.assertEqual(
+                len(attrs["events"]),
+                attrs["event_limit"],
+            )
             self.assertTrue(
                 any(
                     event.get("request_id") == "floor-command-inside-window"
@@ -680,12 +683,283 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(attrs["verified_command_count"], 1)
 
+    def test_energy_control_episodes_preserve_exact_duration_and_sources(self):
+        now = self.now.astimezone(timezone.utc)
+        first_start = now - timedelta(hours=4)
+        first_end = first_start + timedelta(minutes=23, seconds=24)
+        second_start = now - timedelta(hours=2)
+        second_end = second_start + timedelta(minutes=22, seconds=24)
+        optimizer = SimpleNamespace(
+            mode="readiness_pilot",
+            state={
+                "readiness_pilot_started_at": (
+                    now - timedelta(hours=8)
+                ).isoformat(),
+                "decision_history": [
+                    {
+                        "observed_at": first_start.isoformat(),
+                        "actual_target_c": 50,
+                        "proposed_target_c": 55,
+                        "state": "readiness_charge",
+                        "reason": "First verified readiness charge.",
+                        "current_price_eur_kwh": "0.10",
+                        "write_sent": True,
+                    },
+                    {
+                        "observed_at": first_end.isoformat(),
+                        "actual_target_c": 55,
+                        "proposed_target_c": 50,
+                        "state": "readiness_hold",
+                        "reason": "First verified target restore.",
+                        "current_price_eur_kwh": "0.12",
+                        "write_sent": True,
+                    },
+                    {
+                        "observed_at": second_start.isoformat(),
+                        "actual_target_c": 50,
+                        "proposed_target_c": 55,
+                        "state": "readiness_charge",
+                        "reason": "Second verified readiness charge.",
+                        "current_price_eur_kwh": "0.09",
+                        "write_sent": True,
+                    },
+                    {
+                        "observed_at": second_end.isoformat(),
+                        "actual_target_c": 55,
+                        "proposed_target_c": 50,
+                        "state": "readiness_hold",
+                        "reason": "Second verified target restore.",
+                        "current_price_eur_kwh": "0.11",
+                        "write_sent": True,
+                    },
+                    {
+                        "observed_at": (
+                            now - timedelta(minutes=30)
+                        ).isoformat(),
+                        "actual_target_c": 52,
+                        "proposed_target_c": 52,
+                        "state": "manual_override",
+                        "reason": "Observed external target change.",
+                        "current_price_eur_kwh": "0.15",
+                        "write_sent": False,
+                    },
+                ],
+            },
+        )
+        floor_start = now - timedelta(hours=3)
+        floor_native = now - timedelta(hours=1, minutes=39)
+        floor = SimpleNamespace(
+            mode="active",
+            state={
+                "decision_history": [
+                    {
+                        "observed_at": floor_start.isoformat(),
+                        "mode": "active",
+                        "actual_offset_c": 0,
+                        "proposed_offset_c": -4,
+                        "state": "coast",
+                        "reason": "Verified optimizer overlay.",
+                        "current_price_eur_kwh": "0.30",
+                        "write_sent": True,
+                    },
+                    {
+                        "observed_at": (
+                            now - timedelta(minutes=10)
+                        ).isoformat(),
+                        "mode": "shadow",
+                        "actual_offset_c": -2,
+                        "proposed_offset_c": 4,
+                        "state": "preheat",
+                        "reason": "Counterfactual only.",
+                        "current_price_eur_kwh": "0.08",
+                        "write_sent": False,
+                    },
+                ],
+                "native_schedule_transitions": [
+                    {
+                        "observed_at": floor_native.isoformat(),
+                        "previous_offset_c": -4,
+                        "native_offset_c": -2,
+                        "classification": "accepted_schedule_transition",
+                    }
+                ],
+            },
+        )
+        protection = SimpleNamespace(
+            mode="armed",
+            state={
+                "decision_history": [
+                    {
+                        "observed_at": (
+                            now - timedelta(minutes=20)
+                        ).isoformat(),
+                        "state": "hard_stop",
+                        "reason": "Verified protection standby.",
+                        "current_price_eur_kwh": "1.50",
+                        "write_sent": True,
+                        "actions": [
+                            {
+                                "load_id": "daikin_hot_water",
+                                "operation": "standby",
+                                "current_state": "on",
+                                "proposed_state": "standby",
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        activity = self.sensor_module.EnergyControlActivitySensor(
+            optimizer,
+            floor,
+            protection,
+            None,
+            "pricing",
+        )
+
+        attrs = activity.extra_state_attributes
+        hot_water_charges = [
+            episode
+            for episode in attrs["episodes"]
+            if episode["subsystem"] == "hot_water"
+            and episode["after_value"] == 55
+        ]
+        self.assertEqual(
+            [episode["duration_minutes"] for episode in hot_water_charges],
+            [23.4, 22.4],
+        )
+        floor_episodes = [
+            episode
+            for episode in attrs["episodes"]
+            if episode["subsystem"] == "floor_heating"
+            and episode["unit"] == "°C"
+        ]
+        self.assertEqual(
+            [episode["source"] for episode in floor_episodes],
+            ["optimizer", "native_schedule"],
+        )
+        self.assertEqual(
+            floor_episodes[0]["end"],
+            floor_native.isoformat(),
+        )
+        self.assertEqual(
+            {
+                episode["source"]
+                for episode in attrs["episodes"]
+            },
+            {
+                "optimizer",
+                "native_schedule",
+                "manual_external",
+                "protection",
+            },
+        )
+        self.assertTrue(
+            any(
+                event["kind"] == "simulation"
+                and event["system"] == "Floor heating"
+                for event in attrs["events"]
+            )
+        )
+        self.assertFalse(
+            any(
+                episode["operation"] == "preheat"
+                and episode["after_value"] == 4
+                for episode in attrs["episodes"]
+            )
+        )
+
+    def test_energy_control_episodes_clip_rolling_window_and_stay_bounded(self):
+        self.now = datetime(
+            2026,
+            10,
+            22,
+            3,
+            0,
+            tzinfo=timezone.utc,
+        )
+        now = self.now
+        records = [
+            {
+                "observed_at": (
+                    now - timedelta(hours=30)
+                ).isoformat(),
+                "actual_target_c": 50,
+                "proposed_target_c": 55,
+                "state": "readiness_charge",
+                "reason": "Episode crossing the rolling cutoff.",
+                "current_price_eur_kwh": "0.12345",
+                "write_sent": True,
+            },
+            {
+                "observed_at": (
+                    now - timedelta(hours=20)
+                ).isoformat(),
+                "actual_target_c": 55,
+                "proposed_target_c": 50,
+                "state": "readiness_hold",
+                "reason": "Episode crossing the rolling cutoff.",
+                "current_price_eur_kwh": "0.12345",
+                "write_sent": True,
+            },
+        ]
+        for index in range(30):
+            observed_at = (
+                now
+                - timedelta(hours=19, minutes=30)
+                + timedelta(minutes=30 * index)
+            )
+            before = 50 if index % 2 == 0 else 55
+            after = 55 if index % 2 == 0 else 50
+            records.append(
+                {
+                    "observed_at": observed_at.isoformat(),
+                    "actual_target_c": before,
+                    "proposed_target_c": after,
+                    "state": "readiness_charge",
+                    "reason": "Bounded rolling episode evidence.",
+                    "current_price_eur_kwh": "0.12345",
+                    "write_sent": True,
+                }
+            )
+        optimizer = SimpleNamespace(
+            mode="readiness_pilot",
+            state={
+                "readiness_pilot_started_at": (
+                    now - timedelta(days=2)
+                ).isoformat(),
+                "decision_history": records,
+            },
+        )
+        activity = self.sensor_module.EnergyControlActivitySensor(
+            optimizer,
+            None,
+            None,
+            None,
+            "pricing",
+        )
+
+        attrs = activity.extra_state_attributes
+        cutoff = now - timedelta(hours=24)
+        self.assertLessEqual(
+            len(attrs["episodes"]),
+            attrs["episode_limit"],
+        )
+        self.assertTrue(attrs["episodes"][0]["clipped_start"])
+        self.assertEqual(
+            attrs["episodes"][0]["start"],
+            cutoff.isoformat(),
+        )
+        self.assertGreater(attrs["episode_truncated_count"], 0)
+        self.assertLess(len(json.dumps(attrs)), 16000)
+
     def test_solar_power_limit_sensors_use_equivalent_watts(self):
         controller = SimpleNamespace(
             attributes={
                 "configured_limit_equivalent_w": 8000,
                 "active_limit_equivalent_w": 6000,
-                "requested_limit_equivalent_w": 4000,
+                "requested_limit_equivalent_w": None,
+                "qualified_proposed_limit_equivalent_w": 4000,
                 "configured_limit_mode": "percent",
                 "pmax_w": 8000,
             },
@@ -704,12 +978,19 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                 controller,
                 "pricing",
             ),
+            self.sensor_module.SolarQualifiedShadowProposalSensor(
+                controller,
+                "pricing",
+            ),
         )
         self.assertEqual(
             [sensor.native_value for sensor in sensors],
-            [8000.0, 6000.0, 4000.0],
+            [8000.0, 6000.0, None, 4000.0],
         )
-        self.assertTrue(all(sensor.available for sensor in sensors))
+        self.assertEqual(
+            [sensor.available for sensor in sensors],
+            [True, True, False, True],
+        )
 
     def test_solar_relevance_requires_daylight_and_fresh_output_gate(self):
         controller = SimpleNamespace(
@@ -718,6 +999,10 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                 "active_power_w": 6200,
                 "active_power_fresh": True,
                 "output_gate_w": 5000,
+                "shadow_relevance_ready": False,
+                "write_allowed": False,
+                "grid_export_meter_available": False,
+                "grid_export_meter_blocker": "Synthetic missing meter.",
             },
             async_add_listener=Mock(),
         )
@@ -737,8 +1022,15 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sensor.native_value, "waiting_for_fresh_output")
 
         controller.attributes["active_power_fresh"] = True
-        self.assertEqual(sensor.native_value, "ready")
-        self.assertTrue(sensor.extra_state_attributes["ready"])
+        self.assertEqual(sensor.native_value, "qualifying")
+        controller.attributes["shadow_relevance_ready"] = True
+        self.assertEqual(sensor.native_value, "shadow_ready")
+        self.assertFalse(sensor.extra_state_attributes["ready"])
+        self.assertTrue(sensor.extra_state_attributes["shadow_ready"])
+        self.assertEqual(
+            sensor.extra_state_attributes["write_authority"],
+            "shadow_only",
+        )
 
     async def test_owner_activation_and_floor_controls_delegate_explicitly(self):
         select_module = importlib.import_module(COMPONENT + ".select")

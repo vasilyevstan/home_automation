@@ -125,7 +125,7 @@ class DhwOptimizerTests(base.HAComponentTests):
             heating_minutes=90,
             lease_expires=None,
         )
-        self.assertEqual(charge.state, "readiness_charge")
+        self.assertEqual(charge.state, "readiness_final_topup")
         self.assertEqual(charge.desired_target, 55)
         self.assertTrue(charge.urgent)
 
@@ -307,6 +307,155 @@ class DhwOptimizerTests(base.HAComponentTests):
         self.assertEqual(deadline_hold.state, "usage_hold")
         self.assertEqual(deadline_hold.desired_target, 50)
 
+    def test_learned_shallow_allowance_avoids_0515_and_latches_0615(self):
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        optimizer.state["readiness_topup_durations"] = [23.4, 22.4]
+        self.assertEqual(optimizer.shallow_heating_minutes, 45)
+        prices = self.intervals(
+            datetime.fromisoformat("2026-10-21T00:00:00+00:00"),
+            ["0.20"] * 40,
+        )
+
+        premature = self.module.plan_dhw(
+            now=datetime.fromisoformat("2026-10-21T02:15:00+00:00"),
+            mode=self.const.DHW_MODE_SAFE,
+            policy=self.policy,
+            observation=self.observation(tank_temperature=49),
+            intervals=prices,
+            heating_minutes=105,
+            shallow_heating_minutes=optimizer.shallow_heating_minutes,
+            lease_expires=None,
+        )
+        self.assertNotIn(
+            premature.state,
+            ("readiness_charge", "readiness_final_topup"),
+        )
+        self.assertEqual(premature.readiness_heating_profile, "shallow")
+        self.assertEqual(premature.readiness_heating_minutes, 45)
+
+        final = self.module.plan_dhw(
+            now=datetime.fromisoformat("2026-10-21T03:15:00+00:00"),
+            mode=self.const.DHW_MODE_SAFE,
+            policy=self.policy,
+            observation=self.observation(tank_temperature=49),
+            intervals=prices,
+            heating_minutes=105,
+            shallow_heating_minutes=optimizer.shallow_heating_minutes,
+            lease_expires=None,
+        )
+        self.assertEqual(final.state, "readiness_final_topup")
+        self.assertEqual(final.desired_target, 55)
+
+    def test_retention_model_requires_three_samples_across_two_cycles(self):
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        optimizer.state["retention_samples"] = [
+            {
+                "loss_rate_c_per_hour": 1.0,
+                "readiness_deadline": "2026-10-21T21:00:00+03:00",
+            },
+            {
+                "loss_rate_c_per_hour": 1.5,
+                "readiness_deadline": "2026-10-21T21:00:00+03:00",
+            },
+            {
+                "loss_rate_c_per_hour": 2.0,
+                "readiness_deadline": "2026-10-22T07:00:00+03:00",
+            },
+        ]
+        qualified, rate, sample_count, cycle_count = optimizer.retention_model
+        self.assertTrue(qualified)
+        self.assertEqual(rate, 2.0)
+        self.assertEqual(sample_count, 3)
+        self.assertEqual(cycle_count, 2)
+
+        optimizer.state["retention_samples"] = (
+            optimizer.state["retention_samples"][:2]
+        )
+        self.assertFalse(optimizer.retention_model[0])
+
+    def test_latest_near_cheapest_uses_predicted_recharge_and_minimum_target(self):
+        start = datetime.fromisoformat("2026-10-15T00:00:00+00:00")
+        prices = self.intervals(
+            start,
+            ["0.10"] * 4
+            + ["0.40"] * 4
+            + ["0.105"] * 4
+            + ["0.30"] * 4,
+        )
+        decision = self.module.plan_dhw(
+            now=start + timedelta(hours=2),
+            mode=self.const.DHW_MODE_SAFE,
+            policy=self.module.DhwPolicy.from_options(
+                {"dhw_initial_heat_minutes": 60}
+            ),
+            observation=self.observation(),
+            intervals=prices,
+            heating_minutes=60,
+            shallow_heating_minutes=45,
+            lease_expires=None,
+            retention_loss_rate_c_per_hour=1.0,
+            retention_sample_count=3,
+            retention_cycle_count=2,
+        )
+        self.assertEqual(
+            decision.selected_window.start,
+            start + timedelta(hours=2),
+        )
+        self.assertEqual(
+            decision.absolute_cheapest_window.start,
+            start + timedelta(hours=2),
+        )
+        self.assertEqual(
+            decision.comparison_window.start,
+            start + timedelta(hours=3, minutes=15),
+        )
+        self.assertTrue(decision.preheat_price_gate)
+        self.assertEqual(decision.state, "preheat")
+        self.assertEqual(decision.desired_target, 52)
+
+    def test_unqualified_or_excessive_retention_suppresses_discretionary_heat(self):
+        start = datetime.fromisoformat("2026-10-15T00:00:00+00:00")
+        prices = self.intervals(
+            start,
+            ["0.10"] * 4 + ["0.40"] * 12,
+        )
+        unqualified = self.module.plan_dhw(
+            now=start,
+            mode=self.const.DHW_MODE_SAFE,
+            policy=self.module.DhwPolicy.from_options(
+                {"dhw_initial_heat_minutes": 60}
+            ),
+            observation=self.observation(),
+            intervals=prices,
+            heating_minutes=60,
+            lease_expires=None,
+        )
+        self.assertEqual(unqualified.state, "normal")
+        self.assertEqual(unqualified.desired_target, 50)
+
+        excessive = self.module.plan_dhw(
+            now=start,
+            mode=self.const.DHW_MODE_SAFE,
+            policy=self.module.DhwPolicy.from_options(
+                {"dhw_initial_heat_minutes": 60}
+            ),
+            observation=self.observation(),
+            intervals=prices,
+            heating_minutes=60,
+            shallow_heating_minutes=45,
+            lease_expires=None,
+            retention_loss_rate_c_per_hour=3.0,
+            retention_sample_count=3,
+            retention_cycle_count=2,
+        )
+        self.assertEqual(excessive.state, "normal")
+        self.assertEqual(excessive.desired_target, 50)
+        self.assertIsNone(excessive.adaptive_preheat_target_c)
+
     def test_shadow_proposes_same_readiness_boost_without_writes(self):
         now = datetime.fromisoformat("2026-10-15T03:45:00+00:00")
         decision = self.module.plan_dhw(
@@ -320,7 +469,7 @@ class DhwOptimizerTests(base.HAComponentTests):
             heating_minutes=90,
             lease_expires=None,
         )
-        self.assertEqual(decision.state, "readiness_charge")
+        self.assertEqual(decision.state, "readiness_final_topup")
         self.assertEqual(decision.desired_target, 55)
         self.assertFalse(decision.allow_write)
 
@@ -335,6 +484,9 @@ class DhwOptimizerTests(base.HAComponentTests):
             intervals=self.intervals(now, prices),
             heating_minutes=60,
             lease_expires=None,
+            retention_loss_rate_c_per_hour=0.5,
+            retention_sample_count=3,
+            retention_cycle_count=2,
         )
         self.assertEqual(decision.state, "coast")
         self.assertEqual(decision.desired_target, 45)
@@ -350,9 +502,12 @@ class DhwOptimizerTests(base.HAComponentTests):
             intervals=self.intervals(now, prices),
             heating_minutes=60,
             lease_expires=None,
+            retention_loss_rate_c_per_hour=0.5,
+            retention_sample_count=3,
+            retention_cycle_count=2,
         )
         self.assertEqual(in_window.state, "preheat")
-        self.assertEqual(in_window.desired_target, 55)
+        self.assertEqual(in_window.desired_target, 52)
         self.assertFalse(in_window.allow_write)
 
     def test_negative_prices_use_sign_safe_balanced_gate(self):
@@ -390,11 +545,14 @@ class DhwOptimizerTests(base.HAComponentTests):
             lease_expires=None,
             planned_window=window,
             comparison_window=window,
+            retention_loss_rate_c_per_hour=0.5,
+            retention_sample_count=3,
+            retention_cycle_count=2,
         )
         self.assertFalse(decision.preheat_price_gate)
         self.assertEqual(decision.state, "normal")
         self.assertEqual(decision.desired_target, 50)
-        self.assertIn("unnecessary 55°C preheating", decision.reason)
+        self.assertIn("predicted deferred recharge", decision.reason)
 
     def test_anchored_window_does_not_chase_each_remaining_quarter(self):
         now = datetime.fromisoformat("2026-10-15T00:00:00+00:00")
@@ -411,6 +569,9 @@ class DhwOptimizerTests(base.HAComponentTests):
             intervals=prices,
             heating_minutes=60,
             lease_expires=None,
+            retention_loss_rate_c_per_hour=0.5,
+            retention_sample_count=3,
+            retention_cycle_count=2,
         )
         self.assertEqual(initial.selected_window.start, now + timedelta(hours=1))
         self.assertEqual(initial.selected_window.end, now + timedelta(hours=2))
@@ -424,6 +585,9 @@ class DhwOptimizerTests(base.HAComponentTests):
             intervals=prices,
             heating_minutes=60,
             lease_expires=None,
+            retention_loss_rate_c_per_hour=0.5,
+            retention_sample_count=3,
+            retention_cycle_count=2,
         )
         self.assertEqual(rolling.selected_window.end, now + timedelta(hours=2, minutes=15))
 
@@ -437,6 +601,10 @@ class DhwOptimizerTests(base.HAComponentTests):
             lease_expires=None,
             planned_window=initial.selected_window,
             comparison_window=initial.comparison_window,
+            absolute_cheapest_window=initial.absolute_cheapest_window,
+            retention_loss_rate_c_per_hour=0.5,
+            retention_sample_count=3,
+            retention_cycle_count=2,
         )
         self.assertEqual(anchored.selected_window, initial.selected_window)
         self.assertEqual(anchored.state, "preheat")
@@ -451,6 +619,10 @@ class DhwOptimizerTests(base.HAComponentTests):
             lease_expires=None,
             planned_window=initial.selected_window,
             comparison_window=initial.comparison_window,
+            absolute_cheapest_window=initial.absolute_cheapest_window,
+            retention_loss_rate_c_per_hour=0.5,
+            retention_sample_count=3,
+            retention_cycle_count=2,
         )
         self.assertNotEqual(after_window.state, "preheat")
         self.assertEqual(after_window.selected_window, initial.selected_window)
@@ -515,11 +687,17 @@ class DhwOptimizerTests(base.HAComponentTests):
             average=Decimal("0.10"),
             interval_count=4,
         )
-        optimizer._store_price_plan(deadline, selected, selected)
+        optimizer._store_price_plan(
+            deadline,
+            selected,
+            selected,
+            selected,
+        )
         optimizer._update_preheat_completion(
             selected.start + timedelta(minutes=30),
             self.observation(tank_temperature=50),
             selected,
+            50,
         )
         completed_at = optimizer.state["planned_window_completed_at"]
         self.assertIsNotNone(completed_at)
@@ -715,6 +893,9 @@ class DhwOptimizerTests(base.HAComponentTests):
             ),
             heating_minutes=60,
             lease_expires=None,
+            retention_loss_rate_c_per_hour=0.5,
+            retention_sample_count=3,
+            retention_cycle_count=2,
         )
         self.assertEqual(raw.state, "coast")
         held = self.module.stabilize_decision(
@@ -794,6 +975,9 @@ class DhwOptimizerTests(base.HAComponentTests):
             ),
             heating_minutes=60,
             lease_expires=None,
+            retention_loss_rate_c_per_hour=0.5,
+            retention_sample_count=3,
+            retention_cycle_count=2,
         )
         optimizer._record_optimization_opportunity(now, decision)
         optimizer._record_optimization_opportunity(
@@ -805,7 +989,7 @@ class DhwOptimizerTests(base.HAComponentTests):
             optimizer, self.pricing_entry.entry_id
         )
         self.assertTrue(sensor.available)
-        self.assertEqual(sensor.native_value, Decimal("0.30"))
+        self.assertEqual(sensor.native_value, Decimal("0.20"))
         self.assertEqual(sensor.native_unit_of_measurement, "EUR/kWh")
         attributes = sensor.extra_state_attributes
         self.assertEqual(attributes["valuation_status"], "counterfactual")
@@ -1116,7 +1300,7 @@ class DhwOptimizerTests(base.HAComponentTests):
         self.assertIn("priority", optimizer.decision.reason)
         self.devices.control_daikin.assert_not_awaited()
 
-    def test_revision_seven_resets_changed_policy_evidence(self):
+    def test_revision_eight_resets_changed_policy_evidence(self):
         optimizer = self.module.DhwOptimizer(
             self.hass, self.pricing_entry, self.coordinator, self.devices
         )
@@ -1133,7 +1317,7 @@ class DhwOptimizerTests(base.HAComponentTests):
             }
         )
         optimizer._reset_policy_evidence()
-        self.assertEqual(optimizer.state["policy_revision"], 7)
+        self.assertEqual(optimizer.state["policy_revision"], 8)
         self.assertEqual(optimizer.state["shadow_days"], [])
         self.assertEqual(optimizer.state["heating_durations"], [])
         self.assertEqual(optimizer.state["deadline_checks"], {})
@@ -1162,7 +1346,7 @@ class DhwOptimizerTests(base.HAComponentTests):
         finally:
             await optimizer.async_stop()
 
-    async def test_revision_six_preserves_safe_mode_and_resets_evidence(self):
+    async def test_revision_six_migrates_to_eight_and_preserves_physical_evidence(self):
         optimizer = self.module.DhwOptimizer(
             self.hass, self.pricing_entry, self.coordinator, self.devices
         )
@@ -1211,7 +1395,7 @@ class DhwOptimizerTests(base.HAComponentTests):
         await optimizer.async_start()
         try:
             self.assertEqual(optimizer.mode, self.const.DHW_MODE_SAFE)
-            self.assertEqual(optimizer.state["policy_revision"], 7)
+            self.assertEqual(optimizer.state["policy_revision"], 8)
             self.assertIsNone(optimizer.state["lease_expires"])
             self.assertEqual(optimizer.state["confirmed_writes"], 12)
             self.assertEqual(optimizer.state["heating_durations"], [20, 22])
@@ -1233,15 +1417,29 @@ class DhwOptimizerTests(base.HAComponentTests):
             )
             self.assertEqual(
                 optimizer.state["qualified_opportunity_count"],
-                4,
+                0,
             )
-            self.assertEqual(
-                optimizer.state["last_qualified_opportunity_plan_id"],
-                "synthetic-plan",
+            self.assertIsNone(
+                optimizer.state["last_qualified_opportunity_plan_id"]
             )
             self.assertEqual(optimizer.state["deadline_checks"], {})
-            self.assertEqual(optimizer.state["readiness_window_peaks"], {})
-            self.assertEqual(optimizer.state["readiness_rapid_draws"], {})
+            self.assertEqual(
+                optimizer.state["readiness_window_peaks"],
+                {
+                    "2026-10-20T21:00:00+03:00": {
+                        "temperature": 50,
+                        "observed_at": "2026-10-20T17:55:00+00:00",
+                    }
+                },
+            )
+            self.assertEqual(
+                optimizer.state["readiness_rapid_draws"],
+                {
+                    "2026-10-20T21:00:00+03:00": (
+                        "2026-10-20T18:09:00+00:00"
+                    )
+                },
+            )
             self.assertEqual(
                 optimizer.state["readiness_final_topup_active"],
                 {},
@@ -1436,7 +1634,20 @@ class DhwOptimizerTests(base.HAComponentTests):
             "dhw_coast_horizon_hours": 8,
             "floor_indoor_temperature_entities": ["sensor.room_temperature"],
         }
-        flow._validate(valid)
+        self.assertEqual(flow._validate(valid), valid)
+        runtime_devices.daikin_api = lambda: (
+            SimpleNamespace(entry_id="daikin"),
+            SimpleNamespace(water_tank_target_temp_config={
+                "minValue": 40,
+                "maxValue": 55,
+                "stepValue": 1,
+                "settable": True,
+            }),
+        )
+        self.assertEqual(
+            flow._validate(valid)["dhw_soft_target"],
+            40,
+        )
         with self.assertRaisesRegex(HomeAssistantError, "native range"):
             flow._validate({**valid, "dhw_preheat_target": 60})
 

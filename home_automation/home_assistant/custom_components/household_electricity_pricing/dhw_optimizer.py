@@ -62,12 +62,22 @@ STORE_KEY_SUFFIX = "dhw_optimizer"
 NOTIFICATION_ID = DOMAIN + "_dhw_optimizer_fault"
 DECISION_HISTORY_LIMIT = 96
 HEATING_DURATION_LIMIT = 20
-POLICY_REVISION = 7
+RETENTION_SAMPLE_LIMIT = 20
+POLICY_REVISION = 8
 MINIMUM_TARGET_DWELL = timedelta(minutes=30)
 POST_READINESS_HOLD = timedelta(
     minutes=DHW_POST_READINESS_HOLD_MINUTES
 )
 FINAL_TOPUP_WINDOW = timedelta(minutes=DHW_FINAL_TOPUP_MINUTES)
+SHALLOW_HEATING_FALLBACK_MINUTES = 45
+SHALLOW_HEATING_MIN_MINUTES = 30
+SHALLOW_HEATING_MAX_MINUTES = 60
+RETENTION_MINIMUM_DURATION = timedelta(minutes=30)
+RETENTION_MAX_LOSS_RATE_C_PER_HOUR = 3.0
+RETENTION_REQUIRED_SAMPLES = 3
+RETENTION_REQUIRED_CYCLES = 2
+NEAR_CHEAPEST_ABSOLUTE_PREMIUM = Decimal("0.01")
+NEAR_CHEAPEST_RELATIVE_PREMIUM = Decimal("0.10")
 RECENT_DECISIONS_ATTRIBUTE_LIMIT = 4
 READINESS_SUCCESS = "success"
 READINESS_CONSUMED = "consumed"
@@ -259,6 +269,14 @@ class DhwDecision:
     preheat_price_delta: Decimal | None = None
     preheat_price_delta_percent: Decimal | None = None
     preheat_price_gate: bool = False
+    absolute_cheapest_window: PriceWindowChoice | None = None
+    readiness_heating_minutes: int | None = None
+    readiness_heating_profile: str | None = None
+    retention_qualified: bool = False
+    retention_sample_count: int = 0
+    retention_cycle_count: int = 0
+    retention_loss_rate_c_per_hour: float | None = None
+    adaptive_preheat_target_c: float | None = None
 
     def attributes(self) -> dict:
         result = {
@@ -289,6 +307,17 @@ class DhwDecision:
                 if self.preheat_price_delta_percent is not None else None
             ),
             "preheat_price_gate": self.preheat_price_gate,
+            "readiness_heating_minutes": self.readiness_heating_minutes,
+            "readiness_heating_profile": self.readiness_heating_profile,
+            "retention_model_qualified": self.retention_qualified,
+            "retention_sample_count": self.retention_sample_count,
+            "retention_cycle_count": self.retention_cycle_count,
+            "retention_loss_rate_c_per_hour": (
+                round(self.retention_loss_rate_c_per_hour, 3)
+                if self.retention_loss_rate_c_per_hour is not None
+                else None
+            ),
+            "adaptive_preheat_target_c": self.adaptive_preheat_target_c,
             "price_data_complete": self.data_complete,
             "lease_expires": self.lease_expires.isoformat() if self.lease_expires else None,
             "write_allowed": self.allow_write,
@@ -322,6 +351,25 @@ class DhwDecision:
                 "comparison_window_end": self.comparison_window.end.isoformat(),
                 "comparison_window_average_eur_kwh": format(
                     self.comparison_window.average, "f"
+                ),
+            })
+        if self.absolute_cheapest_window is None:
+            result.update({
+                "absolute_cheapest_window_start": None,
+                "absolute_cheapest_window_end": None,
+                "absolute_cheapest_window_average_eur_kwh": None,
+            })
+        else:
+            result.update({
+                "absolute_cheapest_window_start": (
+                    self.absolute_cheapest_window.start.isoformat()
+                ),
+                "absolute_cheapest_window_end": (
+                    self.absolute_cheapest_window.end.isoformat()
+                ),
+                "absolute_cheapest_window_average_eur_kwh": format(
+                    self.absolute_cheapest_window.average,
+                    "f",
                 ),
             })
         return result
@@ -408,7 +456,11 @@ def select_price_window(
     coast_horizon: timedelta,
     planned_window: PriceWindowChoice | None = None,
     comparison_window: PriceWindowChoice | None = None,
+    absolute_cheapest_window: PriceWindowChoice | None = None,
+    comparison_duration_minutes: int | None = None,
+    prefer_latest_near_cheapest: bool = False,
 ) -> tuple[
+    PriceWindowChoice | None,
     PriceWindowChoice | None,
     PriceWindowChoice | None,
     Decimal | None,
@@ -421,7 +473,7 @@ def select_price_window(
     while cursor < deadline_utc:
         row = prices.get(cursor)
         if row is None or row.end != cursor + MARKET_INTERVAL:
-            return None, None, None, False
+            return None, None, None, None, False
         cursor += MARKET_INTERVAL
     current_price = prices[current].price if current in prices else None
     horizon_start = deadline_utc - coast_horizon
@@ -438,16 +490,23 @@ def select_price_window(
             or comparison.start < horizon_start
             or comparison.end > deadline_utc
             or comparison.start >= comparison.end
-            or comparison.interval_count != planned_window.interval_count
         ):
             comparison = planned_window
-        return planned_window, comparison, current_price, True
+        cheapest = absolute_cheapest_window
+        if (
+            cheapest is None
+            or cheapest.start < horizon_start
+            or cheapest.end > deadline_utc
+            or cheapest.start >= cheapest.end
+        ):
+            cheapest = planned_window
+        return planned_window, comparison, cheapest, current_price, True
     interval_count = max(1, math.ceil(duration_minutes / 15))
     duration = interval_count * MARKET_INTERVAL
     first = max(current, horizon_start)
     last = deadline_utc - duration
     if last < first:
-        return None, None, current_price, True
+        return None, None, None, current_price, True
     choices = []
     candidate = first
     while candidate <= last:
@@ -466,10 +525,58 @@ def select_price_window(
             ))
         candidate += MARKET_INTERVAL
     if not choices:
-        return None, None, current_price, True
-    selected = min(choices, key=lambda item: (item[0], item[1]))[2]
-    comparison = max(choices, key=lambda item: (item[0], item[2].start.timestamp()))[2]
-    return selected, comparison, current_price, True
+        return None, None, None, current_price, True
+    cheapest = min(choices, key=lambda item: (item[0], item[1]))[2]
+    selected = cheapest
+    if prefer_latest_near_cheapest:
+        near_cheapest = []
+        base = max(abs(cheapest.average), Decimal("0.05"))
+        for _, _, choice in choices:
+            premium = choice.average - cheapest.average
+            if (
+                premium <= NEAR_CHEAPEST_ABSOLUTE_PREMIUM
+                and premium / base <= NEAR_CHEAPEST_RELATIVE_PREMIUM
+            ):
+                near_cheapest.append(choice)
+        if near_cheapest:
+            selected = max(near_cheapest, key=lambda choice: choice.start)
+
+    if comparison_duration_minutes is None:
+        comparison = max(
+            choices,
+            key=lambda item: (item[0], item[2].start.timestamp()),
+        )[2]
+    else:
+        comparison_count = max(
+            1,
+            math.ceil(comparison_duration_minutes / 15),
+        )
+        comparison_duration = comparison_count * MARKET_INTERVAL
+        comparison_start = deadline_utc - comparison_duration
+        rows = [
+            prices.get(comparison_start + index * MARKET_INTERVAL)
+            for index in range(comparison_count)
+        ]
+        if (
+            comparison_start >= first
+            and all(row is not None for row in rows)
+        ):
+            total = sum(
+                (row.price for row in rows if row is not None),
+                Decimal(0),
+            )
+            comparison = PriceWindowChoice(
+                start=comparison_start,
+                end=deadline_utc,
+                average=total / comparison_count,
+                interval_count=comparison_count,
+            )
+        else:
+            comparison = max(
+                (item[2] for item in choices),
+                key=lambda choice: choice.start,
+            )
+    return selected, comparison, cheapest, current_price, True
 
 
 def price_gate(
@@ -498,15 +605,21 @@ def plan_dhw(
     observation: DhwObservation,
     intervals: Iterable[PriceInterval],
     heating_minutes: int,
+    shallow_heating_minutes: int | None = None,
     lease_expires: datetime | None,
     planned_window: PriceWindowChoice | None = None,
     comparison_window: PriceWindowChoice | None = None,
+    absolute_cheapest_window: PriceWindowChoice | None = None,
     recovery_latched: bool = False,
     recovery_reason: str | None = None,
     preheat_completed: bool = False,
     readiness_delivered: bool = False,
     final_topup_used: bool = False,
     final_topup_active: bool = False,
+    recent_rapid_draw: bool = False,
+    retention_loss_rate_c_per_hour: float | None = None,
+    retention_sample_count: int = 0,
+    retention_cycle_count: int = 0,
 ) -> DhwDecision:
     if now.utcoffset() is None:
         raise HomeAssistantError("DHW planning time must include a UTC offset.")
@@ -515,7 +628,31 @@ def plan_dhw(
     if mode not in DHW_MODES:
         raise HomeAssistantError("Unknown DHW optimizer mode.")
     deadline = next_readiness(now, policy)
-    selected, comparison, current_price, complete = select_price_window(
+    shallow_minutes = (
+        shallow_heating_minutes
+        if isinstance(shallow_heating_minutes, int)
+        and not isinstance(shallow_heating_minutes, bool)
+        and shallow_heating_minutes > 0
+        else heating_minutes
+    )
+    shallow_eligible = (
+        observation.tank_temperature is not None
+        and 48 <= observation.tank_temperature < policy.normal_target
+        and not recovery_latched
+        and not recent_rapid_draw
+    )
+    readiness_heating_minutes = (
+        shallow_minutes if shallow_eligible else heating_minutes
+    )
+    readiness_heating_profile = "shallow" if shallow_eligible else "deep"
+    retention_qualified = (
+        retention_loss_rate_c_per_hour is not None
+        and math.isfinite(retention_loss_rate_c_per_hour)
+        and retention_loss_rate_c_per_hour >= 0
+        and retention_sample_count >= RETENTION_REQUIRED_SAMPLES
+        and retention_cycle_count >= RETENTION_REQUIRED_CYCLES
+    )
+    selected, comparison, cheapest, current_price, complete = select_price_window(
         now,
         deadline,
         intervals,
@@ -523,6 +660,13 @@ def plan_dhw(
         policy.coast_horizon,
         planned_window,
         comparison_window,
+        absolute_cheapest_window,
+        (
+            shallow_minutes
+            if retention_qualified
+            else None
+        ),
+        retention_qualified,
     )
     gate, delta, relative = price_gate(
         current_price,
@@ -536,6 +680,28 @@ def plan_dhw(
         policy.price_delta,
         policy.price_percent,
     )
+    adaptive_preheat_target = None
+    if (
+        retention_qualified
+        and selected is not None
+        and retention_loss_rate_c_per_hour is not None
+    ):
+        hold_hours = max(
+            0.0,
+            (
+                deadline.astimezone(UTC) - selected.end.astimezone(UTC)
+            ).total_seconds()
+            / 3600,
+        )
+        required_target = math.ceil(
+            policy.normal_target
+            + retention_loss_rate_c_per_hour * hold_hours
+            + 1
+        )
+        if required_target <= policy.preheat_target:
+            adaptive_preheat_target = float(
+                max(policy.normal_target, required_target)
+            )
     allow_write = mode in (DHW_MODE_READINESS, DHW_MODE_SAFE)
 
     def decision(
@@ -567,6 +733,14 @@ def plan_dhw(
             preheat_price_delta=preheat_delta,
             preheat_price_delta_percent=preheat_relative,
             preheat_price_gate=preheat_gate,
+            absolute_cheapest_window=cheapest,
+            readiness_heating_minutes=readiness_heating_minutes,
+            readiness_heating_profile=readiness_heating_profile,
+            retention_qualified=retention_qualified,
+            retention_sample_count=retention_sample_count,
+            retention_cycle_count=retention_cycle_count,
+            retention_loss_rate_c_per_hour=retention_loss_rate_c_per_hour,
+            adaptive_preheat_target_c=adaptive_preheat_target,
         )
 
     if mode == DHW_MODE_PAUSED:
@@ -589,7 +763,7 @@ def plan_dhw(
             policy.preheat_target,
             urgent=True,
         )
-    if remaining <= timedelta(minutes=heating_minutes):
+    if remaining <= timedelta(minutes=readiness_heating_minutes):
         if observation.tank_temperature < policy.normal_target:
             if (
                 readiness_delivered
@@ -614,19 +788,18 @@ def plan_dhw(
             return decision(
                 (
                     "readiness_final_topup"
-                    if readiness_delivered
-                    and remaining <= FINAL_TOPUP_WINDOW
+                    if remaining <= FINAL_TOPUP_WINDOW
                     else "readiness_charge"
                 ),
                 (
                     "The readiness deadline is inside the final 45-minute "
                     "window; keep the 55°C charge latched through the deadline."
-                    if readiness_delivered
-                    and remaining <= FINAL_TOPUP_WINDOW
+                    if remaining <= FINAL_TOPUP_WINDOW
                     else (
                         "The readiness deadline is inside the conservative "
-                        "heating allowance; request 55°C until the measured "
-                        "tank reaches 50°C."
+                        f"{readiness_heating_profile} "
+                        f"{readiness_heating_minutes}-minute heating allowance; "
+                        "request 55°C until the measured tank reaches 50°C."
                     )
                 ),
                 policy.preheat_target,
@@ -689,18 +862,34 @@ def plan_dhw(
         )
     now_utc = now.astimezone(UTC)
     if selected.start <= now_utc < selected.end:
+        if not retention_qualified:
+            return decision(
+                "normal",
+                "Discretionary heating above 50°C is suppressed until at "
+                "least three clean retention samples span two readiness cycles.",
+                policy.normal_target,
+            )
+        if adaptive_preheat_target is None:
+            return decision(
+                "normal",
+                "The learned retention envelope would require more than the "
+                "55°C native maximum, so early discretionary storage is skipped.",
+                policy.normal_target,
+            )
         if not preheat_gate:
             return decision(
                 "normal",
-                "The cheapest feasible block does not beat the highest-cost alternative "
-                "by both price gates, so unnecessary 55°C preheating is avoided.",
+                "The latest near-cheapest block does not beat the predicted "
+                "deferred recharge by both price gates, so discretionary "
+                "preheating is avoided.",
                 policy.normal_target,
             )
         return decision(
             "preheat",
-            "The current quarter is inside the anchored cheapest block and its "
-            "all-in price advantage justifies 55°C preheating.",
-            policy.preheat_target,
+            "The current quarter is inside the latest near-cheapest block, "
+            "the predicted deferred recharge passes both price gates, and the "
+            f"minimum retained-readiness target is {adaptive_preheat_target:g}°C.",
+            adaptive_preheat_target,
         )
     if (
         observation.tank_temperature < policy.normal_target
@@ -799,11 +988,20 @@ class DhwOptimizer:
             "planned_comparison_end": None,
             "planned_comparison_average": None,
             "planned_comparison_intervals": None,
+            "planned_cheapest_start": None,
+            "planned_cheapest_end": None,
+            "planned_cheapest_average": None,
+            "planned_cheapest_intervals": None,
             "planned_window_completed_at": None,
             "shadow_days": [],
             "readiness_pilot_days": [],
             "heating_durations": [],
             "readiness_topup_durations": [],
+            "retention_samples": [],
+            "retention_started_at": None,
+            "retention_start_temperature": None,
+            "retention_target": None,
+            "retention_deadline": None,
             "cycle_started_at": None,
             "cycle_start_temperature": None,
             "topup_started_at": None,
@@ -844,11 +1042,20 @@ class DhwOptimizer:
             "planned_comparison_end": None,
             "planned_comparison_average": None,
             "planned_comparison_intervals": None,
+            "planned_cheapest_start": None,
+            "planned_cheapest_end": None,
+            "planned_cheapest_average": None,
+            "planned_cheapest_intervals": None,
             "planned_window_completed_at": None,
             "shadow_days": [],
             "readiness_pilot_days": [],
             "heating_durations": [],
             "readiness_topup_durations": [],
+            "retention_samples": [],
+            "retention_started_at": None,
+            "retention_start_temperature": None,
+            "retention_target": None,
+            "retention_deadline": None,
             "cycle_started_at": None,
             "cycle_start_temperature": None,
             "topup_started_at": None,
@@ -873,7 +1080,7 @@ class DhwOptimizer:
             "last_qualified_opportunity_at": None,
         })
 
-    def _migrate_revision_seven(self) -> None:
+    def _migrate_revision_eight(self) -> None:
         preserved = {
             "heating_durations": list(self.state["heating_durations"]),
             "readiness_topup_durations": list(
@@ -893,15 +1100,21 @@ class DhwOptimizer:
             "owner_full_control_approved_at": self.state[
                 "owner_full_control_approved_at"
             ],
-            "qualified_opportunity_count": self.state[
-                "qualified_opportunity_count"
-            ],
-            "last_qualified_opportunity_plan_id": self.state[
-                "last_qualified_opportunity_plan_id"
-            ],
-            "last_qualified_opportunity_at": self.state[
-                "last_qualified_opportunity_at"
-            ],
+            "readiness_window_peaks": dict(
+                self.state["readiness_window_peaks"]
+            ),
+            "readiness_rapid_draws": dict(
+                self.state["readiness_rapid_draws"]
+            ),
+            "readiness_deadline_samples": dict(
+                self.state["readiness_deadline_samples"]
+            ),
+            "readiness_final_topups": dict(
+                self.state["readiness_final_topups"]
+            ),
+            "readiness_final_topup_active": dict(
+                self.state["readiness_final_topup_active"]
+            ),
         }
         self._reset_policy_evidence()
         self.state.update(preserved)
@@ -919,8 +1132,8 @@ class DhwOptimizer:
             for key in self.state:
                 if key in stored:
                     self.state[key] = stored[key]
-            if stored_revision in (5, 6):
-                self._migrate_revision_seven()
+            if stored_revision in (5, 6, 7):
+                self._migrate_revision_eight()
             elif stored_revision != POLICY_REVISION:
                 write_capable_mode = self.mode in (
                     DHW_MODE_READINESS,
@@ -1024,6 +1237,62 @@ class DhwOptimizer:
         learned = math.ceil((values[index] + 15) / 15) * 15
         return max(45, min(120, learned))
 
+    @property
+    def shallow_heating_minutes(self) -> int:
+        values = sorted(
+            float(value)
+            for value in self.state["readiness_topup_durations"]
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+        if len(values) < 2:
+            return SHALLOW_HEATING_FALLBACK_MINUTES
+        index = max(0, math.ceil(len(values) * 0.9) - 1)
+        learned = math.ceil((values[index] + 15) / 15) * 15
+        return max(
+            SHALLOW_HEATING_MIN_MINUTES,
+            min(SHALLOW_HEATING_MAX_MINUTES, learned),
+        )
+
+    @property
+    def retention_model(self) -> tuple[bool, float | None, int, int]:
+        samples = []
+        cycles = set()
+        for record in self.state["retention_samples"]:
+            if not isinstance(record, dict):
+                continue
+            rate = _raw_number(record.get("loss_rate_c_per_hour"))
+            deadline = record.get("readiness_deadline")
+            if (
+                rate is None
+                or rate < 0
+                or rate > RETENTION_MAX_LOSS_RATE_C_PER_HOUR
+                or not isinstance(deadline, str)
+            ):
+                continue
+            samples.append(rate)
+            cycles.add(deadline)
+        if not samples:
+            return False, None, 0, 0
+        samples.sort()
+        index = max(0, math.ceil(len(samples) * 0.9) - 1)
+        qualified = (
+            len(samples) >= RETENTION_REQUIRED_SAMPLES
+            and len(cycles) >= RETENTION_REQUIRED_CYCLES
+        )
+        return qualified, samples[index], len(samples), len(cycles)
+
+    def _recent_rapid_draw(self, deadline: datetime) -> bool:
+        return (
+            _instant(
+                self.state["readiness_rapid_draws"].get(
+                    deadline.isoformat()
+                )
+            )
+            is not None
+        )
+
     def _observation(self, status: dict) -> DhwObservation:
         heating = status.get("heating")
         water = status.get("hot_water")
@@ -1088,6 +1357,10 @@ class DhwOptimizer:
             "planned_comparison_end",
             "planned_comparison_average",
             "planned_comparison_intervals",
+            "planned_cheapest_start",
+            "planned_cheapest_end",
+            "planned_cheapest_average",
+            "planned_cheapest_intervals",
             "planned_window_completed_at",
         ):
             self.state[key] = None
@@ -1119,28 +1392,35 @@ class DhwOptimizer:
 
     def _stored_price_plan(
         self, deadline: datetime
-    ) -> tuple[PriceWindowChoice | None, PriceWindowChoice | None]:
+    ) -> tuple[
+        PriceWindowChoice | None,
+        PriceWindowChoice | None,
+        PriceWindowChoice | None,
+    ]:
         if self.state.get("planned_deadline") != deadline.isoformat():
             self._clear_price_plan()
-            return None, None
+            return None, None, None
         selected = self._stored_window("planned_window")
         if selected is None:
             self._clear_price_plan()
-            return None, None
+            return None, None, None
         comparison = self._stored_window("planned_comparison") or selected
-        return selected, comparison
+        cheapest = self._stored_window("planned_cheapest") or selected
+        return selected, comparison, cheapest
 
     def _store_price_plan(
         self,
         deadline: datetime,
         selected: PriceWindowChoice,
         comparison: PriceWindowChoice | None,
+        cheapest: PriceWindowChoice | None,
     ) -> None:
         self.state["planned_deadline"] = deadline.isoformat()
         self.state["planned_window_completed_at"] = None
         for prefix, window in (
             ("planned_window", selected),
             ("planned_comparison", comparison or selected),
+            ("planned_cheapest", cheapest or selected),
         ):
             self.state[prefix + "_start"] = window.start.isoformat()
             self.state[prefix + "_end"] = window.end.isoformat()
@@ -1152,16 +1432,120 @@ class DhwOptimizer:
         now: datetime,
         observation: DhwObservation,
         selected: PriceWindowChoice | None,
+        required_target: float | None,
     ) -> None:
         if (
             selected is None
+            or required_target is None
             or self.state.get("planned_window_completed_at") is not None
             or now.astimezone(UTC) < selected.start.astimezone(UTC)
             or observation.tank_temperature is None
-            or observation.tank_temperature < self.policy.normal_target
+            or observation.tank_temperature < required_target
         ):
             return
         self.state["planned_window_completed_at"] = now.astimezone(UTC).isoformat()
+
+    def _reset_retention_segment(self) -> None:
+        self.state["retention_started_at"] = None
+        self.state["retention_start_temperature"] = None
+        self.state["retention_target"] = None
+        self.state["retention_deadline"] = None
+
+    def _start_retention_segment(
+        self,
+        now: datetime,
+        temperature: float,
+        target: float,
+    ) -> None:
+        self.state["retention_started_at"] = now.isoformat()
+        self.state["retention_start_temperature"] = temperature
+        self.state["retention_target"] = target
+        self.state["retention_deadline"] = next_readiness(
+            now,
+            self.policy,
+        ).isoformat()
+
+    def _update_retention_learning(
+        self,
+        now: datetime,
+        observation: DhwObservation,
+        last_temperature: float | None,
+        last_observed: datetime | None,
+    ) -> None:
+        temperature = observation.tank_temperature
+        target = observation.target_temperature
+        if (
+            observation.override_reason is not None
+            or temperature is None
+            or target is None
+            or observation.enabled is not True
+            or temperature < self.policy.normal_target
+            or target > self.policy.normal_target
+        ):
+            self._reset_retention_segment()
+            return
+        if (
+            last_temperature is not None
+            and last_observed is not None
+            and timedelta(0)
+            <= now - last_observed.astimezone(UTC)
+            <= timedelta(minutes=15)
+            and last_temperature - temperature >= 3
+        ):
+            self._reset_retention_segment()
+            return
+
+        started = _instant(self.state.get("retention_started_at"))
+        start_temperature = _raw_number(
+            self.state.get("retention_start_temperature")
+        )
+        segment_target = _raw_number(self.state.get("retention_target"))
+        deadline = self.state.get("retention_deadline")
+        if (
+            started is None
+            or start_temperature is None
+            or segment_target != target
+            or not isinstance(deadline, str)
+        ):
+            if temperature > self.policy.normal_target:
+                self._start_retention_segment(now, temperature, target)
+            else:
+                self._reset_retention_segment()
+            return
+        if temperature > start_temperature:
+            self._start_retention_segment(now, temperature, target)
+            return
+
+        elapsed = now - started.astimezone(UTC)
+        if elapsed < RETENTION_MINIMUM_DURATION:
+            return
+        hours = elapsed.total_seconds() / 3600
+        loss = start_temperature - temperature
+        rate = loss / hours if hours > 0 else math.inf
+        if (
+            not math.isfinite(rate)
+            or rate < 0
+            or rate > RETENTION_MAX_LOSS_RATE_C_PER_HOUR
+        ):
+            if temperature > self.policy.normal_target:
+                self._start_retention_segment(now, temperature, target)
+            else:
+                self._reset_retention_segment()
+            return
+        samples = list(self.state["retention_samples"])
+        samples.append({
+            "observed_at": now.isoformat(),
+            "duration_minutes": round(elapsed.total_seconds() / 60, 1),
+            "start_temperature_c": start_temperature,
+            "end_temperature_c": temperature,
+            "loss_rate_c_per_hour": round(rate, 3),
+            "readiness_deadline": deadline,
+        })
+        self.state["retention_samples"] = samples[-RETENTION_SAMPLE_LIMIT:]
+        if temperature > self.policy.normal_target:
+            self._start_retention_segment(now, temperature, target)
+        else:
+            self._reset_retention_segment()
 
     def _update_learning(self, now: datetime, observation: DhwObservation) -> None:
         local_day = now.astimezone(TALLINN).date().isoformat()
@@ -1323,6 +1707,12 @@ class DhwOptimizer:
         self.state["readiness_deadline_samples"] = dict(
             list(samples.items())[-30:]
         )
+        self._update_retention_learning(
+            now,
+            observation,
+            last_temperature,
+            last_observed,
+        )
         if (
             observation.override_reason is not None
             or temperature is None
@@ -1470,6 +1860,10 @@ class DhwOptimizer:
         plan_id = self._opportunity_plan_id(decision)
         if (
             plan_id is None
+            or not decision.retention_qualified
+            or decision.adaptive_preheat_target_c is None
+            or decision.adaptive_preheat_target_c
+            <= self.policy.normal_target
             or not decision.preheat_price_gate
             or decision.preheat_price_delta is None
             or decision.preheat_price_delta <= 0
@@ -1511,12 +1905,17 @@ class DhwOptimizer:
                 lease = _instant(self.state.get("lease_expires"))
                 intervals = published_intervals(self.coordinator)
                 deadline = next_readiness(observed_at, self.policy)
-                planned_window, comparison_window = self._stored_price_plan(deadline)
-                self._update_preheat_completion(
-                    observed_at,
-                    observation,
+                (
                     planned_window,
-                )
+                    comparison_window,
+                    absolute_cheapest_window,
+                ) = self._stored_price_plan(deadline)
+                (
+                    retention_qualified,
+                    retention_rate,
+                    retention_sample_count,
+                    retention_cycle_count,
+                ) = self.retention_model
                 decision = plan_dhw(
                     now=observed_at,
                     mode=self.mode,
@@ -1524,9 +1923,11 @@ class DhwOptimizer:
                     observation=observation,
                     intervals=intervals,
                     heating_minutes=self.heating_minutes,
+                    shallow_heating_minutes=self.shallow_heating_minutes,
                     lease_expires=lease.astimezone(UTC) if lease else None,
                     planned_window=planned_window,
                     comparison_window=comparison_window,
+                    absolute_cheapest_window=absolute_cheapest_window,
                     recovery_latched=self.state["recovery_latched"] is True,
                     recovery_reason=self.state.get("recovery_reason"),
                     preheat_completed=(
@@ -1543,9 +1944,23 @@ class DhwOptimizer:
                             "readiness_final_topup_active"
                         ].get(deadline.isoformat())
                     ),
+                    recent_rapid_draw=self._recent_rapid_draw(deadline),
+                    retention_loss_rate_c_per_hour=(
+                        retention_rate if retention_qualified else None
+                    ),
+                    retention_sample_count=retention_sample_count,
+                    retention_cycle_count=retention_cycle_count,
+                )
+                self._update_preheat_completion(
+                    observed_at,
+                    observation,
+                    decision.selected_window,
+                    decision.adaptive_preheat_target_c,
                 )
                 if (
                     planned_window is None
+                    and decision.retention_qualified
+                    and decision.adaptive_preheat_target_c is not None
                     and decision.data_complete
                     and decision.selected_window is not None
                     and decision.deadline is not None
@@ -1554,11 +1969,13 @@ class DhwOptimizer:
                         decision.deadline,
                         decision.selected_window,
                         decision.comparison_window,
+                        decision.absolute_cheapest_window,
                     )
                     self._update_preheat_completion(
                         observed_at,
                         observation,
                         decision.selected_window,
+                        decision.adaptive_preheat_target_c,
                     )
                 if (
                     decision.state == "recovery"
@@ -1963,6 +2380,12 @@ class DhwOptimizer:
             self.state["readiness_pilot_days"]
         )
         pilot_started = _instant(self.state.get("pilot_started_at"))
+        (
+            retention_qualified,
+            retention_rate,
+            retention_sample_count,
+            retention_cycle_count,
+        ) = self.retention_model
         result.update({
             "shadow_zero_writes": self.mode == DHW_MODE_SHADOW,
             "shadow_days": len(self.state["shadow_days"]),
@@ -1973,6 +2396,18 @@ class DhwOptimizer:
                 self.state["readiness_topup_durations"]
             ),
             "heating_duration_minutes": self.heating_minutes,
+            "deep_heating_duration_minutes": self.heating_minutes,
+            "shallow_heating_duration_minutes": (
+                self.shallow_heating_minutes
+            ),
+            "retention_model_qualified": retention_qualified,
+            "retention_sample_count": retention_sample_count,
+            "retention_cycle_count": retention_cycle_count,
+            "retention_loss_rate_c_per_hour": (
+                round(retention_rate, 3)
+                if retention_rate is not None
+                else None
+            ),
             "shadow_ready": self.shadow_ready,
             "soft_standby_ready": False,
             "automatic_soft_standby_enabled": False,

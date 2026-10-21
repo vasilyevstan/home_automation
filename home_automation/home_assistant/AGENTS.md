@@ -70,15 +70,19 @@
   all-in price snapshot and the same shared guarded `EnergyDevices` instance.
   Default to shadow with zero writes; never let installation, setup, status
   reads, or option saves promote it.
-- Preserve the 07:00/21:00 readiness, manual native 30°C capability, automatic
-  45/50/55°C policy, native target range/step validation, complete
-  published-price requirement, sign-safe absolute/relative price gate, and
-  ownership-aware restore.
-  Anchor one cheap and comparison block per readiness cycle; require a material
-  all-in-price advantage before price-driven 55°C preheat. The separately
-  selected readiness pilot may request 55°C only inside the final conservative
-  heating allowance while measured tank temperature is below 50°C, must restore
-  50°C immediately when readiness is measured, and must never use 45°C coast.
+- Preserve the 07:00/21:00 readiness, guarded native minimum capability,
+  automatic 45/50°C policy with an adaptive 50–55°C requested ceiling, native
+  target range/step validation, complete published-price requirement, sign-safe
+  absolute/relative price gate, and ownership-aware restore.
+  Select the latest feasible block that remains within both €0.01/kWh and 10%
+  of the absolute cheapest average, using a €0.05 denominator floor. Require a
+  material all-in-price advantage before discretionary preheat. Suppress early
+  storage above 50°C until retention qualifies with at least three clean
+  passive-loss samples across two readiness cycles. Compute the ceiling from
+  50°C plus p90 loss through readiness plus 1°C reserve, bounded to 55°C.
+  The separately selected readiness pilot may request the readiness ceiling
+  only inside the final learned heating allowance while measured tank
+  temperature is below 50°C and must never use 45°C coast.
   Hold 50°C for two hours after both readiness deadlines; after delivery,
   normally re-arm at 48°C and allow only one final top-up inside the last
   45 minutes. Once that final top-up starts, keep the 55°C request latched
@@ -90,11 +94,15 @@
   rounding cannot restart post-window recovery, use minimum dwell for ordinary
   price-driven transitions, keep readiness evidence provisional for the
   15-minute post-deadline observation window, learn deep-recovery and shallow
-  top-up durations separately, and reset promotion evidence whenever a policy
-  revision changes those behaviors.
+  top-up durations separately, use p90 plus a 15-minute reserve rounded to
+  quarter-hours for the shallow allowance and clamp it to 30–60 minutes, and
+  reset changed-policy qualification whenever a revision changes those
+  behaviors.
 - Never select 30°C automatically or expose it as an optimizer mode. Preserve
-  it only as an explicit guarded native target. Native DHW standby/off remains
-  out of scope unless a later task supplies new evidence and policy.
+  it only as an explicit guarded native target. If the unchanged 30°C option is
+  below the selected device's native target range, persist the device's actual
+  minimum instead. Native DHW standby/off remains out of scope unless a later
+  task supplies new evidence and policy.
 - Preserve the evidence-gated DHW promotion path, but permit a separately
   recorded owner-approved early activation when the owner explicitly requests
   full control. Do not synthesize qualification days, cycles, checks or writes.
@@ -217,20 +225,20 @@
   exact verified device outcome when only final JSONL audit persistence fails,
   and expose that audit failure separately.
 - Keep solar curtailment independent from Daikin and available for solar-only
-  configs. Default to Shadow. Armed remains unavailable until deterministic
-  replay, elevated write capability, bound identity/Pmax, mode-preserving cap
-  calculation and two stable unrestricted observations are complete; passing
-  gates never selects Armed automatically.
-- Solar policy revision 2 uses exact current `export_earnings_eur_kwh`: Shadow
-  opportunity is below zero, while Armed entry is at or below -€0.010/kWh.
-  Require a known contiguous negative block with at least 30 minutes remaining,
-  matching configured/active unrestricted 100% or Pmax, `sun.sun` above the
-  horizon, fresh AC active power of at least 5,000 W twice at least 30 seconds
-  apart, and a 60-second dwell. Apply the same daylight/output gate to new
-  commissioning evidence and reset qualification immediately when either gate
-  fails.
-  Preserve the current percentage/watt mode and apply at most a native-step
-  4,000 W-equivalent cap. Never change inverter mode automatically.
+  configs. Policy revision 3 is Shadow-only: expose only Off and Shadow, reject
+  Armed, keep production authority disabled, and hard-gate acquisition inside
+  the writer-facing method. Stored Armed state migrates command-free to Shadow.
+  Never let replay, commissioning, permissions or daylight observations enable
+  production writes.
+- A negative `export_earnings_eur_kwh` is a counterfactual opportunity. At
+  night record a price-only point with `below_horizon` and no watt proposal.
+  A qualified daylight proposal requires a known contiguous negative block with
+  at least 30 minutes remaining, matching unrestricted configured/active 100%
+  or Pmax, `sun.sun` above the horizon, fresh AC active power of at least
+  5,000 W on two observations and the full 60-second dwell. Observe the
+  selected Huawei entry's active-power entity directly and retain the
+  30-second timer as a backstop. Preserve the current percentage/watt mode and
+  calculate only a native-step 4,000 W-equivalent Shadow proposal.
 - Persist versioned solar state before and after dispatch through an
   acknowledged private atomic file write; HA Store alone is not a durable-write
   acknowledgement because ordinary write/serialization failures may be
@@ -257,13 +265,20 @@
   euro savings.
   Keep the dedicated solar opportunity sensor Recorder-safe and label Armed
   values as live but unattributed, never realized savings.
-- Keep configured, active and requested solar-limit history in dedicated
-  Recorder-safe equivalent-watt sensors. Preserve native percent/watt mode in
-  attributes. Keep the solar relevance sensor Recorder-safe and report `ready`
-  only for the conjunction of above-horizon daylight, fresh active power and
-  output at or above the 5 kW gate. Keep solar operation history bounded, and
-  include verified, pre-dispatch and uncertain solar outcomes in the compact
-  cross-controller activity feed.
+- Keep configured, active, historical owned request/restore, and qualified
+  Shadow-proposal solar-limit history in dedicated Recorder-safe
+  equivalent-watt sensors. The request must be unavailable during ordinary
+  Shadow operation, and raw target capability must never be presented as a
+  proposal. Preserve native percent/watt mode in attributes. Keep solar
+  relevance Recorder-safe and report `shadow_ready` only for the conjunction
+  of above-horizon daylight, fresh ≥5 kW output, unrestricted native limits,
+  two samples and the full dwell.
+- Reconstruct rolling-24-hour activity episodes only from verified actual-state
+  transitions. Close an interval at the next transition on its track; keep
+  optimizer, native-schedule, manual/external and protection sources distinct.
+  Simulations, counterfactual proposals, no-command outcomes and review-required
+  records remain point events. Clip boundary-spanning intervals while retaining
+  their original transition timestamp, and keep Recorder payloads bounded.
 - HA must be the sole Huawei Modbus client during handover. Keep the old local
   solar MCP disconnected as rollback; cloud history is independent. Generation
   caps, export limits, and household load are not interchangeable.

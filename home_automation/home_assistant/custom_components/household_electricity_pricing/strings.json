@@ -37,15 +37,15 @@
     "step": {
       "init": {
         "title": "Heating price optimizers",
-        "description": "Configure the deterministic Daikin target policy, floor-optimizer room sources, and the explicit climate allowlist for extreme-price protection. Saving options does not enable writes. Write-capable modes still require their evidence gate or an explicit owner-approved activation, while every device guard and ownership check remains mandatory. {error}",
+        "description": "Configure deterministic DHW readiness and retention policy, floor-optimizer room sources, and the explicit climate allowlist for extreme-price protection. Saving options does not enable writes. Write-capable heating modes still require their evidence gate or an explicit owner-approved activation, while Solar remains Shadow-only and every device guard and ownership check remains mandatory. {error}",
         "data": {
           "dhw_morning_ready": "Morning readiness time (HH:MM, Europe/Tallinn)",
           "dhw_evening_ready": "Evening readiness time (HH:MM, Europe/Tallinn)",
-          "dhw_soft_target": "Soft-standby target (°C)",
+          "dhw_soft_target": "Native minimum target (°C; guarded manual use)",
           "dhw_floor_target": "Comfort threshold and safe coast target (°C)",
           "dhw_normal_target": "Normal readiness target (°C)",
           "dhw_preheat_target": "Cheap-period preheat target (°C)",
-          "dhw_max_lease_hours": "Maximum soft-standby lease (hours)",
+          "dhw_max_lease_hours": "Maximum target-shift lease (hours)",
           "dhw_price_delta_eur_kwh": "Minimum absolute price advantage (EUR/kWh)",
           "dhw_price_delta_percent": "Minimum relative price advantage (%)",
           "dhw_initial_heat_minutes": "Initial conservative heating allowance (minutes)",

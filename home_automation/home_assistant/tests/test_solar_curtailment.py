@@ -10,7 +10,7 @@ import importlib
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from homeassistant.exceptions import HomeAssistantError
 
@@ -158,7 +158,13 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
             self.devices,
         )
 
-    def commission(self, controller):
+    def commission(
+        self,
+        controller,
+        *,
+        enable_production_control=True,
+    ):
+        controller.production_control_enabled = enable_production_control
         identity = {
             "config_entry_id": self.status["config_entry_id"],
             "serial": self.status["serial"],
@@ -217,6 +223,47 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(watts["mode"], "watts")
         self.assertEqual(watts["value"], 4000.0)
 
+    def test_active_power_entity_changes_trigger_direct_observation(self):
+        controller = self.controller()
+        controller.devices.solar_entry = "solar-entry"
+        entries = [
+            SimpleNamespace(
+                entity_id="sensor.inverter_active_power",
+                unique_id="synthetic_active_power",
+                original_name="Active power",
+            ),
+            SimpleNamespace(
+                entity_id="sensor.inverter_daily_yield",
+                unique_id="synthetic_daily_yield",
+                original_name="Daily yield",
+            ),
+            SimpleNamespace(
+                entity_id="number.inverter_active_power_limit",
+                unique_id="synthetic_active_power_limit",
+                original_name="Active power limit",
+            ),
+        ]
+        with (
+            patch.object(
+                self.module.entity_registry,
+                "async_get",
+                return_value=object(),
+            ),
+            patch.object(
+                self.module.entity_registry,
+                "async_entries_for_config_entry",
+                return_value=entries,
+            ),
+        ):
+            self.assertEqual(
+                controller._solar_observation_entities(),
+                ("sensor.inverter_active_power",),
+            )
+
+        controller._schedule_evaluation = Mock()
+        controller._inverter_observation_changed(None)
+        controller._schedule_evaluation.assert_called_once_with()
+
     def test_negative_block_requires_known_end_and_exact_current_price(self):
         snapshot = self.snapshot(
             ["0.01", "-0.02", "-0.03", "0.00"]
@@ -272,20 +319,188 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         with self.assertRaisesRegex(
-            HomeAssistantError, "complete deterministic"
+            HomeAssistantError, "Armed mode is disabled"
         ):
             await controller.async_set_mode(
                 self.const.SOLAR_CURTAILMENT_MODE_ARMED
             )
-        self.commission(controller)
+        self.commission(
+            controller,
+            enable_production_control=False,
+        )
         self.assertEqual(
             controller.mode,
             self.const.SOLAR_CURTAILMENT_MODE_SHADOW,
         )
-        self.assertIn(
+        self.assertNotIn(
             self.const.SOLAR_CURTAILMENT_MODE_ARMED,
             controller.available_modes,
         )
+        self.assertFalse(controller.attributes["write_allowed"])
+        self.assertTrue(controller.attributes["shadow_zero_writes"])
+
+    async def test_shadow_night_records_price_only_without_watt_proposal(self):
+        controller = self.controller()
+        self.hass.states.async_set("sun.sun", "below_horizon")
+        self.coordinator.data = self.snapshot(
+            ["0.01", "-0.02", "-0.02", "-0.02", "0.01"]
+        )
+
+        await self.evaluate(controller, self.runtime_now)
+
+        self.assertEqual(
+            controller.decision.state,
+            "price_only_opportunity",
+        )
+        attributes = controller.attributes
+        self.assertTrue(attributes["price_only_opportunity"])
+        self.assertEqual(
+            attributes["shadow_blocked_reason"],
+            "below_horizon",
+        )
+        self.assertIsNone(
+            attributes["qualified_proposed_limit_equivalent_w"]
+        )
+        self.assertIsNone(attributes["requested_limit_equivalent_w"])
+        self.assertFalse(attributes["shadow_relevance_ready"])
+        self.assertFalse(attributes["write_allowed"])
+        self.devices.set_solar_limit.assert_not_awaited()
+
+    async def test_shadow_daylight_dwell_exposes_only_qualified_proposal(self):
+        controller = self.controller()
+        self.coordinator.data = self.snapshot(
+            ["0.01", "-0.02", "-0.02", "-0.02", "0.01"]
+        )
+        start = self.runtime_now
+
+        await self.evaluate(controller, start)
+        self.assertEqual(controller.decision.state, "shadow_qualifying")
+        self.assertIsNone(
+            controller.attributes[
+                "qualified_proposed_limit_equivalent_w"
+            ]
+        )
+        await self.evaluate(controller, start + timedelta(seconds=30))
+        self.assertEqual(controller.decision.state, "shadow_qualifying")
+        await self.evaluate(controller, start + timedelta(seconds=60))
+
+        self.assertEqual(controller.decision.state, "shadow_qualified")
+        attributes = controller.attributes
+        self.assertTrue(attributes["shadow_relevance_ready"])
+        self.assertEqual(
+            attributes["qualified_proposed_limit_equivalent_w"],
+            4000.0,
+        )
+        self.assertIsNone(attributes["requested_limit_equivalent_w"])
+        self.assertIsNone(attributes["shadow_blocked_reason"])
+        self.assertFalse(attributes["write_allowed"])
+        self.assertIsNone(controller.state["ownership"])
+        self.devices.set_solar_limit.assert_not_awaited()
+
+        self.status["active_power_w"] = 4000.0
+        await self.evaluate(controller, start + timedelta(seconds=90))
+        attributes = controller.attributes
+        self.assertEqual(controller.decision.state, "shadow_blocked")
+        self.assertFalse(attributes["shadow_relevance_ready"])
+        self.assertEqual(
+            attributes["shadow_blocked_reason"],
+            "output_below_gate",
+        )
+        self.assertIsNone(
+            attributes["qualified_proposed_limit_equivalent_w"]
+        )
+        self.assertIsNone(attributes["requested_limit_equivalent_w"])
+        self.devices.set_solar_limit.assert_not_awaited()
+
+    async def test_positive_price_still_refreshes_shadow_relevance(self):
+        controller = self.controller()
+        self.coordinator.data = self.snapshot(
+            ["0.01", "0.01", "0.01", "0.01"]
+        )
+        start = self.runtime_now
+
+        for seconds in (0, 30, 60):
+            await self.evaluate(
+                controller,
+                start + timedelta(seconds=seconds),
+            )
+
+        self.assertEqual(controller.decision.state, "idle")
+        self.assertTrue(
+            controller.attributes["shadow_relevance_ready"]
+        )
+        self.assertEqual(
+            self.devices.get_solar_status.await_count,
+            3,
+        )
+        self.devices.set_solar_limit.assert_not_awaited()
+
+    async def test_revision_two_ownerless_armed_state_migrates_without_write(self):
+        controller = self.controller()
+        self.coordinator.data = self.snapshot(
+            ["0.01", "0.01", "0.01", "0.01"]
+        )
+        stored = {
+            "mode": self.const.SOLAR_CURTAILMENT_MODE_ARMED,
+            **controller.state,
+            "policy_revision": 2,
+            "ownership": None,
+        }
+        await controller.state_file.async_save(stored)
+
+        await controller.async_start()
+
+        self.assertEqual(
+            controller.mode,
+            self.const.SOLAR_CURTAILMENT_MODE_SHADOW,
+        )
+        self.assertEqual(
+            controller.available_modes,
+            (
+                self.const.SOLAR_CURTAILMENT_MODE_OFF,
+                self.const.SOLAR_CURTAILMENT_MODE_SHADOW,
+            ),
+        )
+        self.assertFalse(controller.attributes["write_allowed"])
+        self.devices.set_solar_limit.assert_not_awaited()
+        for unsubscribe in controller.unsubscribers:
+            unsubscribe()
+        controller.unsubscribers.clear()
+
+    async def test_revision_two_armed_migration_blocks_restricted_baseline(self):
+        controller = self.controller()
+        self.status["configured"] = 80.0
+        self.status["active"] = 80.0
+        self.coordinator.data = self.snapshot(
+            ["0.01", "0.01", "0.01", "0.01"]
+        )
+        stored = {
+            "mode": self.const.SOLAR_CURTAILMENT_MODE_ARMED,
+            **controller.state,
+            "policy_revision": 2,
+            "ownership": None,
+        }
+        await controller.state_file.async_save(stored)
+
+        await controller.async_start()
+
+        self.assertEqual(
+            controller.mode,
+            self.const.SOLAR_CURTAILMENT_MODE_SHADOW,
+        )
+        self.assertEqual(controller.decision.state, "migration_blocked")
+        self.assertIsNotNone(
+            controller.attributes["migration_blocked_reason"]
+        )
+        self.assertEqual(
+            controller.attributes["shadow_blocked_reason"],
+            None,
+        )
+        self.assertFalse(controller.attributes["write_allowed"])
+        self.devices.set_solar_limit.assert_not_awaited()
+        for unsubscribe in controller.unsubscribers:
+            unsubscribe()
+        controller.unsubscribers.clear()
 
     async def test_dwell_two_samples_and_one_mode_preserving_acquisition(self):
         controller = self.controller()
@@ -633,6 +848,7 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_acknowledged_state_failure_prevents_dispatch_even_if_store_swallows(self):
         controller = self.controller()
+        controller.production_control_enabled = True
         controller.store.async_save = AsyncMock(return_value=None)
         controller.state_file.async_save = AsyncMock(
             side_effect=OSError("Synthetic atomic state failure.")
@@ -711,6 +927,7 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_final_state_failure_preserves_verified_owned_state(self):
         controller = self.controller()
+        controller.production_control_enabled = True
         controller.state_file.async_save = AsyncMock(
             side_effect=[
                 None,
@@ -807,6 +1024,7 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_restore_state_failure_keeps_verified_original_classification(self):
         controller = self.controller()
+        controller.production_control_enabled = True
         self.coordinator.data = self.snapshot(
             ["0.01", "-0.02", "-0.02", "-0.02", "0.01"]
         )
@@ -848,6 +1066,7 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_final_recheck_override_suppresses_without_dispatch(self):
         controller = self.controller()
+        controller.production_control_enabled = True
         self.coordinator.data = self.snapshot(
             ["0.01", "-0.02", "-0.02", "-0.02", "0.01"]
         )
@@ -1064,7 +1283,7 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
-    async def test_restart_reconciliation_retains_target_and_clears_original(self):
+    async def test_revision_three_restart_restores_owned_cap_and_clears_original(self):
         controller = self.controller()
         self.coordinator.data = self.snapshot(
             ["0.01", "-0.02", "-0.02", "-0.02", "0.01"]
@@ -1116,14 +1335,19 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
         self.now = self.runtime_now
         restarted = self.controller()
         await restarted.async_start()
-        self.assertIsNotNone(restarted.state["ownership"])
-        self.assertEqual(restarted.decision.state, "owned")
+        self.assertIsNone(restarted.state["ownership"])
+        self.assertEqual(
+            restarted.mode,
+            self.const.SOLAR_CURTAILMENT_MODE_SHADOW,
+        )
+        self.assertEqual(restarted.decision.state, "restored")
+        self.assertEqual(self.status["configured"], 100.0)
+        self.assertEqual(self.status["active"], 100.0)
         for unsubscribe in restarted.unsubscribers:
             unsubscribe()
         restarted.unsubscribers.clear()
 
-        self.status["configured"] = 100.0
-        self.status["active"] = 100.0
+        self.devices.set_solar_limit.reset_mock()
         stored["mode"] = self.const.SOLAR_CURTAILMENT_MODE_SHADOW
         await controller.state_file.async_save(stored)
         self.now = self.runtime_now
@@ -1131,6 +1355,7 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
         await restored.async_start()
         self.assertIsNone(restored.state["ownership"])
         self.assertEqual(restored.mode, self.const.SOLAR_CURTAILMENT_MODE_SHADOW)
+        self.devices.set_solar_limit.assert_not_awaited()
         for unsubscribe in restored.unsubscribers:
             unsubscribe()
         restored.unsubscribers.clear()
