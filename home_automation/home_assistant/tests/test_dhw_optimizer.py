@@ -207,6 +207,27 @@ class DhwOptimizerTests(base.HAComponentTests):
         self.assertEqual(active.state, "readiness_final_topup")
         self.assertEqual(active.desired_target, 55)
 
+        active_after_delivery = self.module.plan_dhw(
+            now=deadline - timedelta(minutes=22),
+            mode=self.const.DHW_MODE_SAFE,
+            policy=self.policy,
+            observation=self.observation(
+                tank_temperature=50,
+                target_temperature=55,
+            ),
+            intervals=prices,
+            heating_minutes=120,
+            lease_expires=None,
+            readiness_delivered=True,
+            final_topup_used=False,
+            final_topup_active=True,
+        )
+        self.assertEqual(
+            active_after_delivery.state,
+            "readiness_final_topup",
+        )
+        self.assertEqual(active_after_delivery.desired_target, 55)
+
         rearmed = self.module.plan_dhw(
             now=deadline - timedelta(hours=1),
             mode=self.const.DHW_MODE_SAFE,
@@ -231,6 +252,60 @@ class DhwOptimizerTests(base.HAComponentTests):
                 self.policy,
             )
         )
+
+    def test_observed_morning_topup_stays_latched_until_deadline(self):
+        prices = self.intervals(
+            datetime.fromisoformat("2026-10-21T00:00:00+00:00"),
+            ["0.20"] * 40,
+        )
+        deadline = datetime.fromisoformat("2026-10-21T04:00:00+00:00")
+
+        start = self.module.plan_dhw(
+            now=datetime.fromisoformat("2026-10-21T03:15:00+00:00"),
+            mode=self.const.DHW_MODE_SAFE,
+            policy=self.policy,
+            observation=self.observation(tank_temperature=49),
+            intervals=prices,
+            heating_minutes=120,
+            lease_expires=None,
+            readiness_delivered=True,
+        )
+        self.assertEqual(start.state, "readiness_final_topup")
+        self.assertEqual(start.desired_target, 55)
+
+        first_delivery = self.module.plan_dhw(
+            now=datetime.fromisoformat("2026-10-21T03:38:00+00:00"),
+            mode=self.const.DHW_MODE_SAFE,
+            policy=self.policy,
+            observation=self.observation(
+                tank_temperature=50,
+                target_temperature=55,
+            ),
+            intervals=prices,
+            heating_minutes=120,
+            lease_expires=None,
+            readiness_delivered=True,
+            final_topup_active=True,
+        )
+        self.assertEqual(first_delivery.state, "readiness_final_topup")
+        self.assertEqual(first_delivery.desired_target, 55)
+
+        deadline_hold = self.module.plan_dhw(
+            now=deadline,
+            mode=self.const.DHW_MODE_SAFE,
+            policy=self.policy,
+            observation=self.observation(
+                tank_temperature=49,
+                target_temperature=55,
+            ),
+            intervals=prices,
+            heating_minutes=120,
+            lease_expires=None,
+            readiness_delivered=True,
+            final_topup_used=True,
+        )
+        self.assertEqual(deadline_hold.state, "usage_hold")
+        self.assertEqual(deadline_hold.desired_target, 50)
 
     def test_shadow_proposes_same_readiness_boost_without_writes(self):
         now = datetime.fromisoformat("2026-10-15T03:45:00+00:00")
@@ -813,7 +888,7 @@ class DhwOptimizerTests(base.HAComponentTests):
         self.assertIsNotNone(optimizer.state["readiness_pilot_started_at"])
         self.assertIsNone(optimizer.state["pilot_started_at"])
 
-    async def test_final_topup_completes_only_after_measured_delivery(self):
+    async def test_final_topup_completes_only_at_its_deadline(self):
         optimizer = self.module.DhwOptimizer(
             self.hass, self.pricing_entry, self.coordinator, self.devices
         )
@@ -873,11 +948,71 @@ class DhwOptimizerTests(base.HAComponentTests):
                 effective_target=55,
             ),
         )
+        self.assertIn(
+            key,
+            optimizer.state["readiness_final_topup_active"],
+        )
+        self.assertNotIn(key, optimizer.state["readiness_final_topups"])
+
+        optimizer._update_learning(
+            deadline,
+            self.observation(
+                tank_temperature=49,
+                target_temperature=55,
+                effective_target=55,
+            ),
+        )
         self.assertNotIn(
             key,
             optimizer.state["readiness_final_topup_active"],
         )
         self.assertIn(key, optimizer.state["readiness_final_topups"])
+
+    async def test_restart_reconstructs_active_final_topup_latch(self):
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        deadline = datetime.fromisoformat("2026-10-21T04:00:00+00:00")
+        key = deadline.isoformat()
+        optimizer.store.async_load = AsyncMock(
+            return_value={
+                "policy_revision": 7,
+                "mode": self.const.DHW_MODE_SAFE,
+                "readiness_final_topup_active": {
+                    key: "2026-10-21T03:15:00+00:00",
+                },
+            }
+        )
+        optimizer.store.async_save = AsyncMock()
+        optimizer.async_evaluate = AsyncMock()
+        await optimizer.async_start()
+        try:
+            self.assertIn(
+                key,
+                optimizer.state["readiness_final_topup_active"],
+            )
+            decision = self.module.plan_dhw(
+                now=datetime.fromisoformat("2026-10-21T03:38:00+00:00"),
+                mode=optimizer.mode,
+                policy=self.policy,
+                observation=self.observation(
+                    tank_temperature=50,
+                    target_temperature=55,
+                ),
+                intervals=self.intervals(
+                    datetime.fromisoformat("2026-10-21T00:00:00+00:00"),
+                    ["0.20"] * 40,
+                ),
+                heating_minutes=120,
+                lease_expires=None,
+                readiness_delivered=True,
+                final_topup_active=True,
+            )
+            self.assertEqual(decision.state, "readiness_final_topup")
+            self.assertEqual(decision.desired_target, 55)
+            self.devices.control_daikin.assert_not_awaited()
+        finally:
+            await optimizer.async_stop()
 
     async def test_write_failure_latches_fault_without_retry(self):
         optimizer = self.module.DhwOptimizer(
@@ -981,7 +1116,7 @@ class DhwOptimizerTests(base.HAComponentTests):
         self.assertIn("priority", optimizer.decision.reason)
         self.devices.control_daikin.assert_not_awaited()
 
-    def test_revision_six_resets_changed_policy_evidence(self):
+    def test_revision_seven_resets_changed_policy_evidence(self):
         optimizer = self.module.DhwOptimizer(
             self.hass, self.pricing_entry, self.coordinator, self.devices
         )
@@ -998,7 +1133,7 @@ class DhwOptimizerTests(base.HAComponentTests):
             }
         )
         optimizer._reset_policy_evidence()
-        self.assertEqual(optimizer.state["policy_revision"], 6)
+        self.assertEqual(optimizer.state["policy_revision"], 7)
         self.assertEqual(optimizer.state["shadow_days"], [])
         self.assertEqual(optimizer.state["heating_durations"], [])
         self.assertEqual(optimizer.state["deadline_checks"], {})
@@ -1027,15 +1162,32 @@ class DhwOptimizerTests(base.HAComponentTests):
         finally:
             await optimizer.async_stop()
 
-    async def test_revision_five_migrates_soft_mode_without_a_command(self):
+    async def test_revision_six_preserves_safe_mode_and_resets_evidence(self):
         optimizer = self.module.DhwOptimizer(
             self.hass, self.pricing_entry, self.coordinator, self.devices
         )
         optimizer.store.async_load = AsyncMock(
             return_value={
-                "policy_revision": 5,
-                "mode": self.const.DHW_MODE_SOFT,
+                "policy_revision": 6,
+                "mode": self.const.DHW_MODE_SAFE,
                 "lease_expires": "2026-10-20T23:00:00+00:00",
+                "confirmed_writes": 12,
+                "heating_durations": [20, 22],
+                "readiness_topup_durations": [18],
+                "readiness_pilot_started_at": (
+                    "2026-10-16T05:00:00+00:00"
+                ),
+                "readiness_pilot_confirmed_writes": 2,
+                "pilot_started_at": "2026-10-17T05:00:00+00:00",
+                "safe_pilot_confirmed_writes": 10,
+                "owner_full_control_approved_at": (
+                    "2026-10-18T05:00:00+00:00"
+                ),
+                "qualified_opportunity_count": 4,
+                "last_qualified_opportunity_plan_id": "synthetic-plan",
+                "last_qualified_opportunity_at": (
+                    "2026-10-20T03:00:00+00:00"
+                ),
                 "deadline_checks": {
                     "2026-10-20T21:00:00+03:00": (
                         self.module.READINESS_SUCCESS
@@ -1059,13 +1211,40 @@ class DhwOptimizerTests(base.HAComponentTests):
         await optimizer.async_start()
         try:
             self.assertEqual(optimizer.mode, self.const.DHW_MODE_SAFE)
-            self.assertEqual(optimizer.state["policy_revision"], 6)
+            self.assertEqual(optimizer.state["policy_revision"], 7)
             self.assertIsNone(optimizer.state["lease_expires"])
+            self.assertEqual(optimizer.state["confirmed_writes"], 12)
+            self.assertEqual(optimizer.state["heating_durations"], [20, 22])
             self.assertEqual(
-                optimizer.state["deadline_checks"][
-                    "2026-10-20T21:00:00+03:00"
-                ],
-                self.module.READINESS_CONSUMED,
+                optimizer.state["readiness_topup_durations"],
+                [18],
+            )
+            self.assertEqual(
+                optimizer.state["readiness_pilot_confirmed_writes"],
+                2,
+            )
+            self.assertEqual(
+                optimizer.state["safe_pilot_confirmed_writes"],
+                10,
+            )
+            self.assertEqual(
+                optimizer.state["owner_full_control_approved_at"],
+                "2026-10-18T05:00:00+00:00",
+            )
+            self.assertEqual(
+                optimizer.state["qualified_opportunity_count"],
+                4,
+            )
+            self.assertEqual(
+                optimizer.state["last_qualified_opportunity_plan_id"],
+                "synthetic-plan",
+            )
+            self.assertEqual(optimizer.state["deadline_checks"], {})
+            self.assertEqual(optimizer.state["readiness_window_peaks"], {})
+            self.assertEqual(optimizer.state["readiness_rapid_draws"], {})
+            self.assertEqual(
+                optimizer.state["readiness_final_topup_active"],
+                {},
             )
             self.devices.control_daikin.assert_not_awaited()
         finally:

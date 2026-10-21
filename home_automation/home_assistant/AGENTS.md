@@ -81,7 +81,10 @@
   50°C immediately when readiness is measured, and must never use 45°C coast.
   Hold 50°C for two hours after both readiness deadlines; after delivery,
   normally re-arm at 48°C and allow only one final top-up inside the last
-  45 minutes. Missing data and comfort/readiness recovery override optimization.
+  45 minutes. Once that final top-up starts, keep the 55°C request latched
+  through the readiness deadline even if the measured tank first reaches 50°C,
+  then restore the 50°C hold at or after the deadline. Missing data and
+  comfort/readiness recovery override optimization.
   Keep recovery latched through measured 50°C,
   persist successful 50°C completion for the anchored plan so later sensor
   rounding cannot restart post-window recovery, use minimum dwell for ordinary
