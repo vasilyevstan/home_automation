@@ -589,6 +589,10 @@ After both readiness deadlines, a two-hour demand hold keeps the target at
 50°C so a delivery-time draw cannot immediately roll the controller into a
 price-driven coast. Once readiness has been delivered, normal charging re-arms
 at 48°C; one final top-up is permitted below 50°C during the last 45 minutes.
+Once that final top-up starts, the 55°C request stays latched through the
+readiness deadline even if the measured tank first touches 50°C, then restores
+to the 50°C hold at or after the deadline. This prevents native target
+hysteresis from losing measured readiness immediately before delivery time.
 
 Comfort or missed-deadline recovery is latched until the measured tank reaches
 50°C. Reaching 50°C after an anchored cheap window starts is also persisted as
@@ -601,9 +605,13 @@ shallow readiness-top-up durations are learned separately. Each
 policy revision that changes scheduling values or qualification semantics clears
 prior evidence so changed Shadow behavior must earn a new observation period.
 Revision 6 retires automatic 30°C standby. A persisted revision-5
-`soft_standby` mode migrates command-free to `safe_target_shift`, clears its
-lease and preserves measured readiness evidence. Older incompatible
-write-capable revisions still pause for explicit review.
+`soft_standby` mode migrates command-free to `safe_target_shift`. Revision 7
+latches a started final readiness top-up through its deadline; known revision-5
+and revision-6 state preserves the selected safe mode but resets policy
+qualification evidence and any obsolete final-top-up markers while retaining
+physical write counts, learned heating durations, owner approval and recorded
+price opportunities. Older incompatible write-capable revisions still pause
+for explicit review.
 
 Deadline evidence distinguishes a measured success, measured readiness later
 consumed by a rapid draw, a rapid-draw-contaminated check that cannot prove

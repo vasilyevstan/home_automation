@@ -62,7 +62,7 @@ STORE_KEY_SUFFIX = "dhw_optimizer"
 NOTIFICATION_ID = DOMAIN + "_dhw_optimizer_fault"
 DECISION_HISTORY_LIMIT = 96
 HEATING_DURATION_LIMIT = 20
-POLICY_REVISION = 6
+POLICY_REVISION = 7
 MINIMUM_TARGET_DWELL = timedelta(minutes=30)
 POST_READINESS_HOLD = timedelta(
     minutes=DHW_POST_READINESS_HOLD_MINUTES
@@ -581,6 +581,14 @@ def plan_dhw(
             write=False,
         )
     remaining = deadline.astimezone(UTC) - now.astimezone(UTC)
+    if final_topup_active and remaining > timedelta(0):
+        return decision(
+            "readiness_final_topup",
+            "Keep the final 55°C readiness charge latched through the "
+            "deadline to avoid native target hysteresis.",
+            policy.preheat_target,
+            urgent=True,
+        )
     if remaining <= timedelta(minutes=heating_minutes):
         if observation.tank_temperature < policy.normal_target:
             if (
@@ -610,9 +618,17 @@ def plan_dhw(
                     and remaining <= FINAL_TOPUP_WINDOW
                     else "readiness_charge"
                 ),
-                "The readiness deadline is inside the conservative heating "
-                "allowance; request 55°C only until the measured tank reaches "
-                "50°C.",
+                (
+                    "The readiness deadline is inside the final 45-minute "
+                    "window; keep the 55°C charge latched through the deadline."
+                    if readiness_delivered
+                    and remaining <= FINAL_TOPUP_WINDOW
+                    else (
+                        "The readiness deadline is inside the conservative "
+                        "heating allowance; request 55°C until the measured "
+                        "tank reaches 50°C."
+                    )
+                ),
                 policy.preheat_target,
                 urgent=True,
             )
@@ -857,6 +873,40 @@ class DhwOptimizer:
             "last_qualified_opportunity_at": None,
         })
 
+    def _migrate_revision_seven(self) -> None:
+        preserved = {
+            "heating_durations": list(self.state["heating_durations"]),
+            "readiness_topup_durations": list(
+                self.state["readiness_topup_durations"]
+            ),
+            "confirmed_writes": self.state["confirmed_writes"],
+            "readiness_pilot_started_at": self.state[
+                "readiness_pilot_started_at"
+            ],
+            "readiness_pilot_confirmed_writes": self.state[
+                "readiness_pilot_confirmed_writes"
+            ],
+            "pilot_started_at": self.state["pilot_started_at"],
+            "safe_pilot_confirmed_writes": self.state[
+                "safe_pilot_confirmed_writes"
+            ],
+            "owner_full_control_approved_at": self.state[
+                "owner_full_control_approved_at"
+            ],
+            "qualified_opportunity_count": self.state[
+                "qualified_opportunity_count"
+            ],
+            "last_qualified_opportunity_plan_id": self.state[
+                "last_qualified_opportunity_plan_id"
+            ],
+            "last_qualified_opportunity_at": self.state[
+                "last_qualified_opportunity_at"
+            ],
+        }
+        self._reset_policy_evidence()
+        self.state.update(preserved)
+        self.state["lease_expires"] = None
+
     async def async_start(self) -> None:
         stored = await self.store.async_load()
         if isinstance(stored, dict):
@@ -869,26 +919,8 @@ class DhwOptimizer:
             for key in self.state:
                 if key in stored:
                     self.state[key] = stored[key]
-            if stored_revision == 5:
-                self.state["policy_revision"] = POLICY_REVISION
-                self.state["lease_expires"] = None
-                self._clear_price_plan()
-                checks = dict(self.state.get("deadline_checks", {}))
-                rapid_draws = self.state.get("readiness_rapid_draws", {})
-                peaks = self.state.get("readiness_window_peaks", {})
-                for key, outcome in tuple(checks.items()):
-                    peak = peaks.get(key)
-                    if (
-                        outcome == READINESS_SUCCESS
-                        and key in rapid_draws
-                        and isinstance(peak, dict)
-                        and _raw_number(peak.get("temperature"))
-                        is not None
-                        and _raw_number(peak.get("temperature"))
-                        >= self.policy.normal_target
-                    ):
-                        checks[key] = READINESS_CONSUMED
-                self.state["deadline_checks"] = checks
+            if stored_revision in (5, 6):
+                self._migrate_revision_seven()
             elif stored_revision != POLICY_REVISION:
                 write_capable_mode = self.mode in (
                     DHW_MODE_READINESS,
@@ -1305,9 +1337,9 @@ class DhwOptimizer:
         )
         for key in tuple(active_final_topups):
             deadline = _instant(key)
-            if deadline is None or now.astimezone(UTC) > deadline.astimezone(UTC):
+            if deadline is None:
                 active_final_topups.pop(key, None)
-            elif temperature >= self.policy.normal_target:
+            elif now.astimezone(UTC) >= deadline.astimezone(UTC):
                 active_final_topups.pop(key, None)
                 completed_final_topups[key] = now.isoformat()
         self.state["readiness_final_topup_active"] = dict(
