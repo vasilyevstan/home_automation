@@ -441,7 +441,8 @@ class FloorRoomTemperatureSensor(SensorEntity):
 class EnergyControlActivitySensor(SensorEntity):
     _EVENT_LIMIT = 16
     _COMMAND_EVENT_LIMIT = 8
-    _EPISODE_LIMIT = 12
+    _ACTION_EPISODE_LIMIT = 32
+    _STATUS_EPISODE_LIMIT = 12
     _COMMAND_KINDS = frozenset({"verified_command", "review_required"})
 
     _attr_has_entity_name = True
@@ -1134,9 +1135,46 @@ class EnergyControlActivitySensor(SensorEntity):
         )
         return transitions
 
+    @staticmethod
+    def _is_status_track(track: str) -> bool:
+        return (
+            track in {"hot_water_circuit", "floor_heating_circuit"}
+            or track.startswith("protection|")
+        )
+
+    @staticmethod
+    def _bounded_episodes(
+        episodes: list[dict],
+        limit: int,
+    ) -> tuple[list[dict], int]:
+        total = len(episodes)
+        if total <= limit:
+            return episodes, 0
+        boundary_episodes = [
+            episode
+            for episode in episodes
+            if episode.get("clipped_start") is True
+        ][-limit:]
+        boundary_ids = {id(episode) for episode in boundary_episodes}
+        remaining_slots = limit - len(boundary_episodes)
+        recent_episodes = (
+            [
+                episode
+                for episode in episodes
+                if id(episode) not in boundary_ids
+            ][-remaining_slots:]
+            if remaining_slots
+            else []
+        )
+        visible = sorted(
+            [*boundary_episodes, *recent_episodes],
+            key=lambda episode: episode["start"],
+        )
+        return visible, total - len(visible)
+
     def _episode_collections(
         self,
-    ) -> tuple[list[dict], int]:
+    ) -> tuple[list[dict], int, list[dict], int]:
         now = dt_util.utcnow().astimezone(timezone.utc)
         cutoff = now - timedelta(hours=24)
         grouped: dict[str, list[dict]] = {}
@@ -1147,7 +1185,8 @@ class EnergyControlActivitySensor(SensorEntity):
                 transition
             )
 
-        episodes = []
+        action_episodes = []
+        status_episodes = []
         for track, transitions in grouped.items():
             for index, transition in enumerate(transitions):
                 original_start = transition["_observed_at"]
@@ -1166,7 +1205,7 @@ class EnergyControlActivitySensor(SensorEntity):
                     0,
                     int((effective_end - clipped_start).total_seconds()),
                 )
-                episode = {
+                episode: dict = {
                     "subsystem": transition["subsystem"],
                     "start": clipped_start.isoformat(),
                     "end": (
@@ -1180,48 +1219,42 @@ class EnergyControlActivitySensor(SensorEntity):
                     ),
                     "before_value": transition["before_value"],
                     "after_value": transition["after_value"],
-                    "unit": transition["unit"],
                     "source": transition["source"],
-                    "result": transition["result"],
-                    "action_price_eur_kwh": transition[
-                        "action_price_eur_kwh"
-                    ],
-                    "reason": transition["reason"],
                     "operation": transition["operation"],
-                    "active": next_start is None,
                     "clipped_start": original_start < cutoff,
                 }
+                if transition["unit"] is not None:
+                    episode["unit"] = transition["unit"]
+                if transition["action_price_eur_kwh"] is not None:
+                    episode["action_price_eur_kwh"] = transition[
+                        "action_price_eur_kwh"
+                    ]
                 if original_start < cutoff:
                     episode["transition_at"] = (
                         original_start.isoformat()
                     )
-                episodes.append(episode)
+                if self._is_status_track(track):
+                    episode["active"] = next_start is None
+                    status_episodes.append(episode)
+                else:
+                    action_episodes.append(episode)
 
-        episodes.sort(key=lambda episode: episode["start"])
-        total = len(episodes)
-        if total <= self._EPISODE_LIMIT:
-            return episodes, 0
-        boundary_episodes = [
-            episode
-            for episode in episodes
-            if episode["clipped_start"]
-        ][-self._EPISODE_LIMIT :]
-        boundary_ids = {id(episode) for episode in boundary_episodes}
-        remaining_slots = self._EPISODE_LIMIT - len(boundary_episodes)
-        recent_episodes = (
-            [
-                episode
-                for episode in episodes
-                if id(episode) not in boundary_ids
-            ][-remaining_slots:]
-            if remaining_slots
-            else []
+        action_episodes.sort(key=lambda episode: episode["start"])
+        status_episodes.sort(key=lambda episode: episode["start"])
+        visible_actions, truncated_actions = self._bounded_episodes(
+            action_episodes,
+            self._ACTION_EPISODE_LIMIT,
         )
-        visible = sorted(
-            [*boundary_episodes, *recent_episodes],
-            key=lambda episode: episode["start"],
+        visible_statuses, truncated_statuses = self._bounded_episodes(
+            status_episodes,
+            self._STATUS_EPISODE_LIMIT,
         )
-        return visible, total - len(visible)
+        return (
+            visible_actions,
+            truncated_actions,
+            visible_statuses,
+            truncated_statuses,
+        )
 
     @staticmethod
     def _controller_authority(
@@ -1276,7 +1309,9 @@ class EnergyControlActivitySensor(SensorEntity):
             ),
         }
 
-    def _event_collections(self) -> tuple[list[dict], list[dict]]:
+    def _event_collections(
+        self,
+    ) -> tuple[list[dict], list[dict], dict[str, int]]:
         now = dt_util.utcnow().astimezone(timezone.utc)
         cutoff = now - timedelta(hours=24)
         events = []
@@ -1653,72 +1688,107 @@ class EnergyControlActivitySensor(SensorEntity):
             last_signature_by_system[event["system"]] = signature
             deduplicated.append(event)
 
-        command_events = [
+        all_command_events = [
             event
             for event in deduplicated
             if event.get("kind") in self._COMMAND_KINDS
-        ][-self._COMMAND_EVENT_LIMIT:]
-        if len(deduplicated) <= self._EVENT_LIMIT:
-            return deduplicated, command_events
-
-        priority_events = command_events[-self._EVENT_LIMIT:]
-        priority_ids = {id(event) for event in priority_events}
-        remaining_slots = self._EVENT_LIMIT - len(priority_events)
-        context_events = (
-            [
-                event
-                for event in deduplicated
-                if id(event) not in priority_ids
-            ][-remaining_slots:]
-            if remaining_slots
-            else []
-        )
-        visible_events = sorted(
-            [*priority_events, *context_events],
-            key=lambda event: event["observed_at"],
-        )
-        return visible_events, command_events
+        ]
+        command_events = all_command_events[-self._COMMAND_EVENT_LIMIT:]
+        all_context_events = [
+            event
+            for event in deduplicated
+            if event.get("kind") not in self._COMMAND_KINDS
+        ]
+        counts = {
+            "event_count": len(all_context_events),
+            "command_event_count": len(all_command_events),
+            "verified_command_count": sum(
+                event.get("kind") == "verified_command"
+                for event in all_command_events
+            ),
+            "simulation_count": sum(
+                event.get("kind") == "simulation"
+                for event in all_context_events
+            ),
+            "no_command_count": sum(
+                event.get("kind") == "no_command"
+                for event in all_context_events
+            ),
+            "review_required_count": sum(
+                event.get("kind") == "review_required"
+                for event in all_command_events
+            ),
+        }
+        visible_events = all_context_events[-self._EVENT_LIMIT:]
+        return visible_events, command_events, counts
 
     def _events(self) -> list[dict]:
-        events, _ = self._event_collections()
-        return events
+        events, command_events, _ = self._event_collections()
+        return sorted(
+            [*events, *command_events],
+            key=lambda event: event["observed_at"],
+        )
 
     @property
     def native_value(self) -> str:
-        events, _ = self._event_collections()
+        events = self._events()
         return events[-1]["kind"] if events else "no_recent_activity"
 
     @property
     def extra_state_attributes(self) -> dict:
-        events, command_events = self._event_collections()
-        episodes, truncated_episodes = self._episode_collections()
+        events, command_events, event_counts = self._event_collections()
+        (
+            action_episodes,
+            truncated_actions,
+            status_episodes,
+            truncated_statuses,
+        ) = self._episode_collections()
         return {
             "window_hours": 24,
             "event_limit": self._EVENT_LIMIT,
             "command_event_limit": self._COMMAND_EVENT_LIMIT,
-            "episode_limit": self._EPISODE_LIMIT,
+            "action_episode_limit": self._ACTION_EPISODE_LIMIT,
+            "status_episode_limit": self._STATUS_EPISODE_LIMIT,
             "events": events,
             "command_events": command_events,
-            "episodes": episodes,
-            "episode_count": len(episodes),
-            "episode_truncated_count": truncated_episodes,
+            "event_count": event_counts["event_count"],
+            "event_retained_count": len(events),
+            "event_truncated_count": (
+                event_counts["event_count"] - len(events)
+            ),
+            "command_event_count": event_counts[
+                "command_event_count"
+            ],
+            "command_event_retained_count": len(command_events),
+            "command_event_truncated_count": (
+                event_counts["command_event_count"]
+                - len(command_events)
+            ),
+            "action_episodes": action_episodes,
+            "action_episode_count": (
+                len(action_episodes) + truncated_actions
+            ),
+            "action_episode_retained_count": len(action_episodes),
+            "action_episode_truncated_count": truncated_actions,
+            "status_episodes": status_episodes,
+            "status_episode_count": (
+                len(status_episodes) + truncated_statuses
+            ),
+            "status_episode_retained_count": len(status_episodes),
+            "status_episode_truncated_count": truncated_statuses,
             "audit_error": self._audit_error,
             "authority": self._authorities(),
-            "verified_command_count": sum(
-                event["kind"] == "verified_command" for event in command_events
-            ),
-            "simulation_count": sum(
-                event["kind"] == "simulation" for event in events
-            ),
-            "no_command_count": sum(
-                event["kind"] == "no_command" for event in events
-            ),
-            "review_required_count": sum(
-                event["kind"] == "review_required" for event in command_events
-            ),
-            "uncertain_command_count": sum(
-                event["kind"] == "review_required" for event in command_events
-            ),
+            "verified_command_count": event_counts[
+                "verified_command_count"
+            ],
+            "simulation_count": event_counts["simulation_count"],
+            "no_command_count": event_counts["no_command_count"],
+            "review_required_count": event_counts[
+                "review_required_count"
+            ],
+            "uncertain_command_count": event_counts[
+                "review_required_count"
+            ],
         }
 
 
@@ -1906,6 +1976,9 @@ class SolarRelevanceSensor(SensorEntity):
         return {
             "ready": False,
             "shadow_ready": self.native_value == "shadow_ready",
+            "last_shadow_relevance_ready_at": attributes.get(
+                "last_shadow_relevance_ready_at"
+            ),
             "daylight_state": attributes.get("sun_state"),
             "active_power_w": active_power,
             "active_power_fresh": attributes.get("active_power_fresh"),

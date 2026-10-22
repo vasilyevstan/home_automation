@@ -388,6 +388,10 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
         attributes = controller.attributes
         self.assertTrue(attributes["shadow_relevance_ready"])
         self.assertEqual(
+            attributes["last_shadow_relevance_ready_at"],
+            (start + timedelta(seconds=60)).isoformat(),
+        )
+        self.assertEqual(
             attributes["qualified_proposed_limit_equivalent_w"],
             4000.0,
         )
@@ -402,6 +406,10 @@ class SolarCurtailmentTests(unittest.IsolatedAsyncioTestCase):
         attributes = controller.attributes
         self.assertEqual(controller.decision.state, "shadow_blocked")
         self.assertFalse(attributes["shadow_relevance_ready"])
+        self.assertEqual(
+            attributes["last_shadow_relevance_ready_at"],
+            (start + timedelta(seconds=60)).isoformat(),
+        )
         self.assertEqual(
             attributes["shadow_blocked_reason"],
             "output_below_gate",

@@ -535,19 +535,26 @@ equivalent watts. The request is unavailable during ordinary Shadow operation;
 the raw target capability is not a proposal. The relevance sensor reports
 `shadow_ready` only when daylight, fresh output, the 5 kW gate, unrestricted
 native limits, two samples and the full dwell all qualify. Percentage mode is
-converted with the bound inverter Pmax; watt mode is preserved.
+converted with the bound inverter Pmax; watt mode is preserved. Its
+`last_shadow_relevance_ready_at` attribute retains the most recent completed
+production-relevance dwell after output falls or daylight ends, without
+claiming that export occurred.
 
 The Energy control activity sensor reconstructs verified rolling-24-hour
-episodes from actual transitions. Each interval ends at the next observed
-transition on the same track and retains exact duration, before/after value,
-unit, price, reason, operation and authority source. Optimizer, native schedule,
-manual/external and protection sources remain distinct. Simulations,
-counterfactual Shadow proposals, no-command outcomes and review-required
-records remain point events rather than fake instantaneous commands. Boundary
-episodes are clipped to the rolling cutoff while retaining the original
-transition timestamp. Recorder payloads are bounded to 16 visible events,
-8 command/review events and 12 episodes; journal read or parse failures are
-reported explicitly.
+evidence from actual transitions. Compact `action_episodes` retain target,
+offset and inverter-limit actions with exact duration, before/after value, unit,
+price, operation and authority source. Persistent circuit and protected-load
+state is kept separately in `status_episodes`, so an all-day enabled interval
+cannot consume or visually hide a short control action. Optimizer, native
+schedule, manual/external and protection sources remain distinct.
+Simulations, counterfactual Shadow proposals and no-command outcomes remain
+bounded contextual point events; verified/review-required command context is
+kept in the separate bounded `command_events` list. Boundary episodes are
+clipped to the rolling cutoff while retaining the original transition
+timestamp. The sensor exposes total, retained and truncated counts for every
+collection. Recorder payloads are bounded to 16 contextual events, 8 rich
+command/review events, 32 compact action episodes and 12 status episodes;
+journal read or parse failures are reported explicitly.
 
 ## Domestic-hot-water price optimizer
 
@@ -607,23 +614,30 @@ allowance. The latch described above prevents native target hysteresis from
 losing measured readiness immediately before delivery time.
 
 Comfort or missed-deadline recovery is latched until the measured tank reaches
+50°C. Revision 9 applies the same measured-recovery latch whenever price
+control restores 50°C from a 45°C coast. A selected lower-cost window with less
+than the existing 30-minute minimum dwell remaining is skipped rather than
+starting an incomplete 45→50→45°C pulse. Once a useful recovery starts, a
+later moving-window recalculation cannot return to 45°C before the tank reaches
 50°C. Reaching 50°C after an anchored cheap window starts is also persisted as
 completion for that readiness plan, including completion during post-window
 recovery. A later 49°C reading therefore does not incorrectly re-enter recovery
 for a plan that already succeeded; comfort and readiness guards still apply.
 Ordinary 45/50°C cost-driven transitions use a 30-minute minimum dwell, while
 comfort, readiness and incomplete-data exits bypass it. Deep-recovery and
-shallow readiness-top-up durations are learned separately. Each
-policy revision that changes scheduling values or qualification semantics clears
-prior qualification so changed Shadow behavior must earn a new observation
-period.
+shallow readiness-top-up durations are learned separately. Each policy revision
+that changes scheduling values or qualification semantics clears prior
+qualification so changed Shadow behavior must earn a new observation period.
 Revision 6 retires automatic 30°C standby. A persisted revision-5
 `soft_standby` mode migrates command-free to `safe_target_shift`. Revision 7
 latches a started final readiness top-up through its deadline; known revision-5
-through revision-7 state migrates to revision 8 while preserving the selected
+through revision-7 state migrates through the revision-8 evidence reset to
+revision 9 while preserving the selected
 safe mode, physical write counts, learned deep/shallow durations, owner approval
 and recorded opportunities. Changed scheduling and retention qualification are
-reset, and obsolete final-top-up markers are cleared. Older incompatible
+reset, and obsolete final-top-up markers are cleared. Persisted revision-8
+state migrates command-free to revision 9 while preserving readiness,
+retention, ownership and in-progress recovery evidence. Older incompatible
 write-capable revisions still pause for explicit review.
 
 Deadline evidence distinguishes a measured success, measured readiness later

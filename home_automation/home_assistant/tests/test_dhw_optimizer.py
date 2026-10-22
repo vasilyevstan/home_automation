@@ -456,6 +456,115 @@ class DhwOptimizerTests(base.HAComponentTests):
         self.assertEqual(excessive.desired_target, 50)
         self.assertIsNone(excessive.adaptive_preheat_target_c)
 
+    def test_unqualified_recovery_rejects_short_window_and_latches_useful_restore(self):
+        coast_start = datetime.fromisoformat("2026-10-22T13:45:00+00:00")
+        policy = self.module.DhwPolicy.from_options(
+            {"dhw_initial_heat_minutes": 60}
+        )
+        prices = self.intervals(coast_start, ["0.30"] * 24)
+        selected = self.module.PriceWindowChoice(
+            start=coast_start + timedelta(minutes=30),
+            end=coast_start + timedelta(minutes=90),
+            average=Decimal("0.10"),
+            interval_count=4,
+        )
+
+        coast = self.module.plan_dhw(
+            now=coast_start,
+            mode=self.const.DHW_MODE_SAFE,
+            policy=policy,
+            observation=self.observation(tank_temperature=49),
+            intervals=prices,
+            heating_minutes=60,
+            lease_expires=None,
+            planned_window=selected,
+        )
+        self.assertEqual(coast.state, "coast")
+        self.assertEqual(coast.desired_target, 45)
+
+        short_window = self.module.PriceWindowChoice(
+            start=coast_start + timedelta(minutes=30),
+            end=coast_start + timedelta(minutes=45),
+            average=Decimal("0.10"),
+            interval_count=1,
+        )
+        skipped = self.module.plan_dhw(
+            now=coast_start + timedelta(minutes=30),
+            mode=self.const.DHW_MODE_SAFE,
+            policy=policy,
+            observation=self.observation(
+                tank_temperature=48,
+                target_temperature=45,
+            ),
+            intervals=prices,
+            heating_minutes=60,
+            lease_expires=None,
+            planned_window=short_window,
+        )
+        self.assertEqual(skipped.state, "coast")
+        self.assertEqual(skipped.desired_target, 45)
+        self.assertIn("Less than 30 minutes", skipped.reason)
+
+        restore = self.module.plan_dhw(
+            now=coast_start + timedelta(minutes=30),
+            mode=self.const.DHW_MODE_SAFE,
+            policy=policy,
+            observation=self.observation(
+                tank_temperature=48,
+                target_temperature=45,
+            ),
+            intervals=prices,
+            heating_minutes=60,
+            lease_expires=None,
+            planned_window=selected,
+        )
+        self.assertEqual(restore.state, "recovery")
+        self.assertEqual(restore.desired_target, 50)
+        self.assertFalse(restore.urgent)
+
+        moving_window = self.module.PriceWindowChoice(
+            start=coast_start + timedelta(minutes=90),
+            end=coast_start + timedelta(minutes=150),
+            average=Decimal("0.10"),
+            interval_count=4,
+        )
+        held = self.module.plan_dhw(
+            now=coast_start + timedelta(minutes=60),
+            mode=self.const.DHW_MODE_SAFE,
+            policy=policy,
+            observation=self.observation(
+                tank_temperature=49,
+                target_temperature=50,
+            ),
+            intervals=prices,
+            heating_minutes=60,
+            lease_expires=None,
+            planned_window=moving_window,
+            recovery_latched=True,
+            recovery_reason=restore.reason,
+        )
+        self.assertEqual(held.state, "recovery")
+        self.assertEqual(held.desired_target, 50)
+        self.assertNotEqual(held.desired_target, 45)
+
+        recovered = self.module.plan_dhw(
+            now=coast_start + timedelta(minutes=90),
+            mode=self.const.DHW_MODE_SAFE,
+            policy=policy,
+            observation=self.observation(
+                tank_temperature=50,
+                target_temperature=50,
+            ),
+            intervals=prices,
+            heating_minutes=60,
+            lease_expires=None,
+            planned_window=moving_window,
+            recovery_latched=True,
+            recovery_reason=restore.reason,
+        )
+        self.assertNotEqual(recovered.state, "recovery")
+        self.assertEqual(recovered.desired_target, 50)
+
     def test_shadow_proposes_same_readiness_boost_without_writes(self):
         now = datetime.fromisoformat("2026-10-15T03:45:00+00:00")
         decision = self.module.plan_dhw(
@@ -1300,7 +1409,7 @@ class DhwOptimizerTests(base.HAComponentTests):
         self.assertIn("priority", optimizer.decision.reason)
         self.devices.control_daikin.assert_not_awaited()
 
-    def test_revision_eight_resets_changed_policy_evidence(self):
+    def test_revision_nine_resets_changed_policy_evidence(self):
         optimizer = self.module.DhwOptimizer(
             self.hass, self.pricing_entry, self.coordinator, self.devices
         )
@@ -1317,7 +1426,7 @@ class DhwOptimizerTests(base.HAComponentTests):
             }
         )
         optimizer._reset_policy_evidence()
-        self.assertEqual(optimizer.state["policy_revision"], 8)
+        self.assertEqual(optimizer.state["policy_revision"], 9)
         self.assertEqual(optimizer.state["shadow_days"], [])
         self.assertEqual(optimizer.state["heating_durations"], [])
         self.assertEqual(optimizer.state["deadline_checks"], {})
@@ -1346,7 +1455,49 @@ class DhwOptimizerTests(base.HAComponentTests):
         finally:
             await optimizer.async_stop()
 
-    async def test_revision_six_migrates_to_eight_and_preserves_physical_evidence(self):
+    async def test_revision_eight_migrates_to_nine_without_losing_evidence(self):
+        optimizer = self.module.DhwOptimizer(
+            self.hass, self.pricing_entry, self.coordinator, self.devices
+        )
+        optimizer.store.async_load = AsyncMock(
+            return_value={
+                "policy_revision": 8,
+                "mode": self.const.DHW_MODE_SAFE,
+                "confirmed_writes": 14,
+                "heating_durations": [45, 60],
+                "retention_samples": [
+                    {
+                        "loss_rate_c_per_hour": 1.25,
+                        "readiness_deadline": "2026-10-22T07:00:00+03:00",
+                    }
+                ],
+                "recovery_latched": True,
+                "recovery_reason": "Measured recovery is incomplete.",
+                "planned_window_start": "2026-10-22T14:15:00+00:00",
+            }
+        )
+        optimizer.store.async_save = AsyncMock()
+        optimizer.async_evaluate = AsyncMock()
+        await optimizer.async_start()
+        try:
+            self.assertEqual(optimizer.mode, self.const.DHW_MODE_SAFE)
+            self.assertEqual(optimizer.state["policy_revision"], 9)
+            self.assertEqual(optimizer.state["confirmed_writes"], 14)
+            self.assertEqual(
+                optimizer.state["heating_durations"],
+                [45, 60],
+            )
+            self.assertEqual(len(optimizer.state["retention_samples"]), 1)
+            self.assertTrue(optimizer.state["recovery_latched"])
+            self.assertEqual(
+                optimizer.state["planned_window_start"],
+                "2026-10-22T14:15:00+00:00",
+            )
+            self.devices.control_daikin.assert_not_awaited()
+        finally:
+            await optimizer.async_stop()
+
+    async def test_revision_six_migrates_to_nine_and_preserves_physical_evidence(self):
         optimizer = self.module.DhwOptimizer(
             self.hass, self.pricing_entry, self.coordinator, self.devices
         )
@@ -1395,7 +1546,7 @@ class DhwOptimizerTests(base.HAComponentTests):
         await optimizer.async_start()
         try:
             self.assertEqual(optimizer.mode, self.const.DHW_MODE_SAFE)
-            self.assertEqual(optimizer.state["policy_revision"], 8)
+            self.assertEqual(optimizer.state["policy_revision"], 9)
             self.assertIsNone(optimizer.state["lease_expires"])
             self.assertEqual(optimizer.state["confirmed_writes"], 12)
             self.assertEqual(optimizer.state["heating_durations"], [20, 22])

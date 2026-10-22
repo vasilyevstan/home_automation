@@ -585,15 +585,20 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [event["kind"] for event in attributes["events"]],
             [
-                "verified_command",
                 "no_command",
                 "simulation",
-                "verified_command",
                 "no_command",
+            ],
+        )
+        self.assertEqual(
+            [event["kind"] for event in attributes["command_events"]],
+            [
+                "verified_command",
+                "verified_command",
                 "review_required",
             ],
         )
-        resume_event = attributes["events"][-2]
+        resume_event = attributes["events"][-1]
         self.assertEqual(
             resume_event["change"],
             "Fresh-state reconciliation",
@@ -604,12 +609,23 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(sensor.native_value, "review_required")
         self.assertEqual(
-            attributes["events"][0]["decision_price_eur_kwh"],
+            attributes["command_events"][0][
+                "decision_price_eur_kwh"
+            ],
             0.25,
         )
-        self.assertEqual(attributes["events"][0]["before_value"], 50)
-        self.assertEqual(attributes["events"][0]["after_value"], 55)
-        self.assertEqual(attributes["events"][0]["unit"], "°C")
+        self.assertEqual(
+            attributes["command_events"][0]["before_value"],
+            50,
+        )
+        self.assertEqual(
+            attributes["command_events"][0]["after_value"],
+            55,
+        )
+        self.assertEqual(
+            attributes["command_events"][0]["unit"],
+            "°C",
+        )
 
     async def test_energy_control_activity_preserves_audited_commands(self):
         now = self.now
@@ -675,7 +691,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                     for event in attrs["command_events"]
                 )
             )
-            self.assertTrue(
+            self.assertFalse(
                 any(
                     event.get("request_id") == "floor-command-inside-window"
                     for event in attrs["events"]
@@ -820,7 +836,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         attrs = activity.extra_state_attributes
         hot_water_charges = [
             episode
-            for episode in attrs["episodes"]
+            for episode in attrs["action_episodes"]
             if episode["subsystem"] == "hot_water"
             and episode["after_value"] == 55
         ]
@@ -830,7 +846,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         )
         floor_episodes = [
             episode
-            for episode in attrs["episodes"]
+            for episode in attrs["action_episodes"]
             if episode["subsystem"] == "floor_heating"
             and episode["unit"] == "°C"
         ]
@@ -845,14 +861,27 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             {
                 episode["source"]
-                for episode in attrs["episodes"]
+                for episode in attrs["action_episodes"]
             },
             {
                 "optimizer",
                 "native_schedule",
                 "manual_external",
-                "protection",
             },
+        )
+        self.assertEqual(
+            {
+                episode["source"]
+                for episode in attrs["status_episodes"]
+            },
+            {"protection"},
+        )
+        self.assertTrue(
+            any(
+                episode["operation"]
+                == "daikin_hot_water:standby"
+                for episode in attrs["status_episodes"]
+            )
         )
         self.assertTrue(
             any(
@@ -865,7 +894,174 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
             any(
                 episode["operation"] == "preheat"
                 and episode["after_value"] == 4
-                for episode in attrs["episodes"]
+                for episode in attrs["action_episodes"]
+            )
+        )
+
+    def test_energy_control_activity_retains_representative_full_day_actions(self):
+        now = self.now.astimezone(timezone.utc)
+        optimizer = SimpleNamespace(
+            mode="safe",
+            state={
+                "decision_history": [
+                    {
+                        "observed_at": (
+                            now - timedelta(hours=16)
+                        ).isoformat(),
+                        "actual_target_c": 50,
+                        "proposed_target_c": 55,
+                        "state": "readiness_charge",
+                        "reason": "Morning readiness charge.",
+                        "current_price_eur_kwh": "0.10",
+                        "write_sent": True,
+                    },
+                    {
+                        "observed_at": (
+                            now - timedelta(hours=15, minutes=15)
+                        ).isoformat(),
+                        "actual_target_c": 55,
+                        "proposed_target_c": 50,
+                        "state": "readiness",
+                        "reason": "Morning readiness restore.",
+                        "current_price_eur_kwh": "0.12",
+                        "write_sent": True,
+                    },
+                    {
+                        "observed_at": (
+                            now - timedelta(hours=5, minutes=15)
+                        ).isoformat(),
+                        "actual_target_c": 50,
+                        "proposed_target_c": 45,
+                        "state": "coast",
+                        "reason": "Afternoon price coast.",
+                        "current_price_eur_kwh": "0.34",
+                        "write_sent": True,
+                    },
+                    {
+                        "observed_at": (
+                            now - timedelta(hours=3, minutes=45)
+                        ).isoformat(),
+                        "actual_target_c": 45,
+                        "proposed_target_c": 50,
+                        "state": "recovery",
+                        "reason": "Measured recovery.",
+                        "current_price_eur_kwh": "0.24",
+                        "write_sent": True,
+                    },
+                    {
+                        "observed_at": (
+                            now - timedelta(hours=2)
+                        ).isoformat(),
+                        "actual_target_c": 50,
+                        "proposed_target_c": 55,
+                        "state": "readiness_final_topup",
+                        "reason": "Evening readiness charge.",
+                        "current_price_eur_kwh": "0.18",
+                        "write_sent": True,
+                    },
+                    {
+                        "observed_at": (
+                            now - timedelta(hours=1, minutes=15)
+                        ).isoformat(),
+                        "actual_target_c": 55,
+                        "proposed_target_c": 50,
+                        "state": "readiness",
+                        "reason": "Evening readiness restore.",
+                        "current_price_eur_kwh": "0.20",
+                        "write_sent": True,
+                    },
+                ],
+            },
+        )
+        floor = SimpleNamespace(
+            mode="active",
+            state={
+                "decision_history": [
+                    {
+                        "observed_at": (
+                            now - timedelta(hours=6)
+                        ).isoformat(),
+                        "actual_offset_c": -2,
+                        "proposed_offset_c": -6,
+                        "state": "coast",
+                        "reason": "Floor peak shift.",
+                        "current_price_eur_kwh": "0.28",
+                        "write_sent": True,
+                    },
+                    {
+                        "observed_at": (
+                            now - timedelta(hours=4)
+                        ).isoformat(),
+                        "actual_offset_c": -6,
+                        "proposed_offset_c": -2,
+                        "state": "normal",
+                        "reason": "Floor baseline restore.",
+                        "current_price_eur_kwh": "0.16",
+                        "write_sent": True,
+                    },
+                ],
+                "native_schedule_transitions": [],
+            },
+        )
+        activity = self.sensor_module.EnergyControlActivitySensor(
+            optimizer,
+            floor,
+            None,
+            None,
+            "pricing",
+        )
+        activity._audit_events = [
+            {
+                "observed_at": (
+                    now - timedelta(hours=30)
+                ).isoformat(),
+                "operation": "hot_water_enabled",
+                "before_value": "off",
+                "after_value": "on",
+                "unit": None,
+                "reason": "Persistent DHW circuit state.",
+            },
+            {
+                "observed_at": (
+                    now - timedelta(hours=30)
+                ).isoformat(),
+                "operation": "heating_enabled",
+                "before_value": "off",
+                "after_value": "on",
+                "unit": None,
+                "reason": "Persistent floor circuit state.",
+            },
+        ]
+
+        attrs = activity.extra_state_attributes
+        self.assertEqual(attrs["action_episode_count"], 8)
+        self.assertEqual(attrs["action_episode_retained_count"], 8)
+        self.assertEqual(attrs["action_episode_truncated_count"], 0)
+        self.assertEqual(
+            [episode["subsystem"] for episode in attrs["action_episodes"]],
+            [
+                "hot_water",
+                "hot_water",
+                "floor_heating",
+                "hot_water",
+                "floor_heating",
+                "hot_water",
+                "hot_water",
+                "hot_water",
+            ],
+        )
+        self.assertEqual(attrs["status_episode_count"], 2)
+        self.assertTrue(
+            all(
+                episode["clipped_start"]
+                for episode in attrs["status_episodes"]
+            )
+        )
+        self.assertFalse(
+            any(
+                episode["operation"]
+                in {"hot_water_enabled", "heating_enabled"}
+                for episode in attrs["action_episodes"]
             )
         )
 
@@ -903,7 +1099,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                 "write_sent": True,
             },
         ]
-        for index in range(30):
+        for index in range(40):
             observed_at = (
                 now
                 - timedelta(hours=19, minutes=30)
@@ -938,19 +1134,41 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
             None,
             "pricing",
         )
+        activity._audit_events = [
+            {
+                "observed_at": (
+                    now - timedelta(hours=30)
+                ).isoformat(),
+                "operation": "hot_water_enabled",
+                "before_value": "off",
+                "after_value": "on",
+                "unit": None,
+                "reason": "Persistent circuit evidence.",
+            }
+        ]
 
         attrs = activity.extra_state_attributes
         cutoff = now - timedelta(hours=24)
         self.assertLessEqual(
-            len(attrs["episodes"]),
-            attrs["episode_limit"],
+            len(attrs["action_episodes"]),
+            attrs["action_episode_limit"],
         )
-        self.assertTrue(attrs["episodes"][0]["clipped_start"])
+        self.assertTrue(attrs["action_episodes"][0]["clipped_start"])
         self.assertEqual(
-            attrs["episodes"][0]["start"],
+            attrs["action_episodes"][0]["start"],
             cutoff.isoformat(),
         )
-        self.assertGreater(attrs["episode_truncated_count"], 0)
+        self.assertGreater(attrs["action_episode_truncated_count"], 0)
+        self.assertEqual(attrs["status_episode_count"], 1)
+        self.assertEqual(attrs["status_episode_truncated_count"], 0)
+        self.assertGreaterEqual(
+            attrs["event_count"],
+            attrs["event_retained_count"],
+        )
+        self.assertGreaterEqual(
+            attrs["command_event_count"],
+            attrs["command_event_retained_count"],
+        )
         self.assertLess(len(json.dumps(attrs)), 16000)
 
     def test_solar_power_limit_sensors_use_equivalent_watts(self):
@@ -1000,6 +1218,9 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                 "active_power_fresh": True,
                 "output_gate_w": 5000,
                 "shadow_relevance_ready": False,
+                "last_shadow_relevance_ready_at": (
+                    "2026-10-22T09:41:00+00:00"
+                ),
                 "write_allowed": False,
                 "grid_export_meter_available": False,
                 "grid_export_meter_blocker": "Synthetic missing meter.",
@@ -1012,6 +1233,12 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(sensor.native_value, "waiting_for_daylight")
         self.assertFalse(sensor.extra_state_attributes["ready"])
+        self.assertEqual(
+            sensor.extra_state_attributes[
+                "last_shadow_relevance_ready_at"
+            ],
+            "2026-10-22T09:41:00+00:00",
+        )
 
         controller.attributes["sun_state"] = "above_horizon"
         controller.attributes["active_power_w"] = 4200
