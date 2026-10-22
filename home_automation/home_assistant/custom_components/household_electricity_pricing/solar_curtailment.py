@@ -634,6 +634,7 @@ class SolarCurtailment:
             "attempted_blocks": [],
             "qualification": None,
             "production_relevance": None,
+            "last_shadow_relevance_ready_at": None,
             "eligible_since": None,
             "shadow_blocked_reason": None,
             "migration_blocked_reason": None,
@@ -1160,10 +1161,15 @@ class SolarCurtailment:
             if started is not None
             else 0
         )
+        was_ready = relevance.get("ready") is True
         relevance["ready"] = (
             int(relevance.get("sample_count", 0)) >= 2
             and elapsed >= SOLAR_CURTAILMENT_QUALIFICATION_SECONDS
         )
+        if relevance["ready"] and not was_ready:
+            self.state["last_shadow_relevance_ready_at"] = (
+                stamp.isoformat()
+            )
 
     def _sun_state(self) -> str | None:
         state = self.hass.states.get("sun.sun")
@@ -2783,6 +2789,9 @@ class SolarCurtailment:
             "shadow_relevance_dwell_seconds": relevance_dwell,
             "shadow_relevance_required_seconds": (
                 SOLAR_CURTAILMENT_QUALIFICATION_SECONDS
+            ),
+            "last_shadow_relevance_ready_at": self.state.get(
+                "last_shadow_relevance_ready_at"
             ),
             "acquisition_allowed": (
                 self.production_control_enabled

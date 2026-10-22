@@ -63,7 +63,7 @@ NOTIFICATION_ID = DOMAIN + "_dhw_optimizer_fault"
 DECISION_HISTORY_LIMIT = 96
 HEATING_DURATION_LIMIT = 20
 RETENTION_SAMPLE_LIMIT = 20
-POLICY_REVISION = 8
+POLICY_REVISION = 9
 MINIMUM_TARGET_DWELL = timedelta(minutes=30)
 POST_READINESS_HOLD = timedelta(
     minutes=DHW_POST_READINESS_HOLD_MINUTES
@@ -863,6 +863,26 @@ def plan_dhw(
     now_utc = now.astimezone(UTC)
     if selected.start <= now_utc < selected.end:
         if not retention_qualified:
+            if (
+                observation.target_temperature < policy.normal_target
+                and observation.tank_temperature < policy.normal_target
+            ):
+                remaining_window = selected.end - now_utc
+                if remaining_window < MINIMUM_TARGET_DWELL:
+                    return decision(
+                        "coast",
+                        "Less than 30 minutes remain in the selected lower-cost "
+                        "window; keep the existing 45°C coast instead of "
+                        "starting an incomplete recovery.",
+                        policy.floor_target,
+                    )
+                return decision(
+                    "recovery",
+                    "The selected lower-cost window has enough time for useful "
+                    "recovery; restore 50°C and keep recovery latched until the "
+                    "measured tank reaches the normal target.",
+                    policy.normal_target,
+                )
             return decision(
                 "normal",
                 "Discretionary heating above 50°C is suppressed until at "
@@ -903,6 +923,17 @@ def plan_dhw(
             urgent=True,
         )
     if not gate:
+        if (
+            observation.target_temperature < policy.normal_target
+            and observation.tank_temperature < policy.normal_target
+        ):
+            return decision(
+                "recovery",
+                "The price coast ended before the tank recovered; restore 50°C "
+                "and keep recovery latched until the measured tank reaches the "
+                "normal target.",
+                policy.normal_target,
+            )
         return decision(
             "normal",
             "The current price does not exceed the balanced absolute and relative gates.",
@@ -1120,6 +1151,9 @@ class DhwOptimizer:
         self.state.update(preserved)
         self.state["lease_expires"] = None
 
+    def _migrate_revision_nine(self) -> None:
+        self.state["policy_revision"] = POLICY_REVISION
+
     async def async_start(self) -> None:
         stored = await self.store.async_load()
         if isinstance(stored, dict):
@@ -1134,6 +1168,8 @@ class DhwOptimizer:
                     self.state[key] = stored[key]
             if stored_revision in (5, 6, 7):
                 self._migrate_revision_eight()
+            elif stored_revision == 8:
+                self._migrate_revision_nine()
             elif stored_revision != POLICY_REVISION:
                 write_capable_mode = self.mode in (
                     DHW_MODE_READINESS,
@@ -1977,13 +2013,6 @@ class DhwOptimizer:
                         decision.selected_window,
                         decision.adaptive_preheat_target_c,
                     )
-                if (
-                    decision.state == "recovery"
-                    and observation.tank_temperature is not None
-                    and observation.tank_temperature < self.policy.normal_target
-                ):
-                    self.state["recovery_latched"] = True
-                    self.state["recovery_reason"] = decision.reason
                 if self.state.get("fault"):
                     decision = replace(
                         decision,
@@ -2002,6 +2031,13 @@ class DhwOptimizer:
                     last_target=last_target,
                     last_transition=last_transition,
                 )
+                if (
+                    decision.state == "recovery"
+                    and observation.tank_temperature is not None
+                    and observation.tank_temperature < self.policy.normal_target
+                ):
+                    self.state["recovery_latched"] = True
+                    self.state["recovery_reason"] = decision.reason
                 if (
                     decision.desired_target is not None
                     and decision.desired_target != last_target

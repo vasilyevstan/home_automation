@@ -276,6 +276,10 @@
 - Reconstruct rolling-24-hour activity episodes only from verified actual-state
   transitions. Close an interval at the next transition on its track; keep
   optimizer, native-schedule, manual/external and protection sources distinct.
+  Keep compact target/offset/limit actions separate from persistent
+  circuit/protected-load status so long enabled intervals cannot consume or
+  obscure action evidence. Expose total, retained and truncated counts for
+  each bounded collection.
   Simulations, counterfactual proposals, no-command outcomes and review-required
   records remain point events. Clip boundary-spanning intervals while retaining
   their original transition timestamp, and keep Recorder payloads bounded.
