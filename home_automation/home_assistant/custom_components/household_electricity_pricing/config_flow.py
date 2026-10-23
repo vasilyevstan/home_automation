@@ -159,7 +159,7 @@ class HouseholdPriceOptionsFlow(OptionsFlow):
             ("Native minimum target", policy.soft_target),
             ("Comfort target", policy.floor_target),
             ("Normal target", policy.normal_target),
-            ("Preheat target", policy.preheat_target),
+            ("Economic storage target", policy.preheat_target),
         ):
             number(value, label, profile["minValue"], profile["maxValue"], profile["stepValue"])
         room_entities = user_input.get(CONF_FLOOR_INDOOR_TEMPERATURE_ENTITIES)

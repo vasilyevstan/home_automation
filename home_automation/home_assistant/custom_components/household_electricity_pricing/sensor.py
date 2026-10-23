@@ -1328,32 +1328,51 @@ class EnergyControlActivitySensor(SensorEntity):
                 if state == "unavailable":
                     continue
                 write_sent = bool(record.get("write_sent"))
-                live = (
-                    pilot_started is not None
-                    and observed_at >= pilot_started
-                )
+                record_mode = record.get("mode")
+                if record_mode == "shadow":
+                    live = False
+                    shadow = True
+                elif record_mode in (
+                    "readiness_pilot",
+                    "safe_target_shift",
+                ):
+                    live = True
+                    shadow = False
+                else:
+                    live = (
+                        pilot_started is not None
+                        and observed_at >= pilot_started
+                    )
+                    shadow = not live
                 if not write_sent:
                     if live and state not in (
-                        "readiness_pilot",
+                        "readiness_charge",
+                        "readiness_preferred",
+                        "readiness_usable",
+                        "economic_storage",
                         "recovery",
+                        "coast",
+                        "hold",
                         "fault",
-                        "manual_override",
+                        "override",
                     ):
                         continue
-                    if not live and state == "normal":
+                    if not live and state == "hold":
                         continue
                 kind = (
                     "verified_command"
                     if write_sent
-                    else "no_command" if live
-                    else "simulation"
+                    else "simulation" if shadow
+                    else "no_command"
                 )
                 events.append({
                     "observed_at": observed_at.isoformat(),
                     "system": "Hot water",
                     "kind": kind,
                     "authority": (
-                        "shadow" if kind == "simulation" else "live"
+                        "shadow"
+                        if kind == "simulation"
+                        else "live"
                     ),
                     "state": state,
                     "change": self._temperature_change(

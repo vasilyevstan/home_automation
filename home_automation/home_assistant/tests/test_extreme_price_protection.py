@@ -152,7 +152,7 @@ class ExtremePriceProtectionTests(base.HAComponentTests):
     def test_comfort_and_readiness_guards_override_extreme_price(self):
         decision = self.plan(
             values=["1.5"],
-            tank_temperature=45,
+            tank_temperature=44.9,
             room_temperature=20.5,
         )
         actions = {
@@ -177,6 +177,17 @@ class ExtremePriceProtectionTests(base.HAComponentTests):
         )
         self.assertEqual(action.operation, "keep_on")
         self.assertIn("readiness", action.reason)
+
+        usable_floor = self.plan(
+            values=["1.5"],
+            tank_temperature=45,
+        )
+        usable_action = next(
+            item
+            for item in usable_floor.actions
+            if item.load_id == self.module.LOAD_HOT_WATER
+        )
+        self.assertEqual(usable_action.operation, "standby")
 
     def test_unknown_circuit_state_is_unavailable_not_already_stopped(self):
         decision = self.plan(
@@ -856,14 +867,28 @@ class ExtremePriceProtectionTests(base.HAComponentTests):
         )
         protection = self.runtime(devices)
         protection.optimizer.decision = SimpleNamespace(state="recovery")
-        self.assertTrue(protection._readiness_active(self.now))
-        with patch.object(
-            protection,
-            "_readiness_lead_time_active",
-            return_value=False,
-        ) as readiness_lead_time:
-            await protection.async_exercise_daikin()
-        readiness_lead_time.assert_called_once()
+        self.assertTrue(protection._readiness_active(self.now, 48))
+        protection.optimizer.decision = SimpleNamespace(
+            state="readiness_preferred"
+        )
+        self.assertFalse(protection._readiness_active(self.now, 48))
+        protection.optimizer.decision = SimpleNamespace(
+            state="economic_storage"
+        )
+        self.assertFalse(protection._readiness_active(self.now, 48))
+        protection.optimizer.decision = SimpleNamespace(
+            state="readiness_charge"
+        )
+        self.assertTrue(protection._readiness_active(self.now, 48))
+        protection.state["ownership"][self.module.LOAD_HOT_WATER] = {
+            "block_id": "test",
+        }
+        protection.optimizer.decision = SimpleNamespace(state="override")
+        self.assertTrue(protection._readiness_active(self.now, 48))
+        protection.state["ownership"].clear()
+        self.assertFalse(protection._readiness_active(self.now, 48))
+        protection.optimizer.decision = SimpleNamespace(state="hold")
+        await protection.async_exercise_daikin()
         self.assertTrue(protection.state["daikin_exercises_verified"])
         self.assertEqual(
             [
@@ -884,6 +909,53 @@ class ExtremePriceProtectionTests(base.HAComponentTests):
         self.assertEqual(
             status["heating"]["operations"]["Power"],
             "on",
+        )
+
+    def test_owned_dhw_exits_for_anchored_preferred_block_hidden_by_override(self):
+        protection = self.runtime(
+            SimpleNamespace(
+                get_daikin_status=AsyncMock(),
+                get_climate_status=AsyncMock(),
+            )
+        )
+        protection.state["ownership"][self.module.LOAD_HOT_WATER] = {
+            "block_id": "test",
+        }
+        protection.optimizer.state = {}
+        protection.optimizer.state.update({
+            "planned_kind": "preferred_readiness",
+            "planned_target": 50,
+            "planned_window_start": (
+                self.now - timedelta(minutes=15)
+            ).isoformat(),
+            "planned_window_end": (
+                self.now + timedelta(minutes=15)
+            ).isoformat(),
+        })
+
+        protection.optimizer.decision = None
+        self.assertTrue(
+            protection._readiness_active(self.now, 48)
+        )
+        protection.optimizer.decision = SimpleNamespace(state="override")
+        self.assertTrue(
+            protection._readiness_active(self.now, 48)
+        )
+
+        protection.state["dhw_readiness_exit_active"] = False
+        protection.optimizer.state["planned_kind"] = "economic_storage"
+        self.assertFalse(
+            protection._readiness_active(self.now, 48)
+        )
+        protection.optimizer.state["recovery_latched"] = True
+        self.assertTrue(
+            protection._readiness_active(self.now, 48)
+        )
+        self.assertFalse(
+            protection._anchored_preferred_charge_active(
+                self.now,
+                50,
+            )
         )
 
     async def test_climate_commissioning_exercises_restore_and_returns_off(self):

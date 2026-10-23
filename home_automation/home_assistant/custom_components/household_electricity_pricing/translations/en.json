@@ -37,19 +37,19 @@
     "step": {
       "init": {
         "title": "Heating price optimizers",
-        "description": "Configure deterministic DHW readiness and retention policy, floor-optimizer room sources, and the explicit climate allowlist for extreme-price protection. Saving options does not enable writes. Write-capable heating modes still require their evidence gate or an explicit owner-approved activation, while Solar remains Shadow-only and every device guard and ownership check remains mandatory. {error}",
+        "description": "Configure deterministic 45/50°C DHW readiness with retention-qualified economic storage, adaptive floor-optimizer room guards, and the explicit climate allowlist for extreme-price protection. Saving options does not enable writes. Write-capable heating modes still require their evidence gate or an explicit owner-approved activation, while Solar remains Shadow-only and every device guard and ownership check remains mandatory. {error}",
         "data": {
           "dhw_morning_ready": "Morning readiness time (HH:MM, Europe/Tallinn)",
           "dhw_evening_ready": "Evening readiness time (HH:MM, Europe/Tallinn)",
           "dhw_soft_target": "Native minimum target (°C; guarded manual use)",
           "dhw_floor_target": "Comfort threshold and safe coast target (°C)",
           "dhw_normal_target": "Normal readiness target (°C)",
-          "dhw_preheat_target": "Cheap-period preheat target (°C)",
+          "dhw_preheat_target": "Economic storage target (°C; qualified cheap periods only)",
           "dhw_max_lease_hours": "Maximum target-shift lease (hours)",
           "dhw_price_delta_eur_kwh": "Minimum absolute price advantage (EUR/kWh)",
           "dhw_price_delta_percent": "Minimum relative price advantage (%)",
           "dhw_initial_heat_minutes": "Initial conservative heating allowance (minutes)",
-          "dhw_coast_horizon_hours": "Maximum preheat coast horizon (hours)",
+          "dhw_coast_horizon_hours": "Maximum economic-storage horizon (hours)",
           "floor_indoor_temperature_entities": "Occupied-room temperatures for the floor optimizer",
           "extreme_price_climate_entities": "Climate units covered by extreme-price protection"
         }
