@@ -36,6 +36,7 @@ from .const import (
     DOMAIN,
     EVENT_FLOOR_SHADOW_DECISION,
     FLOOR_COMFORT_FLOOR,
+    FLOOR_COAST_ROOM_SHIFT_LIMITS,
     FLOOR_HORIZON_HOURS,
     FLOOR_MAX_OUTDOOR_TEMPERATURE,
     FLOOR_MAX_SHIFT_HOURS,
@@ -50,8 +51,10 @@ from .const import (
     FLOOR_NEUTRAL_OFFSET,
     FLOOR_PREHEAT_CEILING,
     FLOOR_PREHEAT_OFFSET,
+    FLOOR_PREHEAT_ROOM_SHIFT_LIMITS,
     FLOOR_PRICE_DELTA,
     FLOOR_PRICE_PERCENT,
+    FLOOR_PRICE_SHIFT_TIERS,
     FLOOR_ROOM_TEMPERATURE_MAX_AGE_MINUTES,
     FLOOR_SHADOW_MODE,
     FLOOR_SHIFT_DELTA,
@@ -71,7 +74,7 @@ from .dhw_optimizer import (
 
 STORE_VERSION = 1
 STORE_KEY_SUFFIX = "floor_heating_shadow"
-POLICY_REVISION = 6
+POLICY_REVISION = 7
 DECISION_HISTORY_LIMIT = 96
 RECENT_DECISIONS_ATTRIBUTE_LIMIT = 4
 NOTIFICATION_ID = DOMAIN + "_floor_heating_fault"
@@ -179,24 +182,78 @@ class FloorHeatingPolicy:
     maximum_shift: timedelta = timedelta(hours=FLOOR_MAX_SHIFT_HOURS)
     price_delta: Decimal = Decimal(str(FLOOR_PRICE_DELTA))
     price_percent: Decimal = Decimal(str(FLOOR_PRICE_PERCENT)) / Decimal(100)
+    price_shift_tiers: tuple[tuple[float, float, float], ...] = (
+        FLOOR_PRICE_SHIFT_TIERS
+    )
+    coast_room_shift_limits: tuple[tuple[float, float], ...] = (
+        FLOOR_COAST_ROOM_SHIFT_LIMITS
+    )
+    preheat_room_shift_limits: tuple[tuple[float, float], ...] = (
+        FLOOR_PREHEAT_ROOM_SHIFT_LIMITS
+    )
 
     def __post_init__(self) -> None:
         if not self.minimum_offset <= self.neutral_offset < self.preheat_offset:
             raise HomeAssistantError("Floor offsets must satisfy minimum <= neutral < preheat.")
-        if self.minimum_offset < -6 or self.preheat_offset > 4:
+        if (
+            self.minimum_offset < FLOOR_NATIVE_MIN_OFFSET
+            or self.preheat_offset > FLOOR_NATIVE_MAX_OFFSET
+        ):
             raise HomeAssistantError(
-                "The floor optimizer must remain inside -6°C to +4°C."
+                "The floor optimizer must remain inside the native -10°C to +10°C range."
             )
         if self.shift_delta != 4:
             raise HomeAssistantError(
-                "The floor optimizer uses one meaningful 4°C overlay."
+                "The floor optimizer keeps 4°C as the minimum material shift."
             )
+        if tuple(shift for _, _, shift in self.price_shift_tiers) != (
+            4,
+            6,
+            8,
+            10,
+        ):
+            raise HomeAssistantError("The adaptive floor price tiers are invalid.")
         if self.comfort_floor >= self.preheat_ceiling:
             raise HomeAssistantError("The floor comfort threshold must be below the preheat ceiling.")
         if self.window_minutes <= 0 or self.window_minutes % 15:
             raise HomeAssistantError("The floor shift window must use whole 15-minute intervals.")
         if self.horizon < timedelta(hours=12) or self.maximum_shift <= timedelta(0):
             raise HomeAssistantError("The floor planning horizon or shift span is invalid.")
+
+
+def _price_shift_magnitude(
+    policy: FloorHeatingPolicy,
+    delta: Decimal | None,
+    relative: Decimal | None,
+) -> float:
+    if delta is None or relative is None:
+        return 0
+    selected = 0.0
+    for absolute_gate, percent_gate, shift in policy.price_shift_tiers:
+        if (
+            delta >= Decimal(str(absolute_gate))
+            and relative >= Decimal(str(percent_gate)) / Decimal(100)
+        ):
+            selected = shift
+    return selected
+
+
+def _room_shift_limit(
+    temperature: float,
+    limits: tuple[tuple[float, float], ...],
+) -> float:
+    for maximum_temperature, shift in limits:
+        if temperature <= maximum_temperature:
+            return shift
+    return 0
+
+
+def _round_toward_baseline(target: float, baseline: float) -> float:
+    if target < baseline:
+        return float(math.ceil(target))
+    if target > baseline:
+        return float(math.floor(target))
+    return float(target)
 
 
 @dataclass(frozen=True)
@@ -424,9 +481,8 @@ def plan_floor_heating(
         policy.price_percent,
     )
     busy = dhw_state in {
-        "preheat",
+        "economic_storage",
         "readiness_charge",
-        "readiness_final_topup",
         "recovery",
     }
 
@@ -472,25 +528,36 @@ def plan_floor_heating(
             or "Fresh indoor, outdoor, leaving-water and LWT-offset observations are required.",
             None,
         )
-    if not policy.minimum_offset <= observation.actual_offset <= policy.preheat_offset:
+    if not (
+        FLOOR_NATIVE_MIN_OFFSET
+        <= observation.actual_offset
+        <= FLOOR_NATIVE_MAX_OFFSET
+    ):
         return decision(
             "yield",
-            "The native/manual LWT offset is outside the optimizer's -6°C to +4°C envelope.",
+            "The native/manual LWT offset is outside the native -10°C to +10°C range.",
             observation.actual_offset,
         )
-    if observation.indoor_temperature <= policy.comfort_floor:
-        return decision(
-            "comfort_guard",
-            "Indoor temperature is at the 20°C guard; no price-driven setback is proposed.",
-            max(observation.actual_offset, policy.neutral_offset),
-        )
+    comfort_guard = observation.indoor_temperature <= policy.comfort_floor
     if observation.external_influence_reason is not None:
+        if comfort_guard:
+            return decision(
+                "comfort_guard",
+                "Indoor temperature is at the 20°C guard; restore at least the neutral native offset while external room HVAC is active.",
+                max(observation.actual_offset, policy.neutral_offset),
+            )
         return decision(
             "yield",
             observation.external_influence_reason,
             observation.actual_offset,
         )
     if not complete or current_price is None:
+        if comfort_guard:
+            return decision(
+                "comfort_guard",
+                "Indoor temperature is at the 20°C guard; restore at least the neutral native offset.",
+                max(observation.actual_offset, policy.neutral_offset),
+            )
         return decision(
             "unavailable",
             "Complete published all-in prices are required through the current "
@@ -498,23 +565,38 @@ def plan_floor_heating(
             observation.actual_offset,
         )
     if plan is None:
+        if comfort_guard:
+            return decision(
+                "comfort_guard",
+                "Indoor temperature is at the 20°C guard; restore at least the neutral native offset.",
+                max(observation.actual_offset, policy.neutral_offset),
+            )
         return decision(
             "hold",
             "No complete cheap-before-peak floor-shift pair exists in the planning horizon.",
             observation.actual_offset,
         )
+    now_utc = now.astimezone(UTC)
+    cheap_active = plan.cheap_window.start <= now_utc < plan.cheap_window.end
+    peak_active = plan.peak_window.start <= now_utc < plan.peak_window.end
     if (
         observation.outdoor_temperature >= policy.maximum_outdoor_temperature
         or observation.leaving_water_temperature
         < policy.minimum_leaving_water_temperature
     ):
+        if comfort_guard:
+            return decision(
+                "comfort_guard",
+                "Indoor temperature is at the 20°C guard; restore at least the neutral native offset.",
+                max(observation.actual_offset, policy.neutral_offset),
+            )
         return decision(
             "hold",
             "Outdoor and leaving-water conditions do not provide evidence of useful space-heating demand.",
             observation.actual_offset,
         )
-    now_utc = now.astimezone(UTC)
-    if plan.cheap_window.start <= now_utc < plan.cheap_window.end:
+    shift = _price_shift_magnitude(policy, delta, relative)
+    if cheap_active:
         if not gate:
             return decision(
                 "hold",
@@ -528,39 +610,103 @@ def plan_floor_heating(
                 observation.actual_offset,
                 conflict=True,
             )
-        if observation.indoor_temperature >= policy.preheat_ceiling:
+        room_limit = _room_shift_limit(
+            observation.indoor_temperature,
+            policy.preheat_room_shift_limits,
+        )
+        aggressive = min(
+            policy.preheat_offset,
+            observation.actual_offset + shift,
+        )
+        if room_limit <= 0:
             return decision(
                 "preheat_limited",
                 "The paired cheap block is active, but the room is already at or "
-                "above 21°C; preserve the native offset instead of adding heat.",
+                "above the 21°C preheat ceiling; preserve the native offset "
+                "instead of adding heat into closing thermostatic valves.",
                 observation.actual_offset,
+                aggressive_candidate_offset=aggressive,
             )
         proposed = min(
             policy.preheat_offset,
-            observation.actual_offset + policy.shift_delta,
+            observation.actual_offset + min(shift, room_limit),
         )
+        proposed = _round_toward_baseline(
+            proposed,
+            observation.actual_offset,
+        )
+        if proposed == observation.actual_offset:
+            return decision(
+                "preheat_limited",
+                "Room-temperature headroom leaves no useful positive LWT-offset shift.",
+                observation.actual_offset,
+                aggressive_candidate_offset=aggressive,
+            )
         return decision(
             "preheat",
-            "The current quarter is inside the selected cheap block; apply one "
-            "bounded +4°C LWT-offset overlay relative to the fresh native offset.",
+            "The current quarter is inside the selected cheap block; apply the "
+            f"adaptive +{proposed - observation.actual_offset:g}°C overlay "
+            "allowed by price strength and room-temperature headroom.",
             proposed,
+            aggressive_candidate_offset=aggressive,
         )
-    if plan.peak_window.start <= now_utc < plan.peak_window.end:
+    if peak_active:
         if not gate:
             return decision(
                 "hold",
                 "The cheap-to-peak all-in price advantage does not pass both materiality gates.",
                 observation.actual_offset,
             )
+        if comfort_guard:
+            return decision(
+                "comfort_guard",
+                "Indoor temperature is at the 20°C guard; no price-driven setback is proposed.",
+                max(observation.actual_offset, policy.neutral_offset),
+            )
+        room_limit = _room_shift_limit(
+            observation.indoor_temperature,
+            policy.coast_room_shift_limits,
+        )
+        if observation.indoor_temperature > policy.coast_room_shift_limits[-1][0]:
+            room_limit = policy.price_shift_tiers[-1][2]
+        lwt_limit = max(
+            0,
+            observation.leaving_water_temperature
+            - policy.minimum_leaving_water_temperature,
+        )
+        aggressive = max(
+            policy.minimum_offset,
+            observation.actual_offset - shift,
+        )
         proposed = max(
             policy.minimum_offset,
-            observation.actual_offset - policy.shift_delta,
+            observation.actual_offset - min(shift, room_limit, lwt_limit),
         )
+        proposed = _round_toward_baseline(
+            proposed,
+            observation.actual_offset,
+        )
+        if proposed == observation.actual_offset:
+            return decision(
+                "coast_limited",
+                "Room-temperature or projected leaving-water headroom leaves "
+                "no safe negative LWT-offset shift.",
+                observation.actual_offset,
+                aggressive_candidate_offset=aggressive,
+            )
         return decision(
             "coast",
-            "The current quarter is inside the paired expensive block; apply one "
-            "bounded -4°C LWT-offset overlay relative to the fresh native offset.",
+            "The current quarter is inside the paired expensive block; apply the "
+            f"adaptive {proposed - observation.actual_offset:g}°C overlay "
+            "allowed by price strength, room headroom and the 25°C projected-LWT guard.",
             proposed,
+            aggressive_candidate_offset=aggressive,
+        )
+    if comfort_guard:
+        return decision(
+            "comfort_guard",
+            "Indoor temperature is at the 20°C guard; restore at least the neutral native offset.",
+            max(observation.actual_offset, policy.neutral_offset),
         )
     return decision(
         "hold",
@@ -666,20 +812,31 @@ class FloorHeatingShadow:
         if isinstance(stored, dict) and stored.get("policy_revision") in (
             4,
             5,
+            6,
             POLICY_REVISION,
         ):
+            stored_revision = stored.get("policy_revision")
             mode = stored.get("mode")
             if mode in FLOOR_MODES:
                 self.mode = mode
             for key in self.state:
                 if key in stored:
                     self.state[key] = stored[key]
-            if stored.get("policy_revision") in (4, 5):
+            if stored_revision in (4, 5, 6):
                 self.state["policy_revision"] = POLICY_REVISION
                 self.mode = FLOOR_MODE_SHADOW
                 self.state["activation_hold"] = False
                 self.state["schedule_learning_hold_until"] = None
                 self.state["schedule_learning_reason"] = None
+                self.state["candidate_cycles"] = 0
+                self.state["contaminated_candidate_cycles"] = 0
+                self.state["candidate_cycle_started_at"] = None
+                self.state["candidate_cycle_peak_end"] = None
+                self.state["candidate_cycle_contaminated"] = False
+                self.state["qualified_opportunity_count"] = 0
+                self.state["last_qualified_opportunity_plan_id"] = None
+                self.state["last_qualified_opportunity_at"] = None
+                self._clear_plan()
             if (
                 self.state.get("pending_operation") is not None
                 and not self.state.get("fault")
@@ -691,7 +848,7 @@ class FloorHeatingShadow:
             elif (
                 self._ownership() is not None
                 and not self.state.get("fault")
-                and stored.get("policy_revision") in (4, 5)
+                and stored_revision in (4, 5, 6)
             ):
                 self.state["fault"] = (
                     "The floor policy changed while an optimizer-owned offset "
@@ -1178,22 +1335,63 @@ class FloorHeatingShadow:
                 proposed_offset=observation.actual_offset,
             )
         if decision.state == "yield":
-            desired = target
-        elif decision.state == "preheat":
-            desired = min(
-                self.policy.preheat_offset,
-                baseline + self.policy.shift_delta,
+            return replace(decision, proposed_offset=target)
+        owner_phase = str(owner["phase"])
+        if decision.state == owner_phase:
+            return replace(decision, proposed_offset=target)
+        if decision.state in ACTIVE_STATES:
+            phase_end = self._owned_phase_window_end(
+                now,
+                decision,
+                owner_phase,
             )
-        elif decision.state == "coast":
-            desired = max(
-                self.policy.minimum_offset,
-                baseline - self.policy.shift_delta,
+            if now.astimezone(UTC) < phase_end:
+                self.state["schedule_learning_hold_until"] = (
+                    phase_end.isoformat()
+                )
+                self.state["schedule_learning_reason"] = (
+                    f"The owned {owner_phase} episode ended early when "
+                    f"{decision.state} took priority. The optimizer restored "
+                    "the native baseline and will not reacquire during the same "
+                    "price window."
+                )
+            return replace(
+                decision,
+                state="hold",
+                reason=(
+                    f"The owned {owner_phase} episode ended; restore its exact "
+                    "native baseline before another floor phase can acquire control."
+                ),
+                proposed_offset=baseline,
             )
-        elif decision.state == "comfort_guard":
-            desired = max(baseline, self.policy.neutral_offset)
-        else:
-            desired = baseline
-        return replace(decision, proposed_offset=desired)
+        phase_end = self._owned_phase_window_end(
+            now,
+            decision,
+            owner_phase,
+        )
+        if now.astimezone(UTC) < phase_end:
+            self.state["schedule_learning_hold_until"] = phase_end.isoformat()
+            self.state["schedule_learning_reason"] = (
+                f"The owned {owner_phase} episode exited early because "
+                f"{decision.reason} The optimizer restored the native baseline "
+                "and will not reacquire during the same price window."
+            )
+        return replace(decision, proposed_offset=baseline)
+
+    def _owned_phase_window_end(
+        self,
+        now: datetime,
+        decision: FloorHeatingDecision,
+        phase: str,
+    ) -> datetime:
+        if decision.plan is not None:
+            if phase == "preheat":
+                return decision.plan.cheap_window.end
+            if phase == "coast":
+                return decision.plan.peak_window.end
+            if phase == "comfort_guard":
+                return self._schedule_window_end(now, decision)
+        return now.astimezone(UTC)
 
     def _schedule_window_end(
         self,
@@ -1360,7 +1558,10 @@ class FloorHeatingShadow:
         restoring: bool,
     ) -> bool:
         block_reason = self._extreme_block_reason(now)
-        if block_reason is not None:
+        if (
+            block_reason is not None
+            or self.state.get("pending_operation") is not None
+        ):
             return False
         pending = {
             "previous_offset": previous,
@@ -1446,6 +1647,7 @@ class FloorHeatingShadow:
             self.mode != FLOOR_MODE_ACTIVE
             or self.state.get("fault")
             or self.state.get("manual_override")
+            or self.state.get("pending_operation") is not None
             or observation.actual_offset is None
             or decision.proposed_offset is None
         ):
@@ -1917,11 +2119,36 @@ class FloorHeatingShadow:
             "neutral_offset_c": self.policy.neutral_offset,
             "preheat_offset_c": self.policy.preheat_offset,
             "shift_delta_c": self.policy.shift_delta,
+            "price_shift_tiers": [
+                {
+                    "minimum_price_delta_eur_kwh": absolute,
+                    "minimum_price_delta_percent": percent,
+                    "shift_c": shift,
+                }
+                for absolute, percent, shift in self.policy.price_shift_tiers
+            ],
+            "coast_room_shift_limits": [
+                {
+                    "maximum_room_temperature_c": temperature,
+                    "maximum_shift_c": shift,
+                }
+                for temperature, shift in self.policy.coast_room_shift_limits
+            ],
+            "preheat_room_shift_limits": [
+                {
+                    "maximum_room_temperature_c": temperature,
+                    "maximum_shift_c": shift,
+                }
+                for temperature, shift in self.policy.preheat_room_shift_limits
+            ],
             "offset_policy": (
-                "fresh_native_offset_plus_or_minus_4c_bounded_to_minus6_plus4"
+                "adaptive_price_tier_clamped_by_room_and_projected_lwt"
             ),
             "comfort_floor_c": self.policy.comfort_floor,
             "preheat_ceiling_c": self.policy.preheat_ceiling,
+            "minimum_leaving_water_temperature_c": (
+                self.policy.minimum_leaving_water_temperature
+            ),
             "window_minutes": self.policy.window_minutes,
             "planning_horizon_hours": int(self.policy.horizon.total_seconds() // 3600),
             "planning_basis": "complete_tallinn_delivery_days",
@@ -1945,7 +2172,7 @@ class FloorHeatingShadow:
             "pilot_eligible": self.pilot_eligible,
             "pilot_eligibility_reason": (
                 "The evidence gate requires at least 14 observed days and five "
-                "clean revision-6 candidate cycles. Explicit owner-approved "
+                "clean revision-7 candidate cycles. Explicit owner-approved "
                 "activation is recorded separately and does not relabel the "
                 "evidence gate as passed."
             ),

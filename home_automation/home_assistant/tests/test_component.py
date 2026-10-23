@@ -470,8 +470,8 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         ).isoformat(),
                         "actual_target_c": 50,
                         "proposed_target_c": 55,
-                        "state": "readiness_charge",
-                        "reason": "Readiness charge.",
+                        "state": "economic_storage",
+                        "reason": "Qualified cheap-period storage.",
                         "current_price_eur_kwh": "0.25",
                         "write_sent": True,
                     },
@@ -480,9 +480,20 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                             now - timedelta(hours=1)
                         ).isoformat(),
                         "actual_target_c": 50,
+                        "proposed_target_c": 45,
+                        "state": "readiness_usable",
+                        "reason": "Usable temperature accepted at a high price.",
+                        "write_sent": False,
+                    },
+                    {
+                        "observed_at": (
+                            now - timedelta(minutes=30)
+                        ).isoformat(),
+                        "mode": "shadow",
+                        "actual_target_c": 50,
                         "proposed_target_c": 50,
-                        "state": "readiness_pilot",
-                        "reason": "Hold normal target.",
+                        "state": "readiness_preferred",
+                        "reason": "Post-migration Shadow evaluation.",
                         "write_sent": False,
                     },
                 ],
@@ -579,13 +590,14 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
         attributes = sensor.extra_state_attributes
         self.assertEqual(attributes["verified_command_count"], 2)
         self.assertEqual(attributes["no_command_count"], 2)
-        self.assertEqual(attributes["simulation_count"], 1)
+        self.assertEqual(attributes["simulation_count"], 2)
         self.assertEqual(attributes["uncertain_command_count"], 1)
         self.assertEqual(attributes["review_required_count"], 1)
         self.assertEqual(
             [event["kind"] for event in attributes["events"]],
             [
                 "no_command",
+                "simulation",
                 "simulation",
                 "no_command",
             ],
@@ -597,6 +609,14 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                 "verified_command",
                 "review_required",
             ],
+        )
+        self.assertTrue(
+            any(
+                event["kind"] == "simulation"
+                and event["system"] == "Hot water"
+                and event["state"] == "readiness_preferred"
+                for event in attributes["events"]
+            )
         )
         resume_event = attributes["events"][-1]
         self.assertEqual(
@@ -716,7 +736,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         "observed_at": first_start.isoformat(),
                         "actual_target_c": 50,
                         "proposed_target_c": 55,
-                        "state": "readiness_charge",
+                        "state": "economic_storage",
                         "reason": "First verified readiness charge.",
                         "current_price_eur_kwh": "0.10",
                         "write_sent": True,
@@ -725,7 +745,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         "observed_at": first_end.isoformat(),
                         "actual_target_c": 55,
                         "proposed_target_c": 50,
-                        "state": "readiness_hold",
+                        "state": "readiness_preferred",
                         "reason": "First verified target restore.",
                         "current_price_eur_kwh": "0.12",
                         "write_sent": True,
@@ -734,7 +754,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         "observed_at": second_start.isoformat(),
                         "actual_target_c": 50,
                         "proposed_target_c": 55,
-                        "state": "readiness_charge",
+                        "state": "economic_storage",
                         "reason": "Second verified readiness charge.",
                         "current_price_eur_kwh": "0.09",
                         "write_sent": True,
@@ -743,7 +763,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         "observed_at": second_end.isoformat(),
                         "actual_target_c": 55,
                         "proposed_target_c": 50,
-                        "state": "readiness_hold",
+                        "state": "readiness_preferred",
                         "reason": "Second verified target restore.",
                         "current_price_eur_kwh": "0.11",
                         "write_sent": True,
@@ -754,7 +774,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         ).isoformat(),
                         "actual_target_c": 52,
                         "proposed_target_c": 52,
-                        "state": "manual_override",
+                        "state": "override",
                         "reason": "Observed external target change.",
                         "current_price_eur_kwh": "0.15",
                         "write_sent": False,
@@ -901,7 +921,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
     def test_energy_control_activity_retains_representative_full_day_actions(self):
         now = self.now.astimezone(timezone.utc)
         optimizer = SimpleNamespace(
-            mode="safe",
+            mode="safe_target_shift",
             state={
                 "decision_history": [
                     {
@@ -910,7 +930,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         ).isoformat(),
                         "actual_target_c": 50,
                         "proposed_target_c": 55,
-                        "state": "readiness_charge",
+                        "state": "economic_storage",
                         "reason": "Morning readiness charge.",
                         "current_price_eur_kwh": "0.10",
                         "write_sent": True,
@@ -921,7 +941,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         ).isoformat(),
                         "actual_target_c": 55,
                         "proposed_target_c": 50,
-                        "state": "readiness",
+                        "state": "readiness_preferred",
                         "reason": "Morning readiness restore.",
                         "current_price_eur_kwh": "0.12",
                         "write_sent": True,
@@ -954,7 +974,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         ).isoformat(),
                         "actual_target_c": 50,
                         "proposed_target_c": 55,
-                        "state": "readiness_final_topup",
+                        "state": "economic_storage",
                         "reason": "Evening readiness charge.",
                         "current_price_eur_kwh": "0.18",
                         "write_sent": True,
@@ -965,7 +985,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         ).isoformat(),
                         "actual_target_c": 55,
                         "proposed_target_c": 50,
-                        "state": "readiness",
+                        "state": "readiness_preferred",
                         "reason": "Evening readiness restore.",
                         "current_price_eur_kwh": "0.20",
                         "write_sent": True,
@@ -994,7 +1014,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                         ).isoformat(),
                         "actual_offset_c": -6,
                         "proposed_offset_c": -2,
-                        "state": "normal",
+                        "state": "hold",
                         "reason": "Floor baseline restore.",
                         "current_price_eur_kwh": "0.16",
                         "write_sent": True,
@@ -1093,7 +1113,7 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
                 ).isoformat(),
                 "actual_target_c": 55,
                 "proposed_target_c": 50,
-                "state": "readiness_hold",
+                "state": "readiness_preferred",
                 "reason": "Episode crossing the rolling cutoff.",
                 "current_price_eur_kwh": "0.12345",
                 "write_sent": True,
@@ -1288,10 +1308,10 @@ class HAComponentTests(unittest.IsolatedAsyncioTestCase):
             [
                 "Paused",
                 "Shadow (no writes)",
-                "Active price shift",
+                "Active adaptive price shift",
             ],
         )
-        await mode_select.async_select_option("Active price shift")
+        await mode_select.async_select_option("Active adaptive price shift")
         floor.async_set_mode.assert_awaited_once_with("active")
 
         activate_floor = button_module.FloorHeatingActivateButton(

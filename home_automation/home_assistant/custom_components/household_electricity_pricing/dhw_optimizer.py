@@ -41,14 +41,12 @@ from .const import (
     DEFAULT_DHW_PRICE_DELTA,
     DEFAULT_DHW_PRICE_PERCENT,
     DEFAULT_DHW_SOFT_TARGET,
-    DHW_FINAL_TOPUP_MINUTES,
     DHW_MODE_PAUSED,
     DHW_MODE_READINESS,
     DHW_MODE_SAFE,
     DHW_MODE_SHADOW,
     DHW_MODE_SOFT,
     DHW_MODES,
-    DHW_POST_DELIVERY_REARM_C,
     DHW_POST_READINESS_HOLD_MINUTES,
     DOMAIN,
     EVENT_DHW_DECISION,
@@ -63,12 +61,12 @@ NOTIFICATION_ID = DOMAIN + "_dhw_optimizer_fault"
 DECISION_HISTORY_LIMIT = 96
 HEATING_DURATION_LIMIT = 20
 RETENTION_SAMPLE_LIMIT = 20
-POLICY_REVISION = 9
+POLICY_REVISION = 10
 MINIMUM_TARGET_DWELL = timedelta(minutes=30)
 POST_READINESS_HOLD = timedelta(
     minutes=DHW_POST_READINESS_HOLD_MINUTES
 )
-FINAL_TOPUP_WINDOW = timedelta(minutes=DHW_FINAL_TOPUP_MINUTES)
+MAX_STORAGE_HORIZON = timedelta(hours=8)
 SHALLOW_HEATING_FALLBACK_MINUTES = 45
 SHALLOW_HEATING_MIN_MINUTES = 30
 SHALLOW_HEATING_MAX_MINUTES = 60
@@ -76,18 +74,26 @@ RETENTION_MINIMUM_DURATION = timedelta(minutes=30)
 RETENTION_MAX_LOSS_RATE_C_PER_HOUR = 3.0
 RETENTION_REQUIRED_SAMPLES = 3
 RETENTION_REQUIRED_CYCLES = 2
-NEAR_CHEAPEST_ABSOLUTE_PREMIUM = Decimal("0.01")
-NEAR_CHEAPEST_RELATIVE_PREMIUM = Decimal("0.10")
 RECENT_DECISIONS_ATTRIBUTE_LIMIT = 4
+PLAN_KIND_ECONOMIC = "economic_storage"
+PLAN_KIND_PREFERRED = "preferred_readiness"
 READINESS_SUCCESS = "success"
 READINESS_CONSUMED = "consumed"
+READINESS_ACCEPTED = "usable_below_preferred"
 READINESS_CONTAMINATED = "draw_contaminated"
 READINESS_FAILURE = "failure"
 READINESS_UNAVAILABLE = "unavailable"
 READINESS_USABLE = frozenset(
-    (READINESS_SUCCESS, READINESS_CONSUMED, READINESS_FAILURE)
+    (
+        READINESS_SUCCESS,
+        READINESS_CONSUMED,
+        READINESS_ACCEPTED,
+        READINESS_FAILURE,
+    )
 )
-READINESS_DELIVERED = frozenset((READINESS_SUCCESS, READINESS_CONSUMED))
+READINESS_DELIVERED = frozenset(
+    (READINESS_SUCCESS, READINESS_CONSUMED, READINESS_ACCEPTED)
+)
 
 
 def _number(value: object, label: str) -> float:
@@ -277,6 +283,9 @@ class DhwDecision:
     retention_cycle_count: int = 0
     retention_loss_rate_c_per_hour: float | None = None
     adaptive_preheat_target_c: float | None = None
+    plan_kind: str | None = None
+    planned_target_c: float | None = None
+    protected_endpoint: datetime | None = None
 
     def attributes(self) -> dict:
         result = {
@@ -318,6 +327,13 @@ class DhwDecision:
                 else None
             ),
             "adaptive_preheat_target_c": self.adaptive_preheat_target_c,
+            "price_plan_kind": self.plan_kind,
+            "planned_target_c": self.planned_target_c,
+            "protected_endpoint": (
+                self.protected_endpoint.isoformat()
+                if self.protected_endpoint is not None
+                else None
+            ),
             "price_data_complete": self.data_complete,
             "lease_expires": self.lease_expires.isoformat() if self.lease_expires else None,
             "write_allowed": self.allow_write,
@@ -439,6 +455,15 @@ def quarter_start(now: datetime) -> datetime:
     return datetime.fromtimestamp(stamp // seconds * seconds, UTC)
 
 
+def quarter_ceiling(instant: datetime) -> datetime:
+    start = quarter_start(instant)
+    return (
+        start
+        if start == instant.astimezone(UTC)
+        else start + MARKET_INTERVAL
+    )
+
+
 def _price_map(intervals: Iterable[PriceInterval]) -> dict[datetime, PriceInterval]:
     result = {}
     for item in intervals:
@@ -446,6 +471,131 @@ def _price_map(intervals: Iterable[PriceInterval]) -> dict[datetime, PriceInterv
             return {}
         result[item.start] = item
     return result
+
+
+def _complete_price_schedule(
+    now: datetime,
+    deadline: datetime,
+    intervals: Iterable[PriceInterval],
+) -> tuple[dict[datetime, PriceInterval], Decimal | None, bool]:
+    prices = _price_map(intervals)
+    current = quarter_start(now)
+    current_row = prices.get(current)
+    if (
+        current_row is None
+        or current_row.end != current + MARKET_INTERVAL
+    ):
+        return prices, None, False
+    deadline_utc = deadline.astimezone(UTC)
+    cursor = current
+    while cursor < deadline_utc:
+        row = prices.get(cursor)
+        if row is None or row.end != cursor + MARKET_INTERVAL:
+            return prices, current_row.price, False
+        cursor += MARKET_INTERVAL
+    return prices, current_row.price, True
+
+
+def _window_choice(
+    prices: Mapping[datetime, PriceInterval],
+    start: datetime,
+    interval_count: int,
+) -> PriceWindowChoice | None:
+    rows = [
+        prices.get(start + index * MARKET_INTERVAL)
+        for index in range(interval_count)
+    ]
+    if not all(row is not None for row in rows):
+        return None
+    total = sum(
+        (row.price for row in rows if row is not None),
+        Decimal(0),
+    )
+    return PriceWindowChoice(
+        start=start,
+        end=start + interval_count * MARKET_INTERVAL,
+        average=total / interval_count,
+        interval_count=interval_count,
+    )
+
+
+def _window_matches_prices(
+    window: PriceWindowChoice,
+    prices: Mapping[datetime, PriceInterval],
+) -> bool:
+    current = _window_choice(
+        prices,
+        window.start,
+        window.interval_count,
+    )
+    return (
+        current is not None
+        and current.end == window.end
+        and current.average == window.average
+    )
+
+
+def _window_choices(
+    prices: Mapping[datetime, PriceInterval],
+    first: datetime,
+    last: datetime,
+    duration_minutes: int,
+) -> tuple[PriceWindowChoice, ...]:
+    interval_count = max(1, math.ceil(duration_minutes / 15))
+    result = []
+    candidate = first
+    while candidate <= last:
+        choice = _window_choice(prices, candidate, interval_count)
+        if choice is not None:
+            result.append(choice)
+        candidate += MARKET_INTERVAL
+    return tuple(result)
+
+
+def _minimum_average_choice(
+    choices: Iterable[PriceWindowChoice],
+) -> PriceWindowChoice | None:
+    values = tuple(choices)
+    if not values:
+        return None
+    return min(
+        values,
+        key=lambda choice: (
+            choice.average,
+            -choice.start.timestamp(),
+        ),
+    )
+
+
+def _retention_horizon(
+    policy: DhwPolicy,
+    target: float,
+    loss_rate_c_per_hour: float,
+) -> timedelta:
+    configured = min(policy.coast_horizon, MAX_STORAGE_HORIZON)
+    if loss_rate_c_per_hour == 0:
+        return configured
+    thermal_hours = max(
+        0.0,
+        (target - policy.floor_target) / loss_rate_c_per_hour,
+    )
+    return min(configured, timedelta(hours=thermal_hours))
+
+
+def _predicted_endpoint_temperature(
+    target: float,
+    window: PriceWindowChoice,
+    endpoint: datetime,
+    loss_rate_c_per_hour: float,
+) -> float:
+    hold_hours = max(
+        0.0,
+        (
+            endpoint.astimezone(UTC) - window.end.astimezone(UTC)
+        ).total_seconds()
+        / 3600,
+    )
+    return target - loss_rate_c_per_hour * hold_hours
 
 
 def select_price_window(
@@ -466,16 +616,16 @@ def select_price_window(
     Decimal | None,
     bool,
 ]:
-    prices = _price_map(intervals)
+    _ = prefer_latest_near_cheapest
+    prices, current_price, complete = _complete_price_schedule(
+        now,
+        deadline,
+        intervals,
+    )
+    if not complete:
+        return None, None, None, current_price, False
     current = quarter_start(now)
     deadline_utc = deadline.astimezone(UTC)
-    cursor = current
-    while cursor < deadline_utc:
-        row = prices.get(cursor)
-        if row is None or row.end != cursor + MARKET_INTERVAL:
-            return None, None, None, None, False
-        cursor += MARKET_INTERVAL
-    current_price = prices[current].price if current in prices else None
     horizon_start = deadline_utc - coast_horizon
     if (
         planned_window is not None
@@ -503,49 +653,31 @@ def select_price_window(
         return planned_window, comparison, cheapest, current_price, True
     interval_count = max(1, math.ceil(duration_minutes / 15))
     duration = interval_count * MARKET_INTERVAL
-    first = max(current, horizon_start)
+    first = quarter_ceiling(max(current, horizon_start))
     last = deadline_utc - duration
     if last < first:
         return None, None, None, current_price, True
-    choices = []
-    candidate = first
-    while candidate <= last:
-        rows = [prices.get(candidate + index * MARKET_INTERVAL) for index in range(interval_count)]
-        if all(row is not None for row in rows):
-            total = sum((row.price for row in rows if row is not None), Decimal(0))
-            choices.append((
-                total,
-                -candidate.timestamp(),
-                PriceWindowChoice(
-                    start=candidate,
-                    end=candidate + duration,
-                    average=total / interval_count,
-                    interval_count=interval_count,
-                ),
-            ))
-        candidate += MARKET_INTERVAL
+    choices = _window_choices(
+        prices,
+        first,
+        last,
+        duration_minutes,
+    )
     if not choices:
         return None, None, None, current_price, True
-    cheapest = min(choices, key=lambda item: (item[0], item[1]))[2]
+    cheapest = _minimum_average_choice(choices)
     selected = cheapest
-    if prefer_latest_near_cheapest:
-        near_cheapest = []
-        base = max(abs(cheapest.average), Decimal("0.05"))
-        for _, _, choice in choices:
-            premium = choice.average - cheapest.average
-            if (
-                premium <= NEAR_CHEAPEST_ABSOLUTE_PREMIUM
-                and premium / base <= NEAR_CHEAPEST_RELATIVE_PREMIUM
-            ):
-                near_cheapest.append(choice)
-        if near_cheapest:
-            selected = max(near_cheapest, key=lambda choice: choice.start)
+    if selected is None:
+        return None, None, None, current_price, True
 
     if comparison_duration_minutes is None:
         comparison = max(
             choices,
-            key=lambda item: (item[0], item[2].start.timestamp()),
-        )[2]
+            key=lambda choice: (
+                choice.average,
+                choice.start.timestamp(),
+            ),
+        )
     else:
         comparison_count = max(
             1,
@@ -573,7 +705,7 @@ def select_price_window(
             )
         else:
             comparison = max(
-                (item[2] for item in choices),
+                choices,
                 key=lambda choice: choice.start,
             )
     return selected, comparison, cheapest, current_price, True
@@ -597,6 +729,171 @@ def price_gate(
     )
 
 
+def _preferred_readiness_plan(
+    *,
+    current: datetime,
+    deadline: datetime,
+    prices: Mapping[datetime, PriceInterval],
+    duration_minutes: int,
+    policy: DhwPolicy,
+    retention_qualified: bool,
+    retention_loss_rate_c_per_hour: float | None,
+) -> tuple[
+    PriceWindowChoice | None,
+    PriceWindowChoice | None,
+    PriceWindowChoice | None,
+    datetime,
+]:
+    deadline_utc = deadline.astimezone(UTC)
+    interval_count = max(1, math.ceil(duration_minutes / 15))
+    duration = interval_count * MARKET_INTERVAL
+    selected = None
+    if (
+        retention_qualified
+        and retention_loss_rate_c_per_hour is not None
+    ):
+        horizon = _retention_horizon(
+            policy,
+            policy.normal_target,
+            retention_loss_rate_c_per_hour,
+        )
+        first = quarter_ceiling(
+            max(current, deadline_utc - horizon)
+        )
+        last = deadline_utc - duration
+        choices = (
+            choice
+            for choice in _window_choices(
+                prices,
+                first,
+                last,
+                duration_minutes,
+            )
+            if _predicted_endpoint_temperature(
+                policy.normal_target,
+                choice,
+                deadline_utc,
+                retention_loss_rate_c_per_hour,
+            )
+            >= policy.floor_target
+        )
+        selected = _minimum_average_choice(choices)
+    if selected is None and current < deadline_utc:
+        final_start = deadline_utc - duration
+        selected = _window_choice(
+            prices,
+            final_start,
+            interval_count,
+        )
+    return selected, selected, selected, deadline_utc
+
+
+def _economic_storage_plan(
+    *,
+    current: datetime,
+    deadline: datetime,
+    prices: Mapping[datetime, PriceInterval],
+    duration_minutes: int,
+    comparison_duration_minutes: int,
+    policy: DhwPolicy,
+    retention_loss_rate_c_per_hour: float,
+) -> tuple[
+    PriceWindowChoice | None,
+    PriceWindowChoice | None,
+    PriceWindowChoice | None,
+    datetime | None,
+]:
+    deadline_utc = deadline.astimezone(UTC)
+    interval_count = max(1, math.ceil(duration_minutes / 15))
+    duration = interval_count * MARKET_INTERVAL
+    comparison_count = max(
+        1,
+        math.ceil(comparison_duration_minutes / 15),
+    )
+    horizon = _retention_horizon(
+        policy,
+        policy.preheat_target,
+        retention_loss_rate_c_per_hour,
+    )
+    first = current
+    last = deadline_utc - duration - MARKET_INTERVAL
+    if last < first:
+        return None, None, None, None
+    choices = _window_choices(
+        prices,
+        first,
+        last,
+        duration_minutes,
+    )
+    if not choices:
+        return None, None, None, None
+    final_comparison = _window_choice(
+        prices,
+        deadline_utc - comparison_count * MARKET_INTERVAL,
+        comparison_count,
+    )
+    opportunities = []
+    for choice in choices:
+        comparisons: list[tuple[PriceWindowChoice, datetime]] = []
+        if (
+            final_comparison is not None
+            and choice.start < final_comparison.start
+            and choice.end < deadline_utc
+        ):
+            comparisons.append((final_comparison, deadline_utc))
+        immediate = _window_choice(
+            prices,
+            choice.end,
+            comparison_count,
+        )
+        if immediate is not None:
+            comparisons.append((immediate, immediate.end))
+        qualified = []
+        for comparison, endpoint in comparisons:
+            gate, delta, relative = price_gate(
+                comparison.average,
+                choice,
+                policy.price_delta,
+                policy.price_percent,
+            )
+            if (
+                gate
+                and delta is not None
+                and relative is not None
+                and choice.start >= endpoint - horizon
+                and _predicted_endpoint_temperature(
+                    policy.preheat_target,
+                    choice,
+                    endpoint,
+                    retention_loss_rate_c_per_hour,
+                )
+                >= policy.floor_target
+            ):
+                qualified.append((
+                    delta,
+                    relative,
+                    endpoint.timestamp(),
+                    comparison,
+                    endpoint,
+                ))
+        if qualified:
+            _, _, _, comparison, endpoint = max(
+                qualified,
+                key=lambda item: (item[0], item[1], item[2]),
+            )
+            opportunities.append((choice, comparison, endpoint))
+    if not opportunities:
+        return None, None, None, None
+    selected, comparison, endpoint = min(
+        opportunities,
+        key=lambda item: (
+            item[0].average,
+            -item[0].start.timestamp(),
+        ),
+    )
+    return selected, comparison, selected, endpoint
+
+
 def plan_dhw(
     *,
     now: datetime,
@@ -610,12 +907,12 @@ def plan_dhw(
     planned_window: PriceWindowChoice | None = None,
     comparison_window: PriceWindowChoice | None = None,
     absolute_cheapest_window: PriceWindowChoice | None = None,
+    planned_deadline: datetime | None = None,
+    planned_kind: str | None = None,
+    planned_endpoint: datetime | None = None,
     recovery_latched: bool = False,
     recovery_reason: str | None = None,
     preheat_completed: bool = False,
-    readiness_delivered: bool = False,
-    final_topup_used: bool = False,
-    final_topup_active: bool = False,
     recent_rapid_draw: bool = False,
     retention_loss_rate_c_per_hour: float | None = None,
     retention_sample_count: int = 0,
@@ -627,7 +924,36 @@ def plan_dhw(
         mode = DHW_MODE_SAFE
     if mode not in DHW_MODES:
         raise HomeAssistantError("Unknown DHW optimizer mode.")
-    deadline = next_readiness(now, policy)
+    _ = preheat_completed
+    next_deadline = next_readiness(now, policy)
+    deadline = next_deadline
+    planned_deadline_valid = (
+        planned_deadline is not None
+        and (
+            planned_deadline.astimezone(UTC)
+            == next_deadline.astimezone(UTC)
+            or (
+                planned_deadline.astimezone(UTC)
+                <= now.astimezone(UTC)
+                < (
+                    planned_deadline.astimezone(UTC)
+                    + POST_READINESS_HOLD
+                )
+            )
+        )
+    )
+    if planned_deadline_valid and planned_deadline is not None:
+        deadline = planned_deadline
+    post_hold_until = post_readiness_hold_until(now, policy)
+    post_readiness = (
+        deadline.astimezone(UTC)
+        <= now.astimezone(UTC)
+        < deadline.astimezone(UTC) + POST_READINESS_HOLD
+    )
+    unanchored_post_readiness = (
+        post_hold_until is not None
+        and not planned_deadline_valid
+    )
     shallow_minutes = (
         shallow_heating_minutes
         if isinstance(shallow_heating_minutes, int)
@@ -637,7 +963,9 @@ def plan_dhw(
     )
     shallow_eligible = (
         observation.tank_temperature is not None
-        and 48 <= observation.tank_temperature < policy.normal_target
+        and policy.floor_target
+        <= observation.tank_temperature
+        < policy.normal_target
         and not recovery_latched
         and not recent_rapid_draw
     )
@@ -652,56 +980,146 @@ def plan_dhw(
         and retention_sample_count >= RETENTION_REQUIRED_SAMPLES
         and retention_cycle_count >= RETENTION_REQUIRED_CYCLES
     )
-    selected, comparison, cheapest, current_price, complete = select_price_window(
+    prices, current_price, complete = _complete_price_schedule(
         now,
         deadline,
         intervals,
-        heating_minutes,
-        policy.coast_horizon,
-        planned_window,
-        comparison_window,
-        absolute_cheapest_window,
-        (
-            shallow_minutes
-            if retention_qualified
-            else None
-        ),
-        retention_qualified,
     )
+    current = quarter_start(now)
+    selected = None
+    comparison = None
+    cheapest = None
+    plan_kind = None
+    endpoint = None
+    planned_economic_expired = (
+        planned_kind == PLAN_KIND_ECONOMIC
+        and planned_endpoint is not None
+        and planned_endpoint.astimezone(UTC)
+        < deadline.astimezone(UTC)
+        and now.astimezone(UTC)
+        >= planned_endpoint.astimezone(UTC)
+    )
+    if (
+        planned_deadline_valid
+        and planned_window is not None
+        and not planned_economic_expired
+        and complete
+        and _window_matches_prices(planned_window, prices)
+        and (
+            comparison_window is None
+            or _window_matches_prices(comparison_window, prices)
+        )
+        and (
+            absolute_cheapest_window is None
+            or _window_matches_prices(
+                absolute_cheapest_window,
+                prices,
+            )
+        )
+    ):
+        selected = planned_window
+        comparison = comparison_window or planned_window
+        cheapest = absolute_cheapest_window or planned_window
+        plan_kind = (
+            planned_kind
+            if planned_kind in (PLAN_KIND_ECONOMIC, PLAN_KIND_PREFERRED)
+            else PLAN_KIND_PREFERRED
+        )
+        endpoint = planned_endpoint or deadline
+    elif (
+        not unanchored_post_readiness
+        and complete
+        and current < deadline.astimezone(UTC)
+    ):
+        preferred = _preferred_readiness_plan(
+            current=current,
+            deadline=deadline,
+            prices=prices,
+            duration_minutes=readiness_heating_minutes,
+            policy=policy,
+            retention_qualified=retention_qualified,
+            retention_loss_rate_c_per_hour=(
+                retention_loss_rate_c_per_hour
+                if retention_qualified
+                else None
+            ),
+        )
+        economic = (None, None, None, None)
+        if (
+            mode in (DHW_MODE_SHADOW, DHW_MODE_SAFE)
+            and retention_qualified
+            and not recent_rapid_draw
+            and retention_loss_rate_c_per_hour is not None
+            and policy.preheat_target > policy.normal_target
+        ):
+            economic = _economic_storage_plan(
+                current=current,
+                deadline=deadline,
+                prices=prices,
+                duration_minutes=heating_minutes,
+                comparison_duration_minutes=readiness_heating_minutes,
+                policy=policy,
+                retention_loss_rate_c_per_hour=(
+                    retention_loss_rate_c_per_hour
+                ),
+            )
+        if economic[0] is not None:
+            selected, comparison, cheapest, endpoint = economic
+            plan_kind = PLAN_KIND_ECONOMIC
+        else:
+            selected, comparison, cheapest, endpoint = preferred
+            if selected is not None:
+                plan_kind = PLAN_KIND_PREFERRED
     gate, delta, relative = price_gate(
         current_price,
         selected,
         policy.price_delta,
         policy.price_percent,
     )
-    preheat_gate, preheat_delta, preheat_relative = price_gate(
+    economic_gate, economic_delta, economic_relative = price_gate(
         comparison.average if comparison is not None else None,
         selected,
         policy.price_delta,
         policy.price_percent,
     )
-    adaptive_preheat_target = None
-    if (
-        retention_qualified
+    economic_feasible = (
+        plan_kind == PLAN_KIND_ECONOMIC
+        and economic_gate
+        and complete
+        and retention_qualified
+        and not recent_rapid_draw
         and selected is not None
+        and endpoint is not None
         and retention_loss_rate_c_per_hour is not None
-    ):
-        hold_hours = max(
-            0.0,
-            (
-                deadline.astimezone(UTC) - selected.end.astimezone(UTC)
-            ).total_seconds()
-            / 3600,
+        and selected.end < deadline.astimezone(UTC)
+        and selected.start
+        >= endpoint.astimezone(UTC)
+        - _retention_horizon(
+            policy,
+            policy.preheat_target,
+            retention_loss_rate_c_per_hour,
         )
-        required_target = math.ceil(
-            policy.normal_target
-            + retention_loss_rate_c_per_hour * hold_hours
-            + 1
+        and _predicted_endpoint_temperature(
+            policy.preheat_target,
+            selected,
+            endpoint,
+            retention_loss_rate_c_per_hour,
         )
-        if required_target <= policy.preheat_target:
-            adaptive_preheat_target = float(
-                max(policy.normal_target, required_target)
-            )
+        >= policy.floor_target
+    )
+    if not economic_feasible:
+        economic_gate = False
+    adaptive_preheat_target = (
+        policy.preheat_target if economic_feasible else None
+    )
+    planned_target = (
+        policy.preheat_target
+        if plan_kind == PLAN_KIND_ECONOMIC
+        and selected is not None
+        else policy.normal_target
+        if selected is not None
+        else None
+    )
     allow_write = mode in (DHW_MODE_READINESS, DHW_MODE_SAFE)
 
     def decision(
@@ -730,9 +1148,9 @@ def plan_dhw(
             allow_write=write,
             urgent=urgent,
             comparison_window=comparison,
-            preheat_price_delta=preheat_delta,
-            preheat_price_delta_percent=preheat_relative,
-            preheat_price_gate=preheat_gate,
+            preheat_price_delta=economic_delta,
+            preheat_price_delta_percent=economic_relative,
+            preheat_price_gate=economic_gate,
             absolute_cheapest_window=cheapest,
             readiness_heating_minutes=readiness_heating_minutes,
             readiness_heating_profile=readiness_heating_profile,
@@ -741,6 +1159,9 @@ def plan_dhw(
             retention_cycle_count=retention_cycle_count,
             retention_loss_rate_c_per_hour=retention_loss_rate_c_per_hour,
             adaptive_preheat_target_c=adaptive_preheat_target,
+            plan_kind=plan_kind,
+            planned_target_c=planned_target,
+            protected_endpoint=endpoint,
         )
 
     if mode == DHW_MODE_PAUSED:
@@ -754,63 +1175,6 @@ def plan_dhw(
             None,
             write=False,
         )
-    remaining = deadline.astimezone(UTC) - now.astimezone(UTC)
-    if final_topup_active and remaining > timedelta(0):
-        return decision(
-            "readiness_final_topup",
-            "Keep the final 55°C readiness charge latched through the "
-            "deadline to avoid native target hysteresis.",
-            policy.preheat_target,
-            urgent=True,
-        )
-    if remaining <= timedelta(minutes=readiness_heating_minutes):
-        if observation.tank_temperature < policy.normal_target:
-            if (
-                readiness_delivered
-                and observation.tank_temperature
-                > DHW_POST_DELIVERY_REARM_C
-                and (
-                    remaining > FINAL_TOPUP_WINDOW
-                    or (
-                        final_topup_used
-                        and not final_topup_active
-                    )
-                )
-            ):
-                return decision(
-                    "readiness_hold",
-                    "Measured readiness was already delivered. Hold 50°C "
-                    "unless the tank reaches the 48°C re-arm threshold or "
-                    "one final top-up is needed inside the last 45 minutes.",
-                    policy.normal_target,
-                    urgent=True,
-                )
-            return decision(
-                (
-                    "readiness_final_topup"
-                    if remaining <= FINAL_TOPUP_WINDOW
-                    else "readiness_charge"
-                ),
-                (
-                    "The readiness deadline is inside the final 45-minute "
-                    "window; keep the 55°C charge latched through the deadline."
-                    if remaining <= FINAL_TOPUP_WINDOW
-                    else (
-                        "The readiness deadline is inside the conservative "
-                        f"{readiness_heating_profile} "
-                        f"{readiness_heating_minutes}-minute heating allowance; "
-                        "request 55°C until the measured tank reaches 50°C."
-                    )
-                ),
-                policy.preheat_target,
-                urgent=True,
-            )
-        return decision(
-            "readiness",
-            "Measured readiness is satisfied; hold the normal 50°C target.",
-            policy.normal_target,
-            urgent=True,
-        )
     if (
         recovery_latched
         and observation.tank_temperature < policy.normal_target
@@ -822,105 +1186,176 @@ def plan_dhw(
             policy.normal_target,
             urgent=True,
         )
-    if observation.tank_temperature <= policy.floor_target:
+    if observation.tank_temperature < policy.floor_target:
         return decision(
             "recovery",
-            "Tank temperature reached the 45°C comfort threshold; price shifting is bypassed.",
+            "Tank temperature fell below the 45°C comfort floor; request "
+            "50°C immediately and keep measured recovery latched.",
             policy.normal_target,
             urgent=True,
         )
-    hold_until = post_readiness_hold_until(now, policy)
-    if hold_until is not None:
+    now_utc = now.astimezone(UTC)
+    inside_selected = (
+        selected is not None
+        and selected.start <= now_utc < selected.end
+    )
+    if (
+        economic_feasible
+        and inside_selected
+    ):
         return decision(
-            "usage_hold",
-            "The two-hour post-readiness demand hold keeps the normal 50°C "
-            "target and blocks price-driven coasting.",
-            policy.normal_target,
+            "economic_storage",
+            "The current quarter is inside the absolute minimum-average "
+            "feasible storage block, both material price gates pass, and "
+            "qualified retention protects the 45°C floor through the "
+            "relevant endpoint.",
+            policy.preheat_target,
             urgent=True,
         )
-    if mode == DHW_MODE_READINESS:
+    if observation.target_temperature > policy.normal_target:
         return decision(
-            "readiness_pilot",
-            "The readiness-only pilot keeps the normal target outside the final "
-            "readiness allowance; price coasting and soft standby remain disabled.",
+            "readiness_preferred",
+            "The economic-storage block is not active; restore the "
+            "optimizer-owned elevated target to the preferred 50°C target.",
             policy.normal_target,
             urgent=True,
         )
     if not complete or current_price is None:
         return decision(
-            "normal",
-            "Published all-in prices are incomplete through the next readiness deadline.",
+            (
+                "readiness_charge"
+                if observation.tank_temperature < policy.normal_target
+                else "readiness_preferred"
+            ),
+            "Published all-in prices are incomplete for the protected "
+            "readiness period; fail safe to the preferred 50°C target.",
+            policy.normal_target,
+            urgent=True,
+        )
+    if unanchored_post_readiness:
+        return decision(
+            (
+                "readiness_charge"
+                if observation.tank_temperature < policy.normal_target
+                else "readiness_preferred"
+            ),
+            "No complete anchored plan is available for the just-finished "
+            "readiness period; fail safe to the preferred 50°C target.",
+            policy.normal_target,
+            urgent=True,
+        )
+    if post_readiness:
+        if observation.tank_temperature < policy.normal_target:
+            if gate:
+                usable_target = observation.target_temperature
+                if not (
+                    policy.floor_target
+                    <= observation.target_temperature
+                    <= policy.normal_target
+                ):
+                    usable_target = (
+                        policy.normal_target
+                        if observation.target_temperature
+                        > policy.normal_target
+                        else policy.floor_target
+                    )
+                return decision(
+                    "readiness_usable",
+                    "The tank remains at or above the usable 45°C floor, "
+                    "while the current price is materially expensive relative "
+                    "to the anchored feasible block. Accept usable water below "
+                    "the preferred 50°C target without toggling native "
+                    "hysteresis.",
+                    usable_target,
+                )
+            return decision(
+                "readiness_charge",
+                "The tank is usable but below the preferred 50°C readiness "
+                "target, and the current price is not materially expensive "
+                "relative to the anchored feasible block.",
+                policy.normal_target,
+                urgent=True,
+            )
+        return decision(
+            "readiness_preferred",
+            "Measured readiness is at or above the preferred 50°C target.",
+            policy.normal_target,
+            urgent=True,
+        )
+    if mode == DHW_MODE_READINESS:
+        if inside_selected and observation.tank_temperature < policy.normal_target:
+            return decision(
+                "readiness_charge",
+                "The current quarter is inside the anchored preferred "
+                "readiness block; request 50°C.",
+                policy.normal_target,
+                urgent=True,
+            )
+        return decision(
+            "readiness_preferred",
+            "The readiness-only pilot keeps the preferred 50°C target; "
+            "economic storage and price coasting remain disabled.",
             policy.normal_target,
             urgent=True,
         )
     if selected is None:
         return decision(
-            "normal",
-            "No complete preheat window remains before the next readiness deadline.",
+            (
+                "readiness_charge"
+                if observation.tank_temperature < policy.normal_target
+                else "readiness_preferred"
+            ),
+            "No complete feasible charging block remains before the next "
+            "readiness deadline; fail safe to the preferred 50°C target.",
             policy.normal_target,
             urgent=True,
         )
-    now_utc = now.astimezone(UTC)
-    if selected.start <= now_utc < selected.end:
-        if not retention_qualified:
-            if (
-                observation.target_temperature < policy.normal_target
-                and observation.tank_temperature < policy.normal_target
-            ):
-                remaining_window = selected.end - now_utc
-                if remaining_window < MINIMUM_TARGET_DWELL:
-                    return decision(
-                        "coast",
-                        "Less than 30 minutes remain in the selected lower-cost "
-                        "window; keep the existing 45°C coast instead of "
-                        "starting an incomplete recovery.",
-                        policy.floor_target,
-                    )
+    if inside_selected:
+        if observation.tank_temperature < policy.normal_target:
+            return decision(
+                "readiness_charge",
+                "The current quarter is inside the anchored absolute "
+                "minimum-average feasible readiness block; request the "
+                "preferred 50°C target.",
+                policy.normal_target,
+                urgent=True,
+            )
+        return decision(
+            "readiness_preferred",
+            "The current quarter is inside the anchored readiness block and "
+            "the tank already satisfies the preferred 50°C target.",
+            policy.normal_target,
+            urgent=True,
+        )
+    if selected.end <= now_utc:
+        if observation.tank_temperature < policy.normal_target:
+            if gate:
+                usable_target = observation.target_temperature
+                if not (
+                    policy.floor_target
+                    <= observation.target_temperature
+                    <= policy.normal_target
+                ):
+                    usable_target = policy.floor_target
                 return decision(
-                    "recovery",
-                    "The selected lower-cost window has enough time for useful "
-                    "recovery; restore 50°C and keep recovery latched until the "
-                    "measured tank reaches the normal target.",
-                    policy.normal_target,
+                    "readiness_usable",
+                    "The anchored block has ended and the tank remains usable "
+                    "at 45–49°C. The current price is materially expensive, so "
+                    "do not chase the preferred target.",
+                    usable_target,
                 )
             return decision(
-                "normal",
-                "Discretionary heating above 50°C is suppressed until at "
-                "least three clean retention samples span two readiness cycles.",
+                "readiness_charge",
+                "The anchored block ended below the preferred target, and "
+                "current energy is not materially expensive; request 50°C.",
                 policy.normal_target,
-            )
-        if adaptive_preheat_target is None:
-            return decision(
-                "normal",
-                "The learned retention envelope would require more than the "
-                "55°C native maximum, so early discretionary storage is skipped.",
-                policy.normal_target,
-            )
-        if not preheat_gate:
-            return decision(
-                "normal",
-                "The latest near-cheapest block does not beat the predicted "
-                "deferred recharge by both price gates, so discretionary "
-                "preheating is avoided.",
-                policy.normal_target,
+                urgent=True,
             )
         return decision(
-            "preheat",
-            "The current quarter is inside the latest near-cheapest block, "
-            "the predicted deferred recharge passes both price gates, and the "
-            f"minimum retained-readiness target is {adaptive_preheat_target:g}°C.",
-            adaptive_preheat_target,
-        )
-    if (
-        observation.tank_temperature < policy.normal_target
-        and selected.end <= now_utc
-        and not preheat_completed
-    ):
-        return decision(
-            "recovery",
-            "The selected cheap window ended before the tank reached the normal target.",
+            "readiness_preferred",
+            "The anchored block has ended and the tank remains at or above "
+            "the preferred 50°C target.",
             policy.normal_target,
-            urgent=True,
         )
     if not gate:
         if (
@@ -928,15 +1363,15 @@ def plan_dhw(
             and observation.tank_temperature < policy.normal_target
         ):
             return decision(
-                "recovery",
-                "The price coast ended before the tank recovered; restore 50°C "
-                "and keep recovery latched until the measured tank reaches the "
-                "normal target.",
+                "readiness_charge",
+                "The tank is below the preferred target and the current price "
+                "is not materially expensive relative to the anchored block.",
                 policy.normal_target,
             )
         return decision(
-            "normal",
-            "The current price does not exceed the balanced absolute and relative gates.",
+            "readiness_preferred",
+            "The current price does not exceed both material gates; preserve "
+            "the preferred 50°C target.",
             policy.normal_target,
         )
 
@@ -959,7 +1394,7 @@ def stabilize_decision(
     if (
         target is None
         or decision.urgent
-        or decision.state == "preheat"
+        or decision.state == "economic_storage"
         or last_target is None
         or last_transition is None
         or target == last_target
@@ -1011,6 +1446,9 @@ class DhwOptimizer:
             "recovery_latched": False,
             "recovery_reason": None,
             "planned_deadline": None,
+            "planned_kind": None,
+            "planned_target": None,
+            "planned_endpoint": None,
             "planned_window_start": None,
             "planned_window_end": None,
             "planned_window_average": None,
@@ -1050,8 +1488,6 @@ class DhwOptimizer:
             "readiness_window_peaks": {},
             "readiness_rapid_draws": {},
             "readiness_deadline_samples": {},
-            "readiness_final_topups": {},
-            "readiness_final_topup_active": {},
             "qualified_opportunity_count": 0,
             "last_qualified_opportunity_plan_id": None,
             "last_qualified_opportunity_at": None,
@@ -1065,6 +1501,9 @@ class DhwOptimizer:
             "recovery_latched": False,
             "recovery_reason": None,
             "planned_deadline": None,
+            "planned_kind": None,
+            "planned_target": None,
+            "planned_endpoint": None,
             "planned_window_start": None,
             "planned_window_end": None,
             "planned_window_average": None,
@@ -1104,8 +1543,6 @@ class DhwOptimizer:
             "readiness_window_peaks": {},
             "readiness_rapid_draws": {},
             "readiness_deadline_samples": {},
-            "readiness_final_topups": {},
-            "readiness_final_topup_active": {},
             "qualified_opportunity_count": 0,
             "last_qualified_opportunity_plan_id": None,
             "last_qualified_opportunity_at": None,
@@ -1140,19 +1577,43 @@ class DhwOptimizer:
             "readiness_deadline_samples": dict(
                 self.state["readiness_deadline_samples"]
             ),
-            "readiness_final_topups": dict(
-                self.state["readiness_final_topups"]
-            ),
-            "readiness_final_topup_active": dict(
-                self.state["readiness_final_topup_active"]
-            ),
         }
         self._reset_policy_evidence()
         self.state.update(preserved)
         self.state["lease_expires"] = None
+        if self.mode in (DHW_MODE_READINESS, DHW_MODE_SAFE):
+            self.mode = DHW_MODE_SHADOW
 
-    def _migrate_revision_nine(self) -> None:
-        self.state["policy_revision"] = POLICY_REVISION
+    def _migrate_revision_ten(self) -> None:
+        self.state.update({
+            "policy_revision": POLICY_REVISION,
+            "lease_expires": None,
+            "last_policy_target": None,
+            "last_policy_transition_at": None,
+            "shadow_days": [],
+            "readiness_pilot_days": [],
+            "retention_started_at": None,
+            "retention_start_temperature": None,
+            "retention_target": None,
+            "retention_deadline": None,
+            "cycle_started_at": None,
+            "cycle_start_temperature": None,
+            "topup_started_at": None,
+            "topup_start_temperature": None,
+            "last_temperature": None,
+            "last_observed_at": None,
+            "decision_history": [],
+            "deadline_checks": {},
+            "readiness_window_peaks": {},
+            "readiness_rapid_draws": {},
+            "readiness_deadline_samples": {},
+            "qualified_opportunity_count": 0,
+            "last_qualified_opportunity_plan_id": None,
+            "last_qualified_opportunity_at": None,
+        })
+        self._clear_price_plan()
+        if self.mode in (DHW_MODE_READINESS, DHW_MODE_SAFE):
+            self.mode = DHW_MODE_SHADOW
 
     async def async_start(self) -> None:
         stored = await self.store.async_load()
@@ -1168,8 +1629,8 @@ class DhwOptimizer:
                     self.state[key] = stored[key]
             if stored_revision in (5, 6, 7):
                 self._migrate_revision_eight()
-            elif stored_revision == 8:
-                self._migrate_revision_nine()
+            elif stored_revision in (8, 9):
+                self._migrate_revision_ten()
             elif stored_revision != POLICY_REVISION:
                 write_capable_mode = self.mode in (
                     DHW_MODE_READINESS,
@@ -1193,7 +1654,7 @@ class DhwOptimizer:
                 name=DOMAIN + " DHW optimizer",
             )
         )
-        await self.async_evaluate()
+        await self.async_evaluate(suppress_write=True)
 
     async def async_stop(self) -> None:
         for unsubscribe in self.unsubscribers:
@@ -1385,6 +1846,9 @@ class DhwOptimizer:
     def _clear_price_plan(self) -> None:
         for key in (
             "planned_deadline",
+            "planned_kind",
+            "planned_target",
+            "planned_endpoint",
             "planned_window_start",
             "planned_window_end",
             "planned_window_average",
@@ -1427,21 +1891,72 @@ class DhwOptimizer:
         )
 
     def _stored_price_plan(
-        self, deadline: datetime
+        self,
+        deadline: datetime,
+        now: datetime | None = None,
     ) -> tuple[
         PriceWindowChoice | None,
         PriceWindowChoice | None,
         PriceWindowChoice | None,
     ]:
-        if self.state.get("planned_deadline") != deadline.isoformat():
+        stored_deadline = _instant(self.state.get("planned_deadline"))
+        deadline_matches = (
+            stored_deadline is not None
+            and stored_deadline.astimezone(UTC)
+            == deadline.astimezone(UTC)
+        )
+        retained_post_readiness = (
+            stored_deadline is not None
+            and now is not None
+            and stored_deadline.astimezone(UTC)
+            <= now.astimezone(UTC)
+            < stored_deadline.astimezone(UTC) + POST_READINESS_HOLD
+        )
+        if not deadline_matches and not retained_post_readiness:
             self._clear_price_plan()
             return None, None, None
         selected = self._stored_window("planned_window")
-        if selected is None:
+        if (
+            selected is None
+            or stored_deadline is None
+            or selected.end > stored_deadline.astimezone(UTC)
+        ):
             self._clear_price_plan()
             return None, None, None
         comparison = self._stored_window("planned_comparison") or selected
         cheapest = self._stored_window("planned_cheapest") or selected
+        kind = self.state.get("planned_kind")
+        endpoint = _instant(self.state.get("planned_endpoint"))
+        target = _raw_number(self.state.get("planned_target"))
+        if (
+            kind not in (PLAN_KIND_ECONOMIC, PLAN_KIND_PREFERRED)
+            or endpoint is None
+            or endpoint.astimezone(UTC) < selected.end
+            or (
+                kind == PLAN_KIND_ECONOMIC
+                and endpoint.astimezone(UTC) < comparison.end
+            )
+            or target is None
+            or (
+                kind == PLAN_KIND_ECONOMIC
+                and target != self.policy.preheat_target
+            )
+            or (
+                kind == PLAN_KIND_PREFERRED
+                and target != self.policy.normal_target
+            )
+        ):
+            self._clear_price_plan()
+            return None, None, None
+        if (
+            now is not None
+            and kind == PLAN_KIND_ECONOMIC
+            and endpoint.astimezone(UTC)
+            < stored_deadline.astimezone(UTC)
+            and now.astimezone(UTC) >= endpoint.astimezone(UTC)
+        ):
+            self._clear_price_plan()
+            return None, None, None
         return selected, comparison, cheapest
 
     def _store_price_plan(
@@ -1450,8 +1965,23 @@ class DhwOptimizer:
         selected: PriceWindowChoice,
         comparison: PriceWindowChoice | None,
         cheapest: PriceWindowChoice | None,
+        *,
+        kind: str = PLAN_KIND_PREFERRED,
+        target: float | None = None,
+        endpoint: datetime | None = None,
     ) -> None:
         self.state["planned_deadline"] = deadline.isoformat()
+        self.state["planned_kind"] = (
+            kind
+            if kind in (PLAN_KIND_ECONOMIC, PLAN_KIND_PREFERRED)
+            else PLAN_KIND_PREFERRED
+        )
+        self.state["planned_target"] = (
+            target if target is not None else self.policy.normal_target
+        )
+        self.state["planned_endpoint"] = (
+            endpoint or deadline
+        ).isoformat()
         self.state["planned_window_completed_at"] = None
         for prefix, window in (
             ("planned_window", selected),
@@ -1656,10 +2186,19 @@ class DhwOptimizer:
                     ready_at <= local < check_end
                     and key not in samples
                 ):
+                    decision_state = None
+                    if (
+                        self.decision is not None
+                        and self.decision.deadline is not None
+                        and self.decision.deadline.astimezone(UTC)
+                        == ready_at.astimezone(UTC)
+                    ):
+                        decision_state = self.decision.state
                     samples[key] = {
                         "temperature": temperature,
                         "target": target,
                         "override_reason": observation.override_reason,
+                        "decision_state": decision_state,
                         "observed_at": now.isoformat(),
                     }
                 if local < check_end or key in checks:
@@ -1686,6 +2225,11 @@ class DhwOptimizer:
                     if isinstance(sample, dict)
                     else None
                 )
+                sample_decision_state = (
+                    sample.get("decision_state")
+                    if isinstance(sample, dict)
+                    else None
+                )
                 peak_record = peaks.get(key)
                 peak = (
                     _raw_number(peak_record.get("temperature"))
@@ -1707,13 +2251,18 @@ class DhwOptimizer:
                     outcome = READINESS_CONTAMINATED
                 elif sample_temperature >= self.policy.normal_target:
                     outcome = READINESS_SUCCESS
+                elif (
+                    sample_temperature >= self.policy.floor_target
+                    and sample_decision_state == "readiness_usable"
+                ):
+                    outcome = READINESS_ACCEPTED
                 else:
                     outcome = READINESS_FAILURE
                 checks[key] = outcome
                 checks = dict(list(checks.items())[-30:])
                 if (
                     temperature is not None
-                    and temperature < self.policy.normal_target
+                    and temperature < self.policy.floor_target
                     and outcome != READINESS_UNAVAILABLE
                 ):
                     self.state["recovery_latched"] = True
@@ -1755,25 +2304,6 @@ class DhwOptimizer:
             or target is None
         ):
             return
-        active_final_topups = dict(
-            self.state["readiness_final_topup_active"]
-        )
-        completed_final_topups = dict(
-            self.state["readiness_final_topups"]
-        )
-        for key in tuple(active_final_topups):
-            deadline = _instant(key)
-            if deadline is None:
-                active_final_topups.pop(key, None)
-            elif now.astimezone(UTC) >= deadline.astimezone(UTC):
-                active_final_topups.pop(key, None)
-                completed_final_topups[key] = now.isoformat()
-        self.state["readiness_final_topup_active"] = dict(
-            list(active_final_topups.items())[-30:]
-        )
-        self.state["readiness_final_topups"] = dict(
-            list(completed_final_topups.items())[-30:]
-        )
         cycle_start = _instant(self.state.get("cycle_started_at"))
         topup_start = _instant(self.state.get("topup_started_at"))
         if topup_start is not None and temperature >= self.policy.normal_target:
@@ -1810,31 +2340,41 @@ class DhwOptimizer:
         self.state["last_temperature"] = temperature
         self.state["last_observed_at"] = now.isoformat()
 
-    def _readiness_delivered(self, deadline: datetime) -> bool:
-        peak_record = self.state["readiness_window_peaks"].get(
-            deadline.isoformat()
-        )
-        peak = (
-            _raw_number(peak_record.get("temperature"))
-            if isinstance(peak_record, dict)
-            else None
-        )
-        return peak is not None and peak >= self.policy.normal_target
+    def _update_deadline_sample_decision(
+        self,
+        now: datetime,
+        decision: DhwDecision,
+    ) -> None:
+        ready_at = previous_readiness(now, self.policy)
+        if not (
+            ready_at <= now.astimezone(TALLINN)
+            < ready_at + timedelta(minutes=15)
+        ):
+            return
+        key = ready_at.isoformat()
+        sample = self.state["readiness_deadline_samples"].get(key)
+        if not isinstance(sample, dict):
+            return
+        sample["decision_state"] = decision.state
 
     def _record_decision(self, now: datetime, decision: DhwDecision) -> None:
         previous = self.decision
         if (
             previous is not None
+            and previous.mode == decision.mode
             and previous.state == decision.state
             and previous.desired_target == decision.desired_target
             and previous.reason == decision.reason
             and previous.selected_window == decision.selected_window
             and previous.comparison_window == decision.comparison_window
             and previous.preheat_price_gate == decision.preheat_price_gate
+            and previous.plan_kind == decision.plan_kind
+            and previous.protected_endpoint == decision.protected_endpoint
         ):
             return
         record = {
             "observed_at": now.isoformat(),
+            "mode": decision.mode,
             "actual_target_c": decision.actual_target,
             "proposed_target_c": decision.desired_target,
             "state": decision.state,
@@ -1864,6 +2404,13 @@ class DhwOptimizer:
             "selected_window_end": (
                 decision.selected_window.end.isoformat()
                 if decision.selected_window else None
+            ),
+            "price_plan_kind": decision.plan_kind,
+            "planned_target_c": decision.planned_target_c,
+            "protected_endpoint": (
+                decision.protected_endpoint.isoformat()
+                if decision.protected_endpoint is not None
+                else None
             ),
             "next_readiness": (
                 decision.deadline.isoformat() if decision.deadline else None
@@ -1916,7 +2463,12 @@ class DhwOptimizer:
         self.state["last_qualified_opportunity_plan_id"] = plan_id
         self.state["last_qualified_opportunity_at"] = now.isoformat()
 
-    async def async_evaluate(self, now: datetime | None = None) -> None:
+    async def async_evaluate(
+        self,
+        now: datetime | None = None,
+        *,
+        suppress_write: bool = False,
+    ) -> None:
         async with self.lock:
             observed_at = (now or dt_util.utcnow()).astimezone(UTC)
             try:
@@ -1938,6 +2490,18 @@ class DhwOptimizer:
                 ):
                     self.state["recovery_latched"] = False
                     self.state["recovery_reason"] = None
+                elif (
+                    observation.tank_temperature is not None
+                    and observation.tank_temperature
+                    < self.policy.floor_target
+                ):
+                    self.state["recovery_latched"] = True
+                    if self.state.get("recovery_reason") is None:
+                        self.state["recovery_reason"] = (
+                            "Tank temperature fell below the 45°C comfort "
+                            "floor; hold 50°C until measured recovery "
+                            "completes."
+                        )
                 lease = _instant(self.state.get("lease_expires"))
                 intervals = published_intervals(self.coordinator)
                 deadline = next_readiness(observed_at, self.policy)
@@ -1945,7 +2509,22 @@ class DhwOptimizer:
                     planned_window,
                     comparison_window,
                     absolute_cheapest_window,
-                ) = self._stored_price_plan(deadline)
+                ) = self._stored_price_plan(deadline, observed_at)
+                stored_deadline = (
+                    _instant(self.state.get("planned_deadline"))
+                    if planned_window is not None
+                    else None
+                )
+                stored_endpoint = (
+                    _instant(self.state.get("planned_endpoint"))
+                    if planned_window is not None
+                    else None
+                )
+                stored_kind = (
+                    self.state.get("planned_kind")
+                    if planned_window is not None
+                    else None
+                )
                 (
                     retention_qualified,
                     retention_rate,
@@ -1964,55 +2543,46 @@ class DhwOptimizer:
                     planned_window=planned_window,
                     comparison_window=comparison_window,
                     absolute_cheapest_window=absolute_cheapest_window,
+                    planned_deadline=stored_deadline,
+                    planned_kind=stored_kind,
+                    planned_endpoint=stored_endpoint,
                     recovery_latched=self.state["recovery_latched"] is True,
                     recovery_reason=self.state.get("recovery_reason"),
                     preheat_completed=(
                         self.state.get("planned_window_completed_at") is not None
                     ),
-                    readiness_delivered=self._readiness_delivered(deadline),
-                    final_topup_used=bool(
-                        self.state["readiness_final_topups"].get(
-                            deadline.isoformat()
-                        )
+                    recent_rapid_draw=self._recent_rapid_draw(
+                        stored_deadline or deadline
                     ),
-                    final_topup_active=bool(
-                        self.state[
-                            "readiness_final_topup_active"
-                        ].get(deadline.isoformat())
-                    ),
-                    recent_rapid_draw=self._recent_rapid_draw(deadline),
                     retention_loss_rate_c_per_hour=(
                         retention_rate if retention_qualified else None
                     ),
                     retention_sample_count=retention_sample_count,
                     retention_cycle_count=retention_cycle_count,
                 )
-                self._update_preheat_completion(
-                    observed_at,
-                    observation,
-                    decision.selected_window,
-                    decision.adaptive_preheat_target_c,
-                )
                 if (
                     planned_window is None
-                    and decision.retention_qualified
-                    and decision.adaptive_preheat_target_c is not None
                     and decision.data_complete
                     and decision.selected_window is not None
                     and decision.deadline is not None
+                    and decision.deadline.astimezone(UTC) > observed_at
+                    and decision.plan_kind is not None
                 ):
                     self._store_price_plan(
                         decision.deadline,
                         decision.selected_window,
                         decision.comparison_window,
                         decision.absolute_cheapest_window,
+                        kind=decision.plan_kind,
+                        target=decision.planned_target_c,
+                        endpoint=decision.protected_endpoint,
                     )
-                    self._update_preheat_completion(
-                        observed_at,
-                        observation,
-                        decision.selected_window,
-                        decision.adaptive_preheat_target_c,
-                    )
+                self._update_preheat_completion(
+                    observed_at,
+                    observation,
+                    decision.selected_window,
+                    decision.planned_target_c,
+                )
                 if self.state.get("fault"):
                     decision = replace(
                         decision,
@@ -2038,8 +2608,13 @@ class DhwOptimizer:
                 ):
                     self.state["recovery_latched"] = True
                     self.state["recovery_reason"] = decision.reason
+                self._update_deadline_sample_decision(
+                    observed_at,
+                    decision,
+                )
                 if (
-                    decision.desired_target is not None
+                    not suppress_write
+                    and decision.desired_target is not None
                     and decision.desired_target != last_target
                 ):
                     self.state["last_policy_target"] = decision.desired_target
@@ -2047,7 +2622,12 @@ class DhwOptimizer:
                 self._record_optimization_opportunity(observed_at, decision)
                 self._record_decision(observed_at, decision)
                 self.decision = decision
-                await self._apply_decision(observed_at, observation, decision)
+                if not suppress_write:
+                    await self._apply_decision(
+                        observed_at,
+                        observation,
+                        decision,
+                    )
             except (HomeAssistantError, TimeoutError, ValueError, KeyError) as error:
                 self.decision = DhwDecision(
                     mode=self.mode,
@@ -2077,26 +2657,6 @@ class DhwOptimizer:
         decision: DhwDecision,
     ) -> None:
         target = decision.desired_target
-        final_topup_key = (
-            decision.deadline.isoformat()
-            if (
-                decision.allow_write
-                and decision.state == "readiness_final_topup"
-                and decision.deadline is not None
-            )
-            else None
-        )
-        if (
-            final_topup_key is not None
-            and target == observation.target_temperature
-            and target == self.policy.preheat_target
-            and self.state.get("last_owned_target") == target
-        ):
-            active = dict(self.state["readiness_final_topup_active"])
-            active[final_topup_key] = now.isoformat()
-            self.state["readiness_final_topup_active"] = dict(
-                list(active.items())[-30:]
-            )
         if (
             not decision.allow_write
             or target is None
@@ -2140,12 +2700,6 @@ class DhwOptimizer:
         if confirmed != target:
             self.state["fault"] = "The guarded DHW command returned an unexpected confirmation."
             return
-        if final_topup_key is not None:
-            active = dict(self.state["readiness_final_topup_active"])
-            active[final_topup_key] = now.isoformat()
-            self.state["readiness_final_topup_active"] = dict(
-                list(active.items())[-30:]
-            )
         self.state["last_owned_target"] = target
         self.state["last_write_at"] = now.isoformat()
         changed = int(result.get("changed") is True)
@@ -2159,8 +2713,7 @@ class DhwOptimizer:
         self.state["lease_expires"] = None
         if (
             changed
-            and decision.state
-            in ("readiness_charge", "readiness_final_topup")
+            and decision.state == "readiness_charge"
             and observation.tank_temperature is not None
             and observation.tank_temperature > self.policy.floor_target
             and self.state["topup_started_at"] is None
@@ -2474,6 +3027,10 @@ class DhwOptimizer:
             "readiness_consumed_after_delivery": sum(
                 value == READINESS_CONSUMED for value in deadline_checks.values()
             ),
+            "readiness_accepted_below_preferred": sum(
+                value == READINESS_ACCEPTED
+                for value in deadline_checks.values()
+            ),
             "readiness_draw_contaminated": sum(
                 value == READINESS_CONTAMINATED
                 for value in deadline_checks.values()
@@ -2508,8 +3065,9 @@ class DhwOptimizer:
                 MINIMUM_TARGET_DWELL.total_seconds() // 60
             ),
             "post_readiness_hold_minutes": DHW_POST_READINESS_HOLD_MINUTES,
-            "post_delivery_rearm_c": DHW_POST_DELIVERY_REARM_C,
-            "final_topup_window_minutes": DHW_FINAL_TOPUP_MINUTES,
+            "economic_storage_horizon_cap_hours": (
+                MAX_STORAGE_HORIZON.total_seconds() / 3600
+            ),
             "readiness_evidence_delay_minutes": 15,
             "extreme_price_block_reason": self._extreme_block_reason(
                 dt_util.utcnow()

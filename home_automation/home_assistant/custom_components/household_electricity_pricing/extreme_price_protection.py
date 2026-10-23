@@ -47,7 +47,6 @@ from .coordinator import HouseholdPriceCoordinator
 from .dhw_optimizer import (
     DhwOptimizer,
     PriceInterval,
-    next_readiness,
     published_intervals,
 )
 from .floor_heating_shadow import read_room_temperature_source
@@ -413,12 +412,12 @@ def plan_extreme_price_protection(
         elif water_guard is not None:
             operation = "unavailable"
             reason = water_guard
-        elif tank_temperature is not None and tank_temperature <= 45:
+        elif tank_temperature is not None and tank_temperature < 45:
             operation = "restore"
-            reason = "DHW reached the 45°C comfort exit."
+            reason = "DHW fell below the 45°C usable floor."
         elif readiness_active:
             operation = "restore"
-            reason = "The next DHW readiness lead time is active."
+            reason = "DHW recovery or preferred readiness charging is active."
         else:
             operation = "hold"
             reason = "Breaker-owned DHW standby remains within its lease."
@@ -476,7 +475,7 @@ def plan_extreme_price_protection(
                 "Fresh DHW tank temperature is unavailable.",
             )
         )
-    elif tank_temperature <= 45 or readiness_active:
+    elif tank_temperature < 45 or readiness_active:
         actions.append(
             ProtectionAction(
                 LOAD_HOT_WATER,
@@ -485,9 +484,9 @@ def plan_extreme_price_protection(
                 "on" if water_enabled else "standby",
                 "on",
                 (
-                    "DHW comfort is at or below 45°C."
-                    if tank_temperature <= 45
-                    else "The next DHW readiness lead time is active."
+                    "DHW is below the 45°C usable floor."
+                    if tank_temperature < 45
+                    else "DHW recovery or preferred readiness charging is active."
                 ),
             )
         )
@@ -855,7 +854,7 @@ def verify_commissioning_replay() -> dict:
 
     comfort = plan(
         ("1.5",),
-        tank_temperature=45,
+        tank_temperature=44.9,
         room_temperature=EXTREME_PRICE_FLOOR_RESTORE_C,
     )
     comfort_actions = {
@@ -995,6 +994,7 @@ class ExtremePriceProtection:
             "decision_history": [],
             "confirmed_stops": 0,
             "confirmed_restores": 0,
+            "dhw_readiness_exit_active": False,
             "thermal_contamination_active": False,
             "replay_verified": False,
             "replay_coverage_days": 0,
@@ -1315,20 +1315,70 @@ class ExtremePriceProtection:
             result.append(await self.devices.get_climate_status(entity_id))
         return tuple(result)
 
-    def _readiness_lead_time_active(self, now: datetime) -> bool:
-        deadline = next_readiness(now, self.optimizer.policy)
-        return deadline - now.astimezone(TALLINN) <= timedelta(
-            minutes=self.optimizer.heating_minutes
+    def _anchored_preferred_charge_active(
+        self,
+        now: datetime,
+        tank_temperature: float | None,
+    ) -> bool:
+        if (
+            tank_temperature is None
+            or tank_temperature >= self.optimizer.policy.normal_target
+        ):
+            return False
+        optimizer_state = getattr(self.optimizer, "state", {})
+        if not isinstance(optimizer_state, dict):
+            return False
+        if optimizer_state.get("recovery_latched") is True:
+            return True
+        if (
+            optimizer_state.get("planned_kind") != "preferred_readiness"
+            or _number(optimizer_state.get("planned_target"))
+            != self.optimizer.policy.normal_target
+        ):
+            return False
+        start = _instant(optimizer_state.get("planned_window_start"))
+        end = _instant(optimizer_state.get("planned_window_end"))
+        now_utc = now.astimezone(UTC)
+        return (
+            start is not None
+            and end is not None
+            and start.astimezone(UTC) <= now_utc < end.astimezone(UTC)
         )
 
-    def _readiness_active(self, now: datetime) -> bool:
+    def _readiness_active(
+        self,
+        now: datetime,
+        tank_temperature: float | None,
+    ) -> bool:
         optimizer_decision = getattr(self.optimizer, "decision", None)
-        if (
+        state = (
+            optimizer_decision.state
+            if optimizer_decision is not None
+            else None
+        )
+        active = state in {
+            "readiness_charge",
+            "recovery",
+        } or self._anchored_preferred_charge_active(
+            now,
+            tank_temperature,
+        )
+        if active:
+            self.state["dhw_readiness_exit_active"] = True
+        elif LOAD_HOT_WATER not in self._ownership():
+            self.state["dhw_readiness_exit_active"] = False
+        return active or (
+            LOAD_HOT_WATER in self._ownership()
+            and bool(self.state["dhw_readiness_exit_active"])
+        )
+
+    def _dhw_heating_priority_active(self) -> bool:
+        optimizer_decision = getattr(self.optimizer, "decision", None)
+        return (
             optimizer_decision is not None
-            and optimizer_decision.state in {"readiness", "recovery"}
-        ):
-            return True
-        return self._readiness_lead_time_active(now)
+            and optimizer_decision.state
+            in {"economic_storage", "readiness_charge", "recovery"}
+        )
 
     def _record(self, now: datetime, decision: ProtectionDecision) -> None:
         previous = self.decision
@@ -1856,7 +1906,10 @@ class ExtremePriceProtection:
                     water_enabled=daikin["water_enabled"],
                     tank_temperature=daikin["tank_temperature"],
                     water_guard=daikin["water_guard"],
-                    readiness_active=self._readiness_active(observed_at),
+                    readiness_active=self._readiness_active(
+                        observed_at,
+                        daikin["tank_temperature"],
+                    ),
                     heating_enabled=daikin["heating_enabled"],
                     room_temperature=daikin["room_temperature"],
                     heating_guard=daikin["heating_guard"],
@@ -2004,9 +2057,9 @@ class ExtremePriceProtection:
                     "DHW must be at least "
                     f"{COMMISSIONING_MIN_TANK_C:g}°C before the standby exercise."
                 )
-            if self._readiness_lead_time_active(observed_at):
+            if self._dhw_heating_priority_active():
                 raise HomeAssistantError(
-                    "DHW readiness lead time is active; commissioning yielded."
+                    "DHW heating priority is active; commissioning yielded."
                 )
             if (
                 daikin["room_temperature"] is None

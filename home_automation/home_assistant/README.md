@@ -571,74 +571,61 @@ The default policy is:
 | Readiness deadlines | 07:00 and 21:00 Europe/Tallinn |
 | Explicit native minimum | 30°C on the current device; native capability minimum when 30°C is unavailable; manual only |
 | Comfort threshold / safe coast target | 45°C |
-| Normal target | 50°C |
-| Cheap-period / final-readiness requested ceiling | 50–55°C |
-| Post-readiness demand hold | 120 minutes at 50°C |
-| Delivered-readiness re-arm | 48°C |
-| Shallow readiness allowance | p90 + 15 minutes, rounded to 15 and clamped to 30–60 minutes; currently 45 minutes |
-| Deep readiness allowance | Learned deep recovery; currently 105 minutes from retained evidence |
+| Preferred readiness / recovery target | 50°C |
+| Economic-storage ceiling | 55°C, retention-qualified and materially cheaper only |
+| Heating allowance | Learned shallow/deep 50°C recovery duration for the measured start temperature, plus reserve and quarter-hour rounding; 55°C storage uses the deep allowance |
 | Price gate | Current all-in price at least €0.05/kWh and 20% above the selected cheap-window average |
-| Preheat coast horizon | 8 hours |
+| Maximum useful-storage horizon | Retention-derived and capped at 8 hours |
 
 For each readiness cycle, the optimizer compares feasible contiguous all-in
-price blocks using the real household import price. Revision 8 selects the
-latest block that remains near the absolute cheapest: within both €0.01/kWh and
-10% of the cheapest average, using a €0.05 denominator floor. This avoids
-unnecessarily early storage when a similarly priced later window exists. It
-still compares the selected block with the highest-cost feasible block of the
-same duration and requires the existing absolute and relative price gates.
-This is a price opportunity per kWh, not a measured saving, because whole-Daikin
-electrical energy is unavailable.
+price blocks using the real household import price. Revision 10 sizes each
+candidate from the learned shallow/deep 50°C recovery duration for the measured
+starting temperature, including reserve and quarter-hour rounding. Economic
+55°C storage conservatively uses the deep allowance rather than claiming a
+separately learned 55°C journey.
+It selects the minimum-average feasible block; a later block wins only when the
+averages are exactly equal. Blocks too early to retain at least 45°C through
+the protected endpoint are rejected. The selected schedule is anchored once
+the required published-price horizon is complete and starts at the chosen
+block, not at a later generic readiness allowance. The compared price spread is
+an opportunity per kWh, not a measured saving, because whole-Daikin electrical
+energy is unavailable.
 
-The bounded readiness pilot is deliberately separate from price shifting.
-Outside the final learned heating allowance it holds 50°C and cannot use 45°C
-coast. Automatic control never selects 30°C. A fresh 48–49°C tank without rapid
-draw or recovery uses the learned shallow allowance; stale, ≤47°C, rapid-draw
-or recovery cases retain the deep allowance. Inside the final allowance, a
-below-50°C charge is classified as `readiness_final_topup` even when it is the
-first charge of that cycle. Once started, its higher requested setpoint remains
-latched through the readiness deadline and then restores to the 50°C hold.
-The higher setpoint is a requested thermostat ceiling, not proof that the full
-tank reached that temperature.
+Readiness separates usable delivery from preferred delivery. Below 45°C,
+recovery requests 50°C immediately and remains latched until the measured tank
+reaches 50°C. At 45–49°C, the optimizer accepts a truthful
+`readiness_usable` outcome when the current price is materially expensive
+relative to the anchored feasible block; otherwise it requests the preferred
+50°C target. Missing or incomplete prices fail safe to 50°C. A measured 49°C
+tank with an already native 50°C target is a no-write state: the optimizer
+never toggles the thermostat merely to defeat Daikin hysteresis. The same
+preferred-versus-usable rule applies after the deadline; there is no mandatory
+post-readiness top-up.
 
-Discretionary early storage above 50°C is suppressed until passive-loss
-retention evidence qualifies with at least three clean samples across two
-readiness cycles. The adaptive target is the ceiling of
-`50°C + p90 loss rate × hours to readiness + 1°C reserve`, bounded to 55°C.
-Targets above 55°C are rejected rather than charging earlier without evidence.
-After both readiness deadlines, a two-hour demand hold keeps the target at
-50°C so a delivery-time draw cannot immediately roll the controller into a
-price-driven coast. Once readiness has been delivered, normal charging re-arms
-at 48°C; one final top-up is permitted below 50°C inside the learned shallow
-allowance. The latch described above prevents native target hysteresis from
-losing measured readiness immediately before delivery time.
+Storage above 50°C is suppressed until passive-loss retention evidence
+qualifies with at least three clean samples across two readiness cycles. A 55°C
+request is then permitted only when both material price gates pass, the block
+fits the retention-derived horizon capped at eight hours, and the model
+predicts at least 45°C through the protected endpoint. The request exists only
+inside that economic-storage block. At block end the controller restores 50°C
+through exact ownership checks and never chases 55°C into a more expensive
+quarter. There is no final-readiness 55°C path.
 
-Comfort or missed-deadline recovery is latched until the measured tank reaches
-50°C. Revision 9 applies the same measured-recovery latch whenever price
-control restores 50°C from a 45°C coast. A selected lower-cost window with less
-than the existing 30-minute minimum dwell remaining is skipped rather than
-starting an incomplete 45→50→45°C pulse. Once a useful recovery starts, a
-later moving-window recalculation cannot return to 45°C before the tank reaches
-50°C. Reaching 50°C after an anchored cheap window starts is also persisted as
-completion for that readiness plan, including completion during post-window
-recovery. A later 49°C reading therefore does not incorrectly re-enter recovery
-for a plan that already succeeded; comfort and readiness guards still apply.
-Ordinary 45/50°C cost-driven transitions use a 30-minute minimum dwell, while
-comfort, readiness and incomplete-data exits bypass it. Deep-recovery and
-shallow readiness-top-up durations are learned separately. Each policy revision
-that changes scheduling values or qualification semantics clears prior
-qualification so changed Shadow behavior must earn a new observation period.
-Revision 6 retires automatic 30°C standby. A persisted revision-5
-`soft_standby` mode migrates command-free to `safe_target_shift`. Revision 7
-latches a started final readiness top-up through its deadline; known revision-5
-through revision-7 state migrates through the revision-8 evidence reset to
-revision 9 while preserving the selected
-safe mode, physical write counts, learned deep/shallow durations, owner approval
-and recorded opportunities. Changed scheduling and retention qualification are
-reset, and obsolete final-top-up markers are cleared. Persisted revision-8
-state migrates command-free to revision 9 while preserving readiness,
-retention, ownership and in-progress recovery evidence. Older incompatible
-write-capable revisions still pause for explicit review.
+Ordinary 45/50°C price transitions retain their minimum dwell. Comfort
+recovery, incomplete-price fallback, ownership conflicts, manufacturer guards,
+manual changes, faults and Extreme Price Protection take precedence. Each
+policy revision that changes scheduling or qualification semantics clears only
+the evidence whose meaning changed. Revision 10 preserves physical write
+counts, learned durations, qualified retention samples, recovery state,
+fault/manual state, pending operations and ownership for explicit
+reconciliation. Any write-capable revision-5 through revision-9 mode returns to
+Shadow so startup cannot act on the new policy before explicit reactivation.
+It clears revision-9 anchored plans, readiness evidence and obsolete
+final-top-up markers. An optimizer-owned 55°C target is evaluated from fresh
+exact state before any later owner-approved restore; an unowned or manual 55°C
+target is left untouched. Migration itself sends no command and invents no
+ownership. Older incompatible write-capable revisions still pause for explicit
+review.
 
 Deadline evidence distinguishes a measured success, measured readiness later
 consumed by a rapid draw, a rapid-draw-contaminated check that cannot prove
@@ -647,7 +634,7 @@ and measured-then-consumed outcomes count as delivered. Contaminated and
 unavailable checks are excluded rather than silently passed or failed; a genuine
 miss blocks promotion. Outcomes remain provisional through the 15-minute
 post-deadline observation window so a rapid draw can reclassify an apparent
-success as `consumed_after_delivery`.
+success as `consumed`.
 
 The options flow validates every target against the selected Daikin's native
 range and step. On the verified BRP069A62 installation that range is 30–55°C in
@@ -659,12 +646,14 @@ The runtime mode select provides:
 
 - `shadow`: default; calculate and record the same adaptive 50–55/45/50°C
   decisions the safe pilot would make, but send no device commands.
-- `readiness_pilot`: permit guarded readiness-ceiling→50°C target changes only
-  inside the final learned readiness allowance; hold 50°C at all other times.
+- `readiness_pilot`: guarded readiness control; prefer 50°C, recover
+  immediately below 45°C, and permit a usable 45–49°C outcome at a materially
+  expensive deadline. It never requests 55°C economic storage.
 - `safe_target_shift`: after at least seven combined Shadow/readiness-pilot
   observation days, five usable heat cycles, ten delivered usable readiness
   checks with no genuine miss, and two confirmed readiness-pilot writes, permit
-  guarded adaptive preheat, 45°C coast, and latched 50°C recovery targets.
+  guarded cheapest-feasible charging, 45°C coast, latched 50°C recovery and
+  retention-qualified economic 55°C storage.
 - `paused`: issue no automatic targets.
 
 The evidence gates remain the normal promotion path. A separate
@@ -731,8 +720,8 @@ recorded without relabeling the evidence gate as passed.
 
 Every live offset action captures the fresh native offset as its baseline,
 binds the command to the exact expected previous value, and requires native
-read-back. Re-evaluation keeps the one intended overlay instead of ratcheting
-another 4°C from the already-owned value. Leaving the action window, changing
+read-back. Re-evaluation keeps the one acquired adaptive target instead of
+ratcheting another shift from the already-owned value. Leaving the action window, changing
 mode, hitting a safety/comfort exit, or unloading restores the exact baseline
 only while the current value still matches optimizer ownership. External
 changes cancel ownership and return the controller to Shadow. A post-dispatch
@@ -750,19 +739,30 @@ credited only after the paired peak ends without room-HVAC, comfort, override,
 missing-input or DHW-priority contamination.
 
 The verified Daikin surface supports a native **-10°C to +10°C** weather-curve
-offset. That capability is not a safe optimization envelope by itself. Floor
-policy revision 6 evaluates one meaningful **4°C relative overlay**, bounded to
-an initial **-6°C to +4°C** envelope:
+offset. Revision 7 may use that whole range, but capability is not permission:
+each price opportunity first selects a `4/6/8/10°C` shift tier, then room and
+hydraulic evidence clamp the target.
 
-| Fresh native offset | Cheap-block proposal | Paired peak proposal |
+| Minimum spread | Minimum relative spread | Candidate shift |
 | ---: | ---: | ---: |
-| -2°C | +2°C | -6°C |
-| 0°C | +4°C | -4°C |
+| €0.05/kWh | 20% | 4°C |
+| €0.08/kWh | 30% | 6°C |
+| €0.12/kWh | 40% | 8°C |
+| €0.18/kWh | 50% | 10°C |
 
-Other fresh native offsets use the same `native ± 4°C` rule and clamp at the
-revision-6 bounds. The old separate +1°C aggressive candidate is retained only
-as a compatibility field in historical decision data; it is no longer the
-policy.
+During an expensive block, the coldest room limits setback to 2°C through
+20.5°C, 4°C through 21°C, 6°C through 22°C, and the price-selected tier above
+22°C. The evaluator also projects leaving-water temperature from the proposed
+offset delta and clamps the target so useful LWT never falls below 25°C.
+Therefore `-10°C` is possible only when both the room and current LWT have
+enough headroom. At or below 20°C the controller does not acquire a negative
+overlay.
+
+During a cheap block, preheat may use the price-selected tier at or below 20°C,
+is capped to 6°C through 20.5°C and 4°C through 21°C, and is suppressed above
+21°C. Physical room thermostats remain a passive comfort backstop, but because
+Home Assistant has no valve-position or loop-flow telemetry, closed valves are
+not treated as proof that higher LWT is useful or hydraulically safe.
 
 The evaluator requires complete canonical all-in coverage through the end of
 the current Tallinn delivery day. It may also use a later local day only when
@@ -773,31 +773,40 @@ quarters are never forecast or zero-filled. Within that evidence it pairs a
 two-hour cheap block with a later two-hour expensive block no more than eight
 hours away, and requires the same €0.05/kWh and 20% materiality gates as the
 DHW policy. It yields to safety/override states, non-LWT control, circuit
-standby, missing temperatures and offsets outside the revision-6 envelope. At
-or below the 20°C indoor guard it removes a negative offset without lowering an
-already warmer native setting. At or above 21°C it records `preheat_limited` and
-preserves the native offset instead of adding heat.
+standby, missing temperatures and offsets outside the native range. At or below
+the 20°C indoor guard it restores an owned setback to the exact fresh native
+baseline without lowering an already warmer native setting. Above 21°C it
+records `preheat_limited` and preserves the native offset instead of adding
+heat.
 
-DHW comfort, readiness and preheat states have compressor priority. A
-conflicting floor preheat candidate is recorded as deferred rather than assumed
-to run concurrently. Fresh directional net-grid power and whole-heat-pump
+DHW `recovery`, `readiness_charge` and `economic_storage` states have heating
+priority. `readiness_preferred` and `readiness_usable` do not prove compressor
+demand and do not block the floor policy by state alone. A conflicting floor
+candidate is recorded as deferred rather than assumed to run concurrently.
+Fresh directional net-grid power and whole-heat-pump
 electrical energy are unavailable, so solar-driven floor-heating dispatch
 remains disabled and the sensor reports price opportunity rather than measured
 kWh or euro savings. The separate bounded inverter-curtailment controller does
 not make the floor evaluator solar-aware.
 In Active mode, fresh native -2°C and 0°C values are accepted as schedule
-baselines. If the native schedule changes between those values while an overlay
-is owned, the controller releases ownership without restoring the stale
-baseline, preserves the schedule value, contaminates the candidate cycle and
-holds further writes until the current cheap/peak window ends. Three accepted
-transitions within one hour are treated as an unstable schedule and return the
-controller to Shadow; unexpected values still fail safely to Shadow.
+baselines. One adaptive target is captured when an episode acquires ownership;
+re-evaluation never escalates it mid-window. A comfort, LWT, HVAC or compressor
+priority exit restores the exact baseline and suppresses reacquisition until
+that same price window ends. If the native schedule changes between accepted
+baseline values while an overlay is owned, the controller releases ownership
+without restoring the stale baseline, preserves the schedule value,
+contaminates the candidate cycle and holds further writes until the current
+cheap/peak window ends. Three accepted transitions within one hour are treated
+as an unstable schedule and return the controller to Shadow; unexpected values
+still fail safely to Shadow. Any unresolved persisted operation blocks another
+dispatch.
 
 The evidence gate remains ineligible until at least 14 observed days and five
-clean revision-6 candidate cycles. The explicit owner-approved path can select
-active mode earlier, but it does not claim that thermal-lag evidence passed.
-The numerical -6°C to +4°C envelope and 4°C overlay are unchanged from revision
-5; revision 6 adds native-schedule reconciliation and observation-only startup.
+clean revision-7 candidate cycles. Revision-6 installations migrate
+command-free to Shadow, preserve pending operations and owned offsets for fresh
+reconciliation, and reset numerical-policy evidence and anchored plans. The
+explicit owner-approved path can select active mode again after startup
+zero-write verification, but it does not claim that thermal-lag evidence passed.
 
 The dedicated floor opportunity sensor changes its valuation status from
 `counterfactual` to `live_action_unattributed` in active mode. Confirmed offset
@@ -832,8 +841,8 @@ The fixed revision-2 policy is:
 | Additional critical alert | €2.00/kWh |
 | Extended-price warning | At least €0.50/kWh for 120 contiguous minutes |
 | Maximum automatic standby lease | 120 minutes |
-| DHW comfort exit | Tank at or below 45°C |
-| DHW readiness exit | Existing 07:00/21:00 readiness lead time |
+| DHW comfort exit | Fresh tank below the 45°C usable floor |
+| DHW readiness exit | Optimizer `recovery` or `readiness_charge`, latched across protection ownership until restore |
 | Floor restore guard | Coldest fresh occupied room at or below 20.5°C |
 | Notifications | HA persistent notification plus `notify.mobile_app_bananastan` |
 

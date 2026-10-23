@@ -25,8 +25,8 @@ from .const import (
 MODE_LABELS = {
     "paused": "Paused",
     "shadow": "Shadow (no writes)",
-    "readiness_pilot": "Readiness pilot (55→50°C)",
-    "safe_target_shift": "Price shift (55/45/50°C)",
+    "readiness_pilot": "Readiness control (prefer 50°C, minimum 45°C)",
+    "safe_target_shift": "Price shift (45/50°C + economic 55°C)",
 }
 LABEL_MODES = {label: mode for mode, label in MODE_LABELS.items()}
 EXTREME_MODE_LABELS = {
@@ -48,7 +48,7 @@ SOLAR_LABEL_MODES = {
 FLOOR_MODE_LABELS = {
     FLOOR_MODE_PAUSED: "Paused",
     FLOOR_MODE_SHADOW: "Shadow (no writes)",
-    FLOOR_MODE_ACTIVE: "Active price shift",
+    FLOOR_MODE_ACTIVE: "Active adaptive price shift",
 }
 FLOOR_LABEL_MODES = {
     label: mode for mode, label in FLOOR_MODE_LABELS.items()
